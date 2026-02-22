@@ -1,29 +1,45 @@
-//! Input event driver
+//! Input event driver for XTEink X4
 //!
-//! The XTEink X4 has three physical input sources that all funnel
-//! into a single "one button at a time" model:
-//! Because each resistance ladder can only report one press at a
-//! time, and the power button is digital, we collapse everything
-//! into `Option<Button>` per poll cycle.
+//! The X4 has three physical input sources that all funnel into a
+//! single "one button at a time" model:
 //!
+//! - **Row 1 ADC** (GPIO1): Right, Left, Confirm, Back via resistance ladder
+//! - **Row 2 ADC** (GPIO2): Volume Up/Down via resistance ladder  
+//! - **Power button** (GPIO3): Digital input, active low
+//!
+//! Because each resistance ladder can only report one press at a time,
+//! we collapse everything into `Option<Button>` per poll cycle.
 
 use esp_hal::time::{Duration, Instant};
 
-use crate::board::{self, Button, InputHw, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
+use crate::board::button::{decode_ladder, Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
+use crate::board::InputHw;
 
+/// Debounce time - ignore state changes shorter than this.
 const DEBOUNCE_MS: u64 = 30;
+
+/// Time held before firing a long-press event.
 const LONG_PRESS_MS: u64 = 600;
+
+/// Interval between repeat events when holding past long-press.
 const REPEAT_MS: u64 = 150;
 
-/// Events are returned one at a time from InputDriver::Poll
+/// Input events returned from [`InputDriver::poll`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
+    /// Button was just pressed.
     Press(Button),
+    /// Button was just released.
     Release(Button),
+    /// Button held long enough to trigger long-press.
     LongPress(Button),
+    /// Button still held, firing repeat event.
     Repeat(Button),
 }
 
+/// Small fixed-size event queue for buffering multiple events per poll.
+///
+/// Needed because a single state change can produce both Release and Press.
 struct EventQueue {
     buf: [Option<Event>; 2],
     read: u8,
@@ -44,8 +60,8 @@ impl EventQueue {
                 return;
             }
         }
-        // NOTE: If both slots are full something is wrong with our logic,
-        // silently dropping is safer than panic.
+        // If both slots are full, something is wrong with our logic.
+        // Silently dropping is safer than panic in embedded.
     }
 
     fn pop(&mut self) -> Option<Event> {
@@ -56,7 +72,7 @@ impl EventQueue {
                 return Some(ev);
             }
         }
-        // Reset for next cycle.
+        // Reset for next cycle
         self.read = 0;
         None
     }
@@ -66,18 +82,27 @@ impl EventQueue {
     }
 }
 
+/// Stateful input driver with debouncing, long-press, and repeat support.
 pub struct InputDriver {
     hw: InputHw,
+    /// Currently stable (debounced) button state.
     stable: Option<Button>,
+    /// Candidate state during debounce window.
     candidate: Option<Button>,
+    /// When the candidate state was first seen.
     candidate_since: Instant,
+    /// When the current stable button was first pressed.
     press_since: Instant,
+    /// Whether we've already fired a long-press for the current hold.
     long_press_fired: bool,
+    /// When we last fired a repeat event.
     last_repeat: Instant,
+    /// Buffered events to return.
     queue: EventQueue,
 }
 
 impl InputDriver {
+    /// Create a new input driver from initialized hardware.
     pub fn new(hw: InputHw) -> Self {
         let now = Instant::now();
         Self {
@@ -93,7 +118,11 @@ impl InputDriver {
     }
 
     /// Poll for the next input event.
+    ///
+    /// Call this regularly (e.g., every 10-20ms). Returns `None` when
+    /// there are no pending events.
     pub fn poll(&mut self) -> Option<Event> {
+        // Drain any buffered events first
         if !self.queue.is_empty() {
             return self.queue.pop();
         }
@@ -101,17 +130,20 @@ impl InputDriver {
         let raw = self.read_raw();
         let now = Instant::now();
 
+        // Track candidate state for debouncing
         if raw != self.candidate {
             self.candidate = raw;
             self.candidate_since = now;
         }
 
+        // Only accept the candidate as stable after debounce period
         let debounced = if now - self.candidate_since >= Duration::from_millis(DEBOUNCE_MS) {
             self.candidate
         } else {
             self.stable
         };
 
+        // Handle state transitions
         if debounced != self.stable {
             if let Some(old) = self.stable {
                 self.queue.push(Event::Release(old));
@@ -126,15 +158,18 @@ impl InputDriver {
             return self.queue.pop();
         }
 
+        // Handle held button: long-press and repeat
         if let Some(btn) = self.stable {
             let held = now - self.press_since;
 
+            // Fire long-press once after threshold
             if !self.long_press_fired && held >= Duration::from_millis(LONG_PRESS_MS) {
                 self.long_press_fired = true;
                 self.last_repeat = now;
                 return Some(Event::LongPress(btn));
             }
 
+            // Fire repeat events at interval
             if self.long_press_fired && (now - self.last_repeat) >= Duration::from_millis(REPEAT_MS)
             {
                 self.last_repeat = now;
@@ -145,15 +180,18 @@ impl InputDriver {
         None
     }
 
+    /// Read raw button state from hardware (before debouncing).
     fn read_raw(&mut self) -> Option<Button> {
+        // Power button has priority (digital, active low)
         if self.hw.power.is_low() {
             return Some(Button::Power);
         }
 
+        // Read ADC channels
         let mv1: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row1)).unwrap();
         let mv2: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row2)).unwrap();
 
-        board::decode_ladder(mv1, ROW1_THRESHOLDS)
-            .or_else(|| board::decode_ladder(mv2, ROW2_THRESHOLDS))
+        // Decode resistance ladder readings
+        decode_ladder(mv1, ROW1_THRESHOLDS).or_else(|| decode_ladder(mv2, ROW2_THRESHOLDS))
     }
 }

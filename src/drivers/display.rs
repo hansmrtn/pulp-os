@@ -1,35 +1,47 @@
+//! Display driver for XTEink X4 e-paper
+//!
+//! Wraps the SSD1677-based e-paper display with a framebuffer and
+//! implements `embedded_graphics::DrawTarget` for easy rendering.
+
 extern crate alloc;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
 use embedded_graphics_core::{
     draw_target::DrawTarget,
-    geometry::{OriginDimensions, Size},
+    geometry::{OriginDimensions, Point, Size},
     pixelcolor::BinaryColor,
     prelude::Pixel,
-    geometry::Point,
 };
 use esp_hal::delay::Delay;
 use log::info;
-use ssd1677::{RefreshMode, Region, Rotation, UpdateRegion};
 use ssd1677::rotation::apply_rotation;
+use ssd1677::{RefreshMode, Region, UpdateRegion};
 
-use crate::board::{DisplayHw, Epd, DISPLAY_HEIGHT, DISPLAY_WIDTH, FB_SIZE};
+use crate::board::display::{FRAMEBUFFER_SIZE, HEIGHT, WIDTH};
+use crate::board::{DisplayHw, Epd};
 
+/// Number of fast/partial refreshes before forcing a full refresh.
+///
+/// E-paper displays accumulate "ghosting" artifacts with partial updates.
+/// A periodic full refresh clears these artifacts.
 const FULL_REFRESH_INTERVAL: u32 = 10;
 
+/// High-level display driver with framebuffer management.
 pub struct DisplayDriver {
     epd: Epd,
     buf: Vec<u8>,
-    /// Number of fast/partial flushes since the last full refresh.
     fast_count: u32,
     dirty: bool,
 }
 
 impl DisplayDriver {
+    /// Create a new display driver from initialized hardware.
     pub fn new(hw: DisplayHw) -> Self {
-        let buf = vec![0xFFu8; FB_SIZE]; // 0xFF = all white
+        // 0xFF = all white (bit set = white pixel for this controller)
+        let buf = vec![0xFFu8; FRAMEBUFFER_SIZE];
 
         Self {
             epd: hw.epd,
@@ -39,16 +51,22 @@ impl DisplayDriver {
         }
     }
 
+    /// Clear the framebuffer to white.
     pub fn clear_white(&mut self) {
         self.buf.fill(0xFF);
         self.dirty = true;
     }
 
+    /// Clear the framebuffer to black.
     pub fn clear_black(&mut self) {
         self.buf.fill(0x00);
         self.dirty = true;
     }
 
+    /// Flush the framebuffer to the display.
+    ///
+    /// Automatically chooses full vs. fast refresh based on the
+    /// number of fast refreshes since the last full refresh.
     pub fn flush(&mut self, delay: &mut Delay) {
         if !self.dirty {
             return;
@@ -64,32 +82,38 @@ impl DisplayDriver {
         self.flush_inner(mode, delay);
     }
 
+    /// Flush with a specific refresh mode.
     pub fn flush_with_mode(&mut self, mode: RefreshMode, delay: &mut Delay) {
         self.flush_inner(mode, delay);
     }
 
+    /// Force a full refresh (clears ghosting artifacts).
     pub fn flush_full(&mut self, delay: &mut Delay) {
         self.flush_inner(RefreshMode::Full, delay);
     }
 
+    /// Returns `true` if the framebuffer has been modified since the last flush.
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
+    /// Number of fast refreshes since the last full refresh.
     pub fn fast_count(&self) -> u32 {
         self.fast_count
     }
 
+    /// Access the underlying EPD driver (for advanced use).
     pub fn epd(&mut self) -> &mut Epd {
         &mut self.epd
     }
 
+    /// Read-only access to the framebuffer.
     pub fn buffer(&self) -> &[u8] {
         &self.buf
     }
 
     fn flush_inner(&mut self, mode: RefreshMode, delay: &mut Delay) {
-        let region = Region::new(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        let region = Region::new(0, 0, WIDTH, HEIGHT);
 
         let update = UpdateRegion {
             region,
@@ -113,7 +137,7 @@ impl DisplayDriver {
     fn set_pixel(&mut self, x: u32, y: u32, on: bool) {
         let rotation = self.epd.rotation();
 
-        // Physical (unrotated) dimensions — cols is the byte-row width.
+        // Physical (unrotated) dimensions
         let dims = self.epd.dimensions();
         let width = dims.cols as u32;
         let height = dims.rows as u32;

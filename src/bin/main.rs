@@ -21,8 +21,8 @@ use embedded_graphics::{
 };
 
 use pulp_os::board::Board;
-use pulp_os::display::DisplayDriver;
-use pulp_os::input::{Event, InputDriver};
+use pulp_os::drivers::display::DisplayDriver;
+use pulp_os::drivers::input::{Event, InputDriver};
 
 extern crate alloc;
 
