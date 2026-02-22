@@ -13,7 +13,8 @@ use esp_hal::delay::Delay;
 use log::info;
 use ssd1677::{RefreshMode, Region, UpdateRegion};
 
-use pulp_os::board::{self, Board, Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
+use pulp_os::board::{self, Board};
+use pulp_os::input::{Event, InputDriver};
 
 extern crate alloc;
 
@@ -33,7 +34,8 @@ fn main() -> ! {
     info!("pulp-os booting...");
 
     // ---- Hardware init ----
-    let Board { mut input, mut display } = Board::init(peripherals);
+    let Board { input, mut display } = Board::init(peripherals);
+    let mut input = InputDriver::new(input);
 
     // ---- Initial display: blank white ----
     let region = Region::new(0, 0, board::DISPLAY_HEIGHT, board::DISPLAY_WIDTH);
@@ -51,34 +53,17 @@ fn main() -> ! {
 
     // ---- Event loop ----
     let delay = Delay::new();
-    let mut last_button: Option<Button> = None;
 
     loop {
-        // Read current button state
-        let current = if input.power.is_low() {
-            Some(Button::Power)
-        } else {
-            let mv1: u16 = nb::block!(input.adc.read_oneshot(&mut input.row1)).unwrap();
-            let mv2: u16 = nb::block!(input.adc.read_oneshot(&mut input.row2)).unwrap();
-            board::decode_ladder(mv1, ROW1_THRESHOLDS)
-                .or_else(|| board::decode_ladder(mv2, ROW2_THRESHOLDS))
-        };
-
-        // Log transitions
-        match (last_button, current) {
-            (None, Some(btn)) => {
-                info!("[BTN] {} pressed", btn);
+        while let Some(ev) = input.poll() {
+            match ev {
+                Event::Press(btn) => info!("[BTN] {} pressed", btn),
+                Event::Release(btn) => info!("[BTN] {} released", btn),
+                Event::LongPress(btn) => info!("[BTN] {} long-press", btn),
+                Event::Repeat(btn) => info!("[BTN] {} repeat", btn),
             }
-            (Some(btn), None) => {
-                info!("[BTN] {} released", btn);
-            }
-            (Some(old), Some(new)) if old != new => {
-                info!("[BTN] {} released, {} pressed", old, new);
-            }
-            _ => {}
         }
-        last_button = current;
 
-        delay.delay_millis(50);
+        delay.delay_millis(20);
     }
 }
