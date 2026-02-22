@@ -153,7 +153,7 @@ impl Board{
         let dims = Dimensions::new(DISPLAY_WIDTH, DISPLAY_HEIGHT).unwrap();
         let cfg = Builder::new()
             .dimensions(dims)
-            .rotation(Rotation::Rotate0)
+            .rotation(Rotation::Rotate270)
             .build()
             .unwrap();
 

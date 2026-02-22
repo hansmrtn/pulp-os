@@ -28,6 +28,8 @@ embedded-hal = "1.0.0"
 ssd1677 = "0.1.0"
 embedded-hal-bus = "0.3.0"
 nb = "1.1.0"
+embedded-graphics-core = "0.4.1"
+embedded-graphics = "0.8.2"
 
 
 [profile.dev]
