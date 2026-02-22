@@ -28,8 +28,8 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use ssd1677::{Interface, Display, Rotation, Builder, Dimensions};
 
 // Display
-pub const DISPLAY_WIDTH: u16 = 480;
-pub const DISPLAY_HEIGHT: u16 = 800;
+pub const DISPLAY_WIDTH: u16 = 800;
+pub const DISPLAY_HEIGHT: u16 = 480;
 
 pub const FB_SIZE: usize = (DISPLAY_WIDTH as usize * DISPLAY_HEIGHT as usize) / 8;
 
@@ -150,7 +150,7 @@ impl Board{
 
         let interface = Interface::new(spi_dev, dc, rst, busy);
 
-        let dims = Dimensions::new(DISPLAY_WIDTH, DISPLAY_HEIGHT).unwrap();
+        let dims = Dimensions::new(DISPLAY_HEIGHT, DISPLAY_WIDTH).unwrap();
         let cfg = Builder::new()
             .dimensions(dims)
             .rotation(Rotation::Rotate270)

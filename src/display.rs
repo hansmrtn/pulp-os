@@ -89,7 +89,7 @@ impl DisplayDriver {
     }
 
     fn flush_inner(&mut self, mode: RefreshMode, delay: &mut Delay) {
-        let region = Region::new(0, 0, DISPLAY_HEIGHT, DISPLAY_WIDTH);
+        let region = Region::new(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
         let update = UpdateRegion {
             region,
