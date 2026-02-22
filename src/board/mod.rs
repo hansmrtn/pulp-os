@@ -9,6 +9,7 @@ pub mod display;
 pub mod pins;
 
 pub use button::{decode_ladder, Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
+pub use display::{DisplayDriver, HEIGHT, WIDTH, FRAMEBUFFER_SIZE, SPI_FREQ_MHZ};
 
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{
@@ -20,13 +21,11 @@ use esp_hal::{
     time::Rate,
     Blocking,
 };
-use ssd1677::{Builder, Dimensions, Display, Interface, Rotation};
 
 // Type Aliases
 pub type SpiBus = spi::master::Spi<'static, Blocking>;
 pub type SpiDevice = ExclusiveDevice<SpiBus, Output<'static>, Delay>;
-pub type EpdInterface = Interface<SpiDevice, Output<'static>, Output<'static>, Input<'static>>;
-pub type Epd = Display<EpdInterface>;
+pub type Epd = DisplayDriver<SpiDevice, Output<'static>, Output<'static>, Input<'static>>;
 
 // Hardware Bundles
 /// Input subsystem hardware: ADC for button ladders + power button.
@@ -93,7 +92,7 @@ impl Board {
 
         // SPI bus
         let spi_cfg =
-            spi::master::Config::default().with_frequency(Rate::from_mhz(display::SPI_FREQ_MHZ));
+            spi::master::Config::default().with_frequency(Rate::from_mhz(SPI_FREQ_MHZ));
         let spi_bus = spi::master::Spi::new(p.SPI2, spi_cfg)
             .unwrap()
             .with_sck(p.GPIO8)
@@ -101,18 +100,8 @@ impl Board {
 
         let spi_dev = ExclusiveDevice::new(spi_bus, cs, Delay::new()).unwrap();
 
-        // Display controller
-        let interface = Interface::new(spi_dev, dc, rst, busy);
-
-        let dims = Dimensions::new(display::HEIGHT, display::WIDTH).unwrap();
-        let cfg = Builder::new()
-            .dimensions(dims)
-            .rotation(Rotation::Rotate270)
-            .build()
-            .unwrap();
-
-        let mut epd = Display::new(interface, cfg);
-        epd.reset(&mut Delay::new());
+        // Create display driver (our custom GxEPD2-based driver)
+        let epd = DisplayDriver::new(spi_dev, dc, rst, busy);
 
         DisplayHw { epd }
     }
