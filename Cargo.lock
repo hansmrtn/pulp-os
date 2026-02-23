@@ -943,7 +943,6 @@ dependencies = [
  "esp-println",
  "log",
  "nb 1.1.0",
- "ssd1677",
  "static_cell",
 ]
 
@@ -1109,17 +1108,6 @@ name = "somni-parser"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0f368519fc6c85fc1afdb769fb5a51123f6158013e143656e25a3485a0d401c"
-
-[[package]]
-name = "ssd1677"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2560a0e0d835b69b9666494f3337d723801db172255970d983996bb274d2be13"
-dependencies = [
- "embedded-graphics-core",
- "embedded-hal 1.0.0",
- "log",
-]
 
 [[package]]
 name = "stable_deref_trait"

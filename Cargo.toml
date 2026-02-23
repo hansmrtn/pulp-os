@@ -25,7 +25,6 @@ esp-println = { version = "0.16.1", features = ["esp32c3", "log-04"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 embedded-hal = "1.0.0"
-ssd1677 = "0.1.0"
 embedded-hal-bus = "0.3.0"
 nb = "1.1.0"
 embedded-graphics-core = "0.4.1"
