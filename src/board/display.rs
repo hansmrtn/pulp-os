@@ -3,10 +3,10 @@
 //! Based on GxEPD2_426_GDEQ0426T82.cpp by Jean-Marc Zingg
 //! <https://github.com/ZinggJM/GxEPD2>
 use embedded_graphics_core::{
+    Pixel,
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
     pixelcolor::BinaryColor,
-    Pixel,
 };
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
@@ -39,13 +39,20 @@ mod cmd {
     pub const MASTER_ACTIVATION: u8 = 0x20;
     pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
     pub const DISPLAY_UPDATE_CONTROL_2: u8 = 0x22;
-    pub const WRITE_RAM_BW: u8 = 0x24;       // Current/New buffer
-    pub const WRITE_RAM_RED: u8 = 0x26;      // Previous buffer (for differential)
+    pub const WRITE_RAM_BW: u8 = 0x24; // Current/New buffer
+    pub const WRITE_RAM_RED: u8 = 0x26; // Previous buffer (for differential)
     pub const BORDER_WAVEFORM: u8 = 0x3C;
     pub const SET_RAM_X_RANGE: u8 = 0x44;
     pub const SET_RAM_Y_RANGE: u8 = 0x45;
     pub const SET_RAM_X_COUNTER: u8 = 0x4E;
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
+}
+
+pub enum Rotation {
+    Deg0,
+    Deg90,
+    Deg180,
+    Deg270,
 }
 
 /// Display driver for SSD1677-based e-paper (GDEQ0426T82)
@@ -59,6 +66,7 @@ pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     init_done: bool,
     initial_refresh: bool,
     initial_write: bool,
+    rotation: Rotation,
 }
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
@@ -80,6 +88,7 @@ where
             init_done: false,
             initial_refresh: true,
             initial_write: true,
+            rotation: Rotation::Deg0,
         }
     }
 
@@ -97,6 +106,7 @@ where
     pub fn init(&mut self, delay: &mut Delay) {
         self.reset(delay);
         self.init_display(delay);
+        self.set_rotation(Rotation::Deg270);
     }
 
     /// Clear the entire screen to white
@@ -117,11 +127,38 @@ where
 
     /// Set a pixel in the framebuffer (0,0 is top-left)
     pub fn set_pixel(&mut self, x: u16, y: u16, black: bool) {
-        if x >= WIDTH || y >= HEIGHT {
-            return;
-        }
-        let idx = (x as usize / 8) + (y as usize * (WIDTH as usize / 8));
-        let bit = 7 - (x % 8);
+        // Transform logical (x, y) to physical (px, py)
+        let (px, py) = match self.rotation {
+            Rotation::Deg0 => {
+                if x >= WIDTH || y >= HEIGHT {
+                    return;
+                }
+                (x, y)
+            }
+            Rotation::Deg90 => {
+                // Logical size: 480×800 (HEIGHT × WIDTH)
+                if x >= HEIGHT || y >= WIDTH {
+                    return;
+                }
+                (WIDTH - 1 - y, x)
+            }
+            Rotation::Deg180 => {
+                if x >= WIDTH || y >= HEIGHT {
+                    return;
+                }
+                (WIDTH - 1 - x, HEIGHT - 1 - y)
+            }
+            Rotation::Deg270 => {
+                // Logical size: 480×800 (HEIGHT × WIDTH)
+                if x >= HEIGHT || y >= WIDTH {
+                    return;
+                }
+                (y, HEIGHT - 1 - x)
+            }
+        };
+
+        let idx = (px as usize / 8) + (py as usize * (WIDTH as usize / 8));
+        let bit = 7 - (px % 8); // Use px, not x!
         if black {
             self.framebuffer[idx] &= !(1 << bit);
         } else {
@@ -146,11 +183,11 @@ where
         // Write to both buffers for full refresh
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
         self.write_full_buffer(cmd::WRITE_RAM_RED); // Previous
-        
+
         delay.delay_millis(1); // Yield between large transfers
-        
+
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-        self.write_full_buffer(cmd::WRITE_RAM_BW);  // Current
+        self.write_full_buffer(cmd::WRITE_RAM_BW); // Current
 
         self.update_full(delay);
         self.initial_refresh = false;
@@ -244,9 +281,9 @@ where
         // Driver output control
         self.send_command(cmd::DRIVER_OUTPUT_CONTROL);
         self.send_data(&[
-            ((HEIGHT - 1) & 0xFF) as u8,     // A[7:0]
-            ((HEIGHT - 1) >> 8) as u8,       // A[9:8]
-            0x02,                             // SM = interlaced
+            ((HEIGHT - 1) & 0xFF) as u8, // A[7:0]
+            ((HEIGHT - 1) >> 8) as u8,   // A[9:8]
+            0x02,                        // SM = interlaced
         ]);
 
         // Border waveform
@@ -330,21 +367,20 @@ where
         // Write in normal row order - gate reversal is handled by RAM address setup
         // (Y-decrease mode in _setPartialRamArea), NOT by reversing rows here
         let bytes_per_row = (WIDTH / 8) as usize;
-        
+
         // Use a temporary buffer to avoid borrow checker issues
         let mut row_buf = [0u8; 256];
-        
+
         for row in 0..HEIGHT as usize {
             let start = row * bytes_per_row;
             // Write row in chunks to avoid issues
             for chunk_start in (0..bytes_per_row).step_by(256) {
                 let chunk_end = (chunk_start + 256).min(bytes_per_row);
                 let chunk_len = chunk_end - chunk_start;
-                
+
                 // Copy to temp buffer
-                row_buf[..chunk_len].copy_from_slice(
-                    &self.framebuffer[start + chunk_start..start + chunk_end]
-                );
+                row_buf[..chunk_len]
+                    .copy_from_slice(&self.framebuffer[start + chunk_start..start + chunk_end]);
                 self.send_data(&row_buf[..chunk_len]);
             }
         }
@@ -367,11 +403,10 @@ where
         for row in 0..h as usize {
             let src_row = y as usize + row;
             let src_start = src_row * bytes_per_row + x_byte;
-            
+
             // Copy to temp buffer
-            row_buf[..window_bytes].copy_from_slice(
-                &self.framebuffer[src_start..src_start + window_bytes]
-            );
+            row_buf[..window_bytes]
+                .copy_from_slice(&self.framebuffer[src_start..src_start + window_bytes]);
             self.send_data(&row_buf[..window_bytes]);
         }
     }
@@ -427,6 +462,10 @@ where
         let _ = self.dc.set_high();
         let _ = self.spi.write(data);
     }
+
+    fn set_rotation(&mut self, rotation: Rotation) {
+        self.rotation = rotation;
+    }
 }
 
 // ========== embedded-graphics integration ==========
@@ -439,7 +478,10 @@ where
     BUSY: InputPin,
 {
     fn size(&self) -> Size {
-        Size::new(WIDTH as u32, HEIGHT as u32)
+        match &self.rotation {
+            Rotation::Deg0 | Rotation::Deg180 => Size::new(WIDTH as u32, HEIGHT as u32),
+            Rotation::Deg90 | Rotation::Deg270 => Size::new(HEIGHT as u32, WIDTH as u32),
+        }
     }
 }
 

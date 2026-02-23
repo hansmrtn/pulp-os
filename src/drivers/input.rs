@@ -12,8 +12,8 @@
 
 use esp_hal::time::{Duration, Instant};
 
-use crate::board::button::{decode_ladder, Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
 use crate::board::InputHw;
+use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
 
 /// Debounce time - ignore state changes shorter than this.
 const DEBOUNCE_MS: u64 = 30;

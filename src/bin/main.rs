@@ -12,7 +12,7 @@ use esp_hal::delay::Delay;
 use log::info;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_10X20, MonoTextStyle},
+    mono_font::{MonoTextStyle, ascii::FONT_10X20},
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{Circle, Line, PrimitiveStyle, Rectangle},
@@ -22,14 +22,13 @@ use embedded_graphics::{
 use pulp_os::board::Board;
 use pulp_os::drivers::input::InputDriver;
 
-
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// The rectangle that will flash on button events.
 /// X must be 8-pixel aligned for efficient partial refresh.
-const FLASH_RECT_X: u16 = 24;  // Aligned to 8 pixels
+const FLASH_RECT_X: u16 = 24; // Aligned to 8 pixels
 const FLASH_RECT_Y: u16 = 70;
 const FLASH_RECT_W: u16 = 120; // Multiple of 8
 const FLASH_RECT_H: u16 = 60;
@@ -53,7 +52,7 @@ fn main() -> ! {
 
     // Initialize display
     board.display.epd.init(&mut delay);
-    
+
     let sz = board.display.epd.size();
     let w = sz.width as i32;
     let h = sz.height as i32;
@@ -120,7 +119,7 @@ fn main() -> ! {
     loop {
         if let Some(btn) = input.poll() {
             info!("[BTN] {:?} pressed", btn);
-            
+
             // Toggle rectangle
             rect_is_black = !rect_is_black;
             let color = if rect_is_black {
@@ -146,7 +145,6 @@ fn main() -> ! {
                 FLASH_RECT_H,
                 &mut delay,
             );
-
         }
 
         delay.delay_millis(10);

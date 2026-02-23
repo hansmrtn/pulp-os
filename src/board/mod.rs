@@ -8,18 +8,18 @@ pub mod button;
 pub mod display;
 pub mod pins;
 
-pub use button::{decode_ladder, Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
-pub use display::{DisplayDriver, HEIGHT, WIDTH, FRAMEBUFFER_SIZE, SPI_FREQ_MHZ};
+pub use button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
+pub use display::{DisplayDriver, FRAMEBUFFER_SIZE, HEIGHT, SPI_FREQ_MHZ, WIDTH};
 
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{
+    Blocking,
     analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation},
     delay::Delay,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
-    peripherals::{Peripherals, ADC1, GPIO1, GPIO2},
+    peripherals::{ADC1, GPIO1, GPIO2, Peripherals},
     spi,
     time::Rate,
-    Blocking,
 };
 
 // Type Aliases
@@ -91,8 +91,7 @@ impl Board {
         let busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
 
         // SPI bus
-        let spi_cfg =
-            spi::master::Config::default().with_frequency(Rate::from_mhz(SPI_FREQ_MHZ));
+        let spi_cfg = spi::master::Config::default().with_frequency(Rate::from_mhz(SPI_FREQ_MHZ));
         let spi_bus = spi::master::Spi::new(p.SPI2, spi_cfg)
             .unwrap()
             .with_sck(p.GPIO8)

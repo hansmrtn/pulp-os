@@ -45,14 +45,14 @@ impl core::fmt::Display for Button {
 pub const DEFAULT_TOLERANCE: u16 = 150;
 
 pub const ROW1_THRESHOLDS: &[(u16, u16, Button)] = &[
-    (3, 50, Button::Right),              // Near ground
+    (3, 50, Button::Right), // Near ground
     (1113, DEFAULT_TOLERANCE, Button::Left),
     (1984, DEFAULT_TOLERANCE, Button::Back),
     (2556, DEFAULT_TOLERANCE, Button::Confirm),
 ];
 
 pub const ROW2_THRESHOLDS: &[(u16, u16, Button)] = &[
-    (3, 50, Button::VolDown),            // Near ground
+    (3, 50, Button::VolDown), // Near ground
     (1659, DEFAULT_TOLERANCE, Button::VolUp),
 ];
 
@@ -66,4 +66,3 @@ pub fn decode_ladder(mv: u16, thresholds: &[(u16, u16, Button)]) -> Option<Butto
     }
     None
 }
-
