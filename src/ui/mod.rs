@@ -1,55 +1,22 @@
 //! UI primitives for e-paper displays
-//!
-//! This module provides rotation-aware widgets that handle their own
-//! partial refresh regions automatically.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use pulp_os::ui::{Region, Widget, Label, Button};
-//! use embedded_graphics::mono_font::ascii::FONT_10X20;
-//!
-//! // Define regions (8-pixel aligned for partial refresh)
-//! const TITLE_REGION: Region = Region::new(16, 8, 200, 32);
-//! const BTN_REGION: Region = Region::new(16, 48, 96, 40);
-//!
-//! // Create widgets
-//! let title = Label::new(TITLE_REGION, "Hello!", &FONT_10X20);
-//! let mut btn = Button::new(BTN_REGION, "Click", &FONT_10X20);
-//!
-//! // Draw and refresh
-//! title.draw(&mut display).unwrap();
-//! btn.draw(&mut display).unwrap();
-//! display.refresh_full(&mut delay);
-//!
-//! // Later, update just the button
-//! btn.set_pressed(true);
-//! btn.draw(&mut display).unwrap();
-//! let r = btn.refresh_bounds();
-//! display.refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
-//! ```
 
 mod button;
 mod label;
+pub mod statusbar;
 mod widget;
-// mod progress;
 
 pub use button::{Button, ButtonStyle};
 pub use label::{DynamicLabel, Label};
+pub use statusbar::{BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes};
 pub use widget::{Alignment, Region, Widget, WidgetState};
-// pub use progress::{ProgressBar, BatteryIndicator, Orientation};
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
 
-/// Extension trait for drawing and refreshing widgets
-///
-/// This trait provides convenience methods for displays that support
-/// partial refresh. Import it to use `draw_widget` and `refresh_widget`.
+/// Extension trait for drawing widgets
 pub trait WidgetExt<D>
 where
     D: DrawTarget<Color = BinaryColor>,
 {
-    /// Draw a widget to the display (does not refresh)
     fn draw_widget<W: Widget>(&mut self, widget: &W) -> Result<(), D::Error>;
 }
 

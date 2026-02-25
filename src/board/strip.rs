@@ -1,8 +1,8 @@
-// Strip-based rendering buffer 
+// Strip-based rendering buffer
 //
 // Instead of holding a full 48KB framebuffer in SRAM, we render
 // through a small strip buffer (~4KB) and stream each strip to
-// the display controller via SPI. 
+// the display controller via SPI.
 // The display is divided into horizontal bands of physical rows.
 // For each band:
 //  1. Clear the strip buffer to white
@@ -26,7 +26,6 @@ pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8; // 100
 
 pub const STRIP_BUF_SIZE: usize = PHYS_BYTES_PER_ROW * STRIP_ROWS as usize; // 4000
 pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS; // 12
-
 
 // A small rendering buffer that covers a physical rectangle of the display.
 //
@@ -168,7 +167,7 @@ impl Default for StripBuffer {
     }
 }
 
-// embedded-graphics integration 
+// embedded-graphics integration
 
 impl OriginDimensions for StripBuffer {
     // Report FULL logical display size.

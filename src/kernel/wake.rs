@@ -1,26 +1,55 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-// Wake source flags (set by ISR and  cleared by main loop)
+// Wake source flags (set by ISR, cleared by main loop)
 static WAKE_BUTTON: AtomicBool = AtomicBool::new(false);
 static WAKE_DISPLAY: AtomicBool = AtomicBool::new(false);
 static WAKE_TIMER: AtomicBool = AtomicBool::new(false);
 
-// who done woke us up from sleep
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WakeReason {
-    Button,
-    Display,
-    Timer,
-    Multiple,
+// How many base ticks (10ms) each timer interrupt represents.
+// Normally 1. When the timer is slowed to 100ms, set to 10
+// so uptime_ticks() stays in consistent 10ms units.
+static TICK_WEIGHT: AtomicU32 = AtomicU32::new(1);
+
+// Uptime in base ticks (10ms each), regardless of actual timer period.
+// Protected by critical section because riscv32imc lacks atomic RMW.
+static UPTIME_TICKS: critical_section::Mutex<core::cell::Cell<u32>> =
+    critical_section::Mutex::new(core::cell::Cell::new(0));
+
+/// Which wake sources fired since the last check.
+///
+/// Each flag is independent — multiple sources can fire between
+/// checks and none are lost. The main loop tests each flag it
+/// cares about and dispatches accordingly.
+#[derive(Debug, Clone, Copy)]
+pub struct WakeFlags {
+    pub button: bool,
+    pub display: bool,
+    pub timer: bool,
 }
 
-pub fn take_wake_reason() -> Option<WakeReason> {
+impl WakeFlags {
+    /// True if any input-related source fired (button or timer).
+    /// Timer wakes always poll input because the ADC-based buttons
+    /// are sampled on the timer tick.
+    #[inline]
+    pub fn has_input(&self) -> bool {
+        self.button || self.timer
+    }
+}
+
+/// Atomically read and clear all pending wake flags.
+/// Returns None if nothing fired.
+fn take_wake_flags() -> Option<WakeFlags> {
     critical_section::with(|_| {
         let button = WAKE_BUTTON.load(Ordering::Relaxed);
         let display = WAKE_DISPLAY.load(Ordering::Relaxed);
         let timer = WAKE_TIMER.load(Ordering::Relaxed);
 
-        // Clear flags we read
+        if !button && !display && !timer {
+            return None;
+        }
+
+        // Clear only the flags we observed
         if button {
             WAKE_BUTTON.store(false, Ordering::Relaxed);
         }
@@ -31,34 +60,12 @@ pub fn take_wake_reason() -> Option<WakeReason> {
             WAKE_TIMER.store(false, Ordering::Relaxed);
         }
 
-        match (button, display, timer) {
-            (false, false, false) => None,
-            (true, false, false) => Some(WakeReason::Button),
-            (false, true, false) => Some(WakeReason::Display),
-            (false, false, true) => Some(WakeReason::Timer),
-            _ => Some(WakeReason::Multiple),
-        }
+        Some(WakeFlags {
+            button,
+            display,
+            timer,
+        })
     })
-}
-
-// Check pending waits (without clearing)
-pub fn has_pending_wake() -> bool {
-    WAKE_BUTTON.load(Ordering::Acquire)
-        || WAKE_DISPLAY.load(Ordering::Acquire)
-        || WAKE_TIMER.load(Ordering::Acquire)
-}
-
-// Check individual wake sources (without clearing)
-pub fn is_button_pending() -> bool {
-    WAKE_BUTTON.load(Ordering::Acquire)
-}
-
-pub fn is_display_pending() -> bool {
-    WAKE_DISPLAY.load(Ordering::Acquire)
-}
-
-pub fn is_timer_pending() -> bool {
-    WAKE_TIMER.load(Ordering::Acquire)
 }
 
 // power button was pressed.
@@ -77,6 +84,28 @@ pub fn signal_display() {
 #[inline]
 pub fn signal_timer() {
     WAKE_TIMER.store(true, Ordering::Release);
+    let weight = TICK_WEIGHT.load(Ordering::Relaxed);
+    critical_section::with(|cs| {
+        let ticks = UPTIME_TICKS.borrow(cs);
+        ticks.set(ticks.get().wrapping_add(weight));
+    });
+}
+
+/// Set the tick weight — how many base ticks (10ms) each timer
+/// interrupt represents. Called when the timer period changes.
+pub fn set_tick_weight(weight: u32) {
+    TICK_WEIGHT.store(weight, Ordering::Release);
+}
+
+/// Uptime in base ticks (10ms each) since boot.
+/// Stays consistent regardless of actual timer period.
+pub fn uptime_ticks() -> u32 {
+    critical_section::with(|cs| UPTIME_TICKS.borrow(cs).get())
+}
+
+/// Uptime in seconds since boot.
+pub fn uptime_secs() -> u32 {
+    uptime_ticks() / 100
 }
 
 #[inline]
@@ -94,32 +123,21 @@ pub fn wait_for_interrupt() {
     }
 }
 
-pub fn sleep_until_wake() -> WakeReason {
+/// Block until a wake event occurs.
+/// Used for deep sleep / idle patterns where the caller
+/// wants to hand off control entirely until something happens.
+pub fn sleep_until_wake() -> WakeFlags {
     loop {
-        if let Some(reason) = take_wake_reason() {
-            return reason;
+        if let Some(flags) = take_wake_flags() {
+            return flags;
         }
 
         wait_for_interrupt();
     }
 }
 
-// Non-blocking wake check.
-// If there's a pending wake reason, return it.
-pub fn try_wake() -> Option<WakeReason> {
-    take_wake_reason()
-}
-
-pub fn clear_all_flags() {
-    WAKE_BUTTON.store(false, Ordering::Release);
-    WAKE_DISPLAY.store(false, Ordering::Release);
-    WAKE_TIMER.store(false, Ordering::Release);
-}
-
-pub fn pending_flags() -> (bool, bool, bool) {
-    (
-        WAKE_BUTTON.load(Ordering::Acquire),
-        WAKE_DISPLAY.load(Ordering::Acquire),
-        WAKE_TIMER.load(Ordering::Acquire),
-    )
+/// Non-blocking wake check. Returns the pending wake flags
+/// (consuming them) or None if nothing fired.
+pub fn try_wake() -> Option<WakeFlags> {
+    take_wake_flags()
 }

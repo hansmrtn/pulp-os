@@ -26,7 +26,7 @@ impl TimeSource for DummyTimeSource {
 pub const SD_INIT_FREQ_HZ: u32 = 400_000;
 
 // Normal operating frequency after init
-// TODO: Put this somewhere else? 
+// TODO: Put this somewhere else?
 pub const SD_NORMAL_FREQ_HZ: u32 = 20_000_000;
 
 // Wrapper that holds the SdCard + VolumeManager together.

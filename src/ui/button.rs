@@ -5,7 +5,7 @@ use embedded_graphics::{
     mono_font::MonoTextStyle,
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle},
+    primitives::{CornerRadii, PrimitiveStyle, RoundedRectangle},
     text::Text,
 };
 

@@ -1,33 +1,47 @@
-// A simple priority-based job scheduler for cooperative multitasking
-// NOTE: No dynamic allocation and uses fixed-size queues
+// Priority-based job scheduler for cooperative multitasking.
+//
+// Jobs are signals, not data carriers. State lives in the app/driver
+// that handles the job. The scheduler only decides execution order.
+//
+// No dynamic allocation — fixed-size ring buffer queues per priority tier.
 use core::fmt;
 
+/// Schedulable units of work.
+///
+/// Jobs carry no payload. The handler reads state from wherever it
+/// lives (app struct, driver, context) when the job executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
-    HandleInput,
-    RenderPage,
+    // ── High priority: interactive, latency-sensitive ──────────
+    /// Poll the input driver for debounced button events.
+    PollInput,
+    /// Flush pending redraw (full or partial) to the display.
+    Render,
 
-    PrefetchNext,
-    PrefetchPrev,
+    // ── Normal priority: responsive but deferrable ─────────────
+    /// Run the active app's `on_work()` with OS services.
+    /// Generic — the kernel doesn't know what the app will do.
+    /// Replaces per-app job variants (no new jobs when adding apps).
+    AppWork,
+    /// Sample battery ADC and refresh the status bar text.
+    UpdateStatusBar,
 
-    LayoutChapter { chapter: u16 },
-    CacheChapter { chapter: u16 },
+    // ── Low priority: speculative / background ─────────────────
+    // (Reserved for future work: prefetch, layout, cache)
 }
 
 impl fmt::Display for Job {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Job::HandleInput => write!(f, "HandleInput"),
-            Job::RenderPage => write!(f, "RenderPage"),
-            Job::PrefetchNext => write!(f, "PrefetchNext"),
-            Job::PrefetchPrev => write!(f, "PrefetchPrev"),
-            Job::LayoutChapter { chapter } => write!(f, "LayoutChapter({})", chapter),
-            Job::CacheChapter { chapter } => write!(f, "CacheChapter({})", chapter),
+            Job::PollInput => write!(f, "PollInput"),
+            Job::Render => write!(f, "Render"),
+            Job::AppWork => write!(f, "AppWork"),
+            Job::UpdateStatusBar => write!(f, "UpdateStatusBar"),
         }
     }
 }
 
-/// Job priority levels
+/// Job priority levels (lower numeric value = higher priority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     High = 0,
@@ -38,16 +52,15 @@ pub enum Priority {
 impl Job {
     pub const fn priority(&self) -> Priority {
         match self {
-            Job::HandleInput | Job::RenderPage => Priority::High,
-            Job::PrefetchNext | Job::PrefetchPrev => Priority::Normal,
-            Job::LayoutChapter { .. } | Job::CacheChapter { .. } => Priority::Low,
+            Job::PollInput | Job::Render => Priority::High,
+            Job::AppWork | Job::UpdateStatusBar => Priority::Normal,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum PushError {
-    /// Queue for this priority level is full, contains the rejected job
+    /// Queue for this priority level is full; contains the rejected job.
     Full(Job),
 }
 
@@ -59,8 +72,9 @@ impl fmt::Display for PushError {
     }
 }
 
-// ring buffer for jobs
-pub struct JobQueue<const N: usize> {
+// ── Ring buffer ────────────────────────────────────────────────
+
+struct JobQueue<const N: usize> {
     buf: [Option<Job>; N],
     head: usize, // next to read
     tail: usize, // next to write
@@ -68,7 +82,7 @@ pub struct JobQueue<const N: usize> {
 }
 
 impl<const N: usize> JobQueue<N> {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             buf: [None; N],
             head: 0,
@@ -77,7 +91,7 @@ impl<const N: usize> JobQueue<N> {
         }
     }
 
-    pub fn push(&mut self, job: Job) -> Result<(), Job> {
+    fn push(&mut self, job: Job) -> Result<(), Job> {
         if self.len >= N {
             return Err(job);
         }
@@ -87,7 +101,7 @@ impl<const N: usize> JobQueue<N> {
         Ok(())
     }
 
-    pub fn pop(&mut self) -> Option<Job> {
+    fn pop(&mut self) -> Option<Job> {
         if self.len == 0 {
             return None;
         }
@@ -97,35 +111,11 @@ impl<const N: usize> JobQueue<N> {
         job
     }
 
-    pub fn peek(&self) -> Option<&Job> {
-        if self.len == 0 {
-            None
-        } else {
-            self.buf[self.head].as_ref()
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    pub fn is_full(&self) -> bool {
-        self.len >= N
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub const fn capacity(&self) -> usize {
-        N
-    }
-
-    pub fn clear(&mut self) {
-        while self.pop().is_some() {}
-    }
-
-    pub fn contains(&self, job: &Job) -> bool {
+    fn contains(&self, job: &Job) -> bool {
         if self.len == 0 {
             return false;
         }
@@ -142,13 +132,13 @@ impl<const N: usize> JobQueue<N> {
     }
 }
 
-impl<const N: usize> Default for JobQueue<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ── Scheduler ──────────────────────────────────────────────────
 
-// The job scheduler
+/// Priority-based job scheduler.
+///
+/// `pop()` always returns the highest-priority pending job (FIFO
+/// within each tier). Jobs can enqueue follow-on work during
+/// execution — the drain loop picks it up immediately.
 pub struct Scheduler {
     high: JobQueue<4>,
     normal: JobQueue<8>,
@@ -164,7 +154,7 @@ impl Scheduler {
         }
     }
 
-    // push a job and returns error with the job if queue is full
+    /// Push a job; returns error if the priority queue is full.
     pub fn push(&mut self, job: Job) -> Result<(), PushError> {
         let result = match job.priority() {
             Priority::High => self.high.push(job),
@@ -174,36 +164,8 @@ impl Scheduler {
         result.map_err(PushError::Full)
     }
 
-    // push a job dropping silently if queue is full
-    pub fn push_or_drop(&mut self, job: Job) -> bool {
-        self.push(job).is_ok()
-    }
-
-    // push a'job but if queue is full, drop the oldest job of same priority
-    pub fn push_replacing(&mut self, job: Job) {
-        match job.priority() {
-            Priority::High => {
-                if self.high.is_full() {
-                    self.high.pop();
-                }
-                let _ = self.high.push(job);
-            }
-            Priority::Normal => {
-                if self.normal.is_full() {
-                    self.normal.pop();
-                }
-                let _ = self.normal.push(job);
-            }
-            Priority::Low => {
-                if self.low.is_full() {
-                    self.low.pop();
-                }
-                let _ = self.low.push(job);
-            }
-        }
-    }
-
-    // Schedule a job only if it's not already queued (dedup that queue).
+    /// Schedule a job only if it's not already queued (dedup).
+    /// Primary method for enqueuing — prevents duplicate work.
     pub fn push_unique(&mut self, job: Job) -> Result<(), PushError> {
         match job.priority() {
             Priority::High => {
@@ -227,49 +189,12 @@ impl Scheduler {
         }
     }
 
-    // the next job to execute
+    /// Pop the highest-priority pending job.
     pub fn pop(&mut self) -> Option<Job> {
         self.high
             .pop()
             .or_else(|| self.normal.pop())
             .or_else(|| self.low.pop())
-    }
-
-    pub fn peek(&self) -> Option<&Job> {
-        self.high
-            .peek()
-            .or_else(|| self.normal.peek())
-            .or_else(|| self.low.peek())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.high.is_empty() && self.normal.is_empty() && self.low.is_empty()
-    }
-
-    pub fn pending(&self) -> usize {
-        self.high.len() + self.normal.len() + self.low.len()
-    }
-
-    pub fn pending_by_priority(&self, priority: Priority) -> usize {
-        match priority {
-            Priority::High => self.high.len(),
-            Priority::Normal => self.normal.len(),
-            Priority::Low => self.low.len(),
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.high.clear();
-        self.normal.clear();
-        self.low.clear();
-    }
-
-    pub fn clear_priority(&mut self, priority: Priority) {
-        match priority {
-            Priority::High => self.high.clear(),
-            Priority::Normal => self.normal.clear(),
-            Priority::Low => self.low.clear(),
-        }
     }
 }
 

@@ -7,7 +7,7 @@ use embedded_graphics::{
 };
 
 /// A rectangular region in logical coordinates.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Region {
     pub x: u16,
     pub y: u16,
@@ -56,6 +56,23 @@ impl Region {
             y: self.y,
             w: ((self.w + extra + 7) / 8) * 8, // Round up width to compensate
             h: self.h,
+        }
+    }
+
+    /// Bounding box union of two regions.
+    /// The result is the smallest region that contains both inputs.
+    /// May over-cover the gap between disjoint regions, but never
+    /// under-covers either one.
+    pub fn union(self, other: Region) -> Self {
+        let x1 = self.x.min(other.x);
+        let y1 = self.y.min(other.y);
+        let x2 = (self.x + self.w).max(other.x + other.w);
+        let y2 = (self.y + self.h).max(other.y + other.h);
+        Self {
+            x: x1,
+            y: y1,
+            w: x2 - x1,
+            h: y2 - y1,
         }
     }
 

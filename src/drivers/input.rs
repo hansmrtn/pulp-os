@@ -4,7 +4,7 @@
 // single "one button at a time" deal:
 // - Row 1 ADC (GPIO1): Right, Left, Confirm, Back via resistance ladder
 // - Row 2 ADC (GPIO2): Volume Up/Down via resistance ladder
-// - Power button (GPIO3): Digital input, active low
+// - Power button (GPIO3): Interrupt-driven, read via board::power_button_is_low()
 // NOTE: Because each resistance ladder can only report one press at a time,
 // we collapse everything into `Option<Button>` per poll cycle.
 
@@ -153,8 +153,10 @@ impl InputDriver {
 
     /// Read raw button state from hardware (before debouncing).
     fn read_raw(&mut self) -> Option<Button> {
-        // Power button has priority (digital, active low)
-        if self.hw.power.is_low() {
+        // Power button: interrupt-driven, read level from shared static.
+        // The GPIO interrupt already woke us via signal_button();
+        // here we just need the current pin state for debounce.
+        if crate::board::power_button_is_low() {
             return Some(Button::Power);
         }
 
@@ -163,5 +165,18 @@ impl InputDriver {
         let mv2: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row2)).unwrap();
 
         decode_ladder(mv1, ROW1_THRESHOLDS).or_else(|| decode_ladder(mv2, ROW2_THRESHOLDS))
+    }
+
+    /// Read battery voltage in millivolts (ADC-calibrated, before divider correction).
+    /// The X4 has a voltage divider on GPIO0 — multiply by 2 for actual battery mV.
+    pub fn read_battery_mv(&mut self) -> u16 {
+        nb::block!(self.hw.adc.read_oneshot(&mut self.hw.battery)).unwrap()
+    }
+
+    /// True when raw button activity was detected but debounce hasn't
+    /// confirmed it yet. Used by the idle timer to snap back to fast
+    /// polling so the confirmation arrives in ~10ms, not ~100ms.
+    pub fn is_debouncing(&self) -> bool {
+        self.candidate.is_some() && self.candidate != self.stable
     }
 }
