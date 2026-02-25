@@ -251,6 +251,10 @@ where
         // This is writeImageAgain() in GxEPD2
         self.write_image_partial_physical(cmd::WRITE_RAM_RED, px, py, pw, ph);
         self.write_image_partial_physical(cmd::WRITE_RAM_BW, px, py, pw, ph);
+
+        // Step 4: Power off display controller to save power.
+        // E-paper retains image without power. Leaving it on draws ~15mA idle.
+        self.power_off(delay);
     }
 
     /// Transform logical region to physical region based on rotation

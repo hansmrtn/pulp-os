@@ -123,8 +123,7 @@ fn main() -> ! {
         }
 
         // 2. Check wake events (non-blocking).
-        //    When nothing is pending, idle briefly so we don't spin at full speed.
-        //    TODO: replace with proper WFI once esp-hal wake sources are configured.
+        //    When nothing is pending, WFI suspends the core until the next interrupt.
         let should_poll = match try_wake() {
             Some(WakeReason::Timer) | Some(WakeReason::Multiple) => poller.tick(),
 
@@ -139,7 +138,7 @@ fn main() -> ! {
             }
 
             None => {
-                delay.delay_millis(1);
+                pulp_os::kernel::wake::wait_for_interrupt();
                 continue;
             }
         };
