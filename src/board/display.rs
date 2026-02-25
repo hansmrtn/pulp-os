@@ -3,10 +3,10 @@
 //! Based on GxEPD2_426_GDEQ0426T82.cpp by Jean-Marc Zingg
 //! <https://github.com/ZinggJM/GxEPD2>
 use embedded_graphics_core::{
+    Pixel,
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
     pixelcolor::BinaryColor,
-    Pixel,
 };
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
@@ -17,8 +17,8 @@ pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
 pub const FRAMEBUFFER_SIZE: usize = (WIDTH as usize * HEIGHT as usize) / 8;
 
-// SPI frequency (10MHz as per GxEPD2)
-pub const SPI_FREQ_MHZ: u32 = 10;
+// SPI frequency
+pub const SPI_FREQ_MHZ: u32 = 20;
 
 // Timing constants from GxEPD2
 #[allow(dead_code)]
@@ -53,8 +53,8 @@ mod cmd {
     pub const MASTER_ACTIVATION: u8 = 0x20;
     pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
     pub const DISPLAY_UPDATE_CONTROL_2: u8 = 0x22;
-    pub const WRITE_RAM_BW: u8 = 0x24;       // Current/New buffer
-    pub const WRITE_RAM_RED: u8 = 0x26;      // Previous buffer (for differential)
+    pub const WRITE_RAM_BW: u8 = 0x24; // Current/New buffer
+    pub const WRITE_RAM_RED: u8 = 0x26; // Previous buffer (for differential)
     pub const BORDER_WAVEFORM: u8 = 0x3C;
     pub const SET_RAM_X_RANGE: u8 = 0x44;
     pub const SET_RAM_Y_RANGE: u8 = 0x45;
@@ -196,23 +196,19 @@ where
         // Write to both buffers for full refresh
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
         self.write_full_buffer(cmd::WRITE_RAM_RED); // Previous
-        
+
         delay.delay_millis(1); // Yield between large transfers
-        
+
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-        self.write_full_buffer(cmd::WRITE_RAM_BW);  // Current
+        self.write_full_buffer(cmd::WRITE_RAM_BW); // Current
 
         self.update_full(delay);
         self.initial_refresh = false;
         self.initial_write = false;
     }
 
-    /// Partial screen refresh (fast, for small updates)
-    /// Takes LOGICAL coordinates (affected by rotation)
-    /// Matches GxEPD2's drawImage() sequence exactly:
-    /// 1. writeImage to 0x24 (current buffer only)
-    /// 2. refresh (partial update compares 0x24 vs 0x26)
-    /// 3. writeImageAgain to BOTH 0x26 and 0x24 (sync buffers for next update)
+    /// Partial screen refresh
+    /// Takes LOGICAL coordinates
     pub fn refresh_partial(&mut self, x: u16, y: u16, w: u16, h: u16, delay: &mut Delay) {
         // Initial refresh must be full
         if self.initial_refresh {
@@ -267,12 +263,8 @@ where
                 // But we need the physical top-left of the region
                 (WIDTH - y - h, x, h, w)
             }
-            Rotation::Deg180 => {
-                (WIDTH - x - w, HEIGHT - y - h, w, h)
-            }
-            Rotation::Deg270 => {
-                (y, HEIGHT - x - w, h, w)
-            }
+            Rotation::Deg180 => (WIDTH - x - w, HEIGHT - y - h, w, h),
+            Rotation::Deg270 => (y, HEIGHT - x - w, h, w),
         }
     }
 
@@ -318,9 +310,9 @@ where
         // Driver output control
         self.send_command(cmd::DRIVER_OUTPUT_CONTROL);
         self.send_data(&[
-            ((HEIGHT - 1) & 0xFF) as u8,     // A[7:0]
-            ((HEIGHT - 1) >> 8) as u8,       // A[9:8]
-            0x02,                             // SM = interlaced
+            ((HEIGHT - 1) & 0xFF) as u8, // A[7:0]
+            ((HEIGHT - 1) >> 8) as u8,   // A[9:8]
+            0x02,                        // SM = interlaced
         ]);
 
         // Border waveform
@@ -404,21 +396,20 @@ where
         // Write in normal row order - gate reversal is handled by RAM address setup
         // (Y-decrease mode in _setPartialRamArea), NOT by reversing rows here
         let bytes_per_row = (WIDTH / 8) as usize;
-        
+
         // Use a temporary buffer to avoid borrow checker issues
         let mut row_buf = [0u8; 256];
-        
+
         for row in 0..HEIGHT as usize {
             let start = row * bytes_per_row;
             // Write row in chunks to avoid issues
             for chunk_start in (0..bytes_per_row).step_by(256) {
                 let chunk_end = (chunk_start + 256).min(bytes_per_row);
                 let chunk_len = chunk_end - chunk_start;
-                
+
                 // Copy to temp buffer
-                row_buf[..chunk_len].copy_from_slice(
-                    &self.framebuffer[start + chunk_start..start + chunk_end]
-                );
+                row_buf[..chunk_len]
+                    .copy_from_slice(&self.framebuffer[start + chunk_start..start + chunk_end]);
                 self.send_data(&row_buf[..chunk_len]);
             }
         }
@@ -442,11 +433,10 @@ where
         for row in 0..h as usize {
             let src_row = y as usize + row;
             let src_start = src_row * bytes_per_row + x_byte;
-            
+
             // Copy to temp buffer
-            row_buf[..window_bytes].copy_from_slice(
-                &self.framebuffer[src_start..src_start + window_bytes]
-            );
+            row_buf[..window_bytes]
+                .copy_from_slice(&self.framebuffer[src_start..src_start + window_bytes]);
             self.send_data(&row_buf[..window_bytes]);
         }
     }
@@ -504,7 +494,7 @@ where
     }
 }
 
-// embedded-graphics integration 
+// embedded-graphics integration
 
 impl<SPI, DC, RST, BUSY, E> OriginDimensions for DisplayDriver<SPI, DC, RST, BUSY>
 where
