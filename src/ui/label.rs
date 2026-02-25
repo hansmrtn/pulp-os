@@ -1,12 +1,12 @@
 use embedded_graphics::{
-    prelude::*,
-    pixelcolor::BinaryColor,
     mono_font::{MonoFont, MonoTextStyle},
-    text::Text,
+    pixelcolor::BinaryColor,
+    prelude::*,
     primitives::PrimitiveStyle,
+    text::Text,
 };
 
-use super::widget::{Region, Widget, Alignment, WidgetState};
+use super::widget::{Alignment, Region, Widget, WidgetState};
 
 /// A text label widget
 /// Automatically handles background clearing on redraw.
@@ -88,7 +88,7 @@ impl<'a> Widget for Label<'a> {
         // Calculate text position
         let text_size = self.text_size();
         let mut pos = self.alignment.position(self.region, text_size);
-        
+
         // Adjust for text baseline (embedded-graphics draws from baseline)
         pos.y += self.font.character_size.height as i32;
 
@@ -226,7 +226,7 @@ impl<const N: usize> Widget for DynamicLabel<N> {
 }
 
 /// Write formatted text to a DynamicLabel
-/// 
+///
 /// Usage:
 /// ```ignore
 /// use core::fmt::Write;

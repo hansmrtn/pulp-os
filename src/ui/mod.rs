@@ -29,14 +29,14 @@
 //! display.refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
 //! ```
 
-mod widget;
-mod label;
 mod button;
+mod label;
+mod widget;
 // mod progress;
 
-pub use widget::{Region, Widget, Alignment, WidgetState};
-pub use label::{Label, DynamicLabel};
 pub use button::{Button, ButtonStyle};
+pub use label::{DynamicLabel, Label};
+pub use widget::{Alignment, Region, Widget, WidgetState};
 // pub use progress::{ProgressBar, BatteryIndicator, Orientation};
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
@@ -61,4 +61,3 @@ where
         widget.draw(self)
     }
 }
-

@@ -1,15 +1,15 @@
 //! Button widget for interactive UI elements
 
 use embedded_graphics::{
-    prelude::*,
-    pixelcolor::BinaryColor,
     mono_font::MonoFont,
     mono_font::MonoTextStyle,
+    pixelcolor::BinaryColor,
+    prelude::*,
+    primitives::{CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle},
     text::Text,
-    primitives::{Rectangle, PrimitiveStyle, RoundedRectangle, CornerRadii},
 };
 
-use super::widget::{Region, Widget, Alignment, WidgetState};
+use super::widget::{Alignment, Region, Widget, WidgetState};
 
 /// Button visual style
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -112,7 +112,8 @@ impl<'a> Widget for Button<'a> {
                     .draw(display)?;
             }
             ButtonStyle::Rounded(radius) => {
-                let rounded = RoundedRectangle::new(rect, CornerRadii::new(Size::new(radius, radius)));
+                let rounded =
+                    RoundedRectangle::new(rect, CornerRadii::new(Size::new(radius, radius)));
                 // Clear background
                 rounded
                     .into_styled(PrimitiveStyle::with_fill(bg))

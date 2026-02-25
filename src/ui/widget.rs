@@ -1,9 +1,9 @@
 //! Widgets are self-contained UI elements that know their bounds and can
 //! draw themselves. They work in logical coordinates (rotation-aware).
 use embedded_graphics::{
-    prelude::*,
     pixelcolor::BinaryColor,
-    primitives::{Rectangle, PrimitiveStyle},
+    prelude::*,
+    primitives::{PrimitiveStyle, Rectangle},
 };
 
 /// A rectangular region in logical coordinates.
@@ -44,10 +44,7 @@ impl Region {
     }
 
     pub fn center(self) -> Point {
-        Point::new(
-            (self.x + self.w / 2) as i32,
-            (self.y + self.h / 2) as i32,
-        )
+        Point::new((self.x + self.w / 2) as i32, (self.y + self.h / 2) as i32)
     }
 
     /// Align X to 8-pixel boundary (required for partial refresh)
