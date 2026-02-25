@@ -16,6 +16,7 @@ use critical_section::Mutex;
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 
 use pulp_os::board::Board;
+use pulp_os::board::StripBuffer;
 use pulp_os::board::button::Button as HwButton;
 use pulp_os::drivers::input::{Event, InputDriver};
 use pulp_os::kernel::wake::{WakeReason, signal_timer, try_wake};
@@ -73,8 +74,10 @@ fn main() -> ! {
     let mut delay = Delay::new();
 
     board.display.epd.init(&mut delay);
-    board.display.epd.fill_white();
     info!("hardware initialized.");
+
+    // strip buffer — 4KB instead of 48KB framebuffer
+    let mut strip = StripBuffer::new();
 
     // widgets
     let title = Label::new(TITLE, "pulp-os", &FONT_10X20);
@@ -85,11 +88,12 @@ fn main() -> ! {
     let mut selected: usize = 0;
     item0.set_pressed(true);
 
-    title.draw(&mut board.display.epd).unwrap();
-    item0.draw(&mut board.display.epd).unwrap();
-    item1.draw(&mut board.display.epd).unwrap();
-    status.draw(&mut board.display.epd).unwrap();
-    board.display.epd.refresh_full(&mut delay);
+    board.display.epd.render_full(&mut strip, &mut delay, |s| {
+        title.draw(s).unwrap();
+        item0.draw(s).unwrap();
+        item1.draw(s).unwrap();
+        status.draw(s).unwrap();
+    });
 
     info!("ui ready.");
 
@@ -123,7 +127,7 @@ fn main() -> ! {
         }
 
         // 2. Check wake events (non-blocking).
-        //    When nothing is pending, WFI suspends the core until the next interrupt.
+        //    When nothing is pending, idle via WFI so we don't spin at full speed.
         let should_poll = match try_wake() {
             Some(WakeReason::Timer) | Some(WakeReason::Multiple) => poller.tick(),
 
@@ -169,6 +173,7 @@ fn main() -> ! {
                                 &mut item0,
                                 &mut item1,
                                 &mut board.display.epd,
+                                &mut strip,
                                 &mut delay,
                             );
                         }
@@ -183,6 +188,7 @@ fn main() -> ! {
                                 &mut item0,
                                 &mut item1,
                                 &mut board.display.epd,
+                                &mut strip,
                                 &mut delay,
                             );
                         }
@@ -195,12 +201,18 @@ fn main() -> ! {
                             "Selected: Item 1"
                         };
                         status.set_text(msg);
-                        status.draw(&mut board.display.epd).unwrap();
                         let r = status.refresh_bounds();
-                        board
-                            .display
-                            .epd
-                            .refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
+                        board.display.epd.render_partial(
+                            &mut strip,
+                            r.x,
+                            r.y,
+                            r.w,
+                            r.h,
+                            &mut delay,
+                            |s| {
+                                status.draw(s).unwrap();
+                            },
+                        );
                         scheduler.push_or_drop(Job::RenderPage);
                     }
                     HwButton::Power => {
@@ -217,12 +229,18 @@ fn main() -> ! {
                 info!("[BTN] LongPress: {}", button.name());
                 if button == HwButton::Power {
                     status.set_text("Shutting down...");
-                    status.draw(&mut board.display.epd).unwrap();
                     let r = status.refresh_bounds();
-                    board
-                        .display
-                        .epd
-                        .refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
+                    board.display.epd.render_partial(
+                        &mut strip,
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        &mut delay,
+                        |s| {
+                            status.draw(s).unwrap();
+                        },
+                    );
                 }
             }
             Event::Repeat(button) => {
@@ -239,17 +257,18 @@ fn update_selection(
     item0: &mut Button,
     item1: &mut Button,
     display: &mut Epd,
+    strip: &mut StripBuffer,
     delay: &mut Delay,
 ) {
     item0.set_pressed(selected == 0);
     item1.set_pressed(selected == 1);
 
-    item0.draw(display).unwrap();
-    item1.draw(display).unwrap();
-
-    // Single refresh for both items
+    // Single partial refresh for both items
     let r = Region::new(16, 80, 200, 112).align8();
-    display.refresh_partial(r.x, r.y, r.w, r.h, delay);
+    display.render_partial(strip, r.x, r.y, r.w, r.h, delay, |s| {
+        item0.draw(s).unwrap();
+        item1.draw(s).unwrap();
+    });
 
     info!("Selected: Item {}", selected);
 }

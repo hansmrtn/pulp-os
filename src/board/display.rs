@@ -2,20 +2,16 @@
 //!
 //! Based on GxEPD2_426_GDEQ0426T82.cpp by Jean-Marc Zingg
 //! <https://github.com/ZinggJM/GxEPD2>
-use embedded_graphics_core::{
-    Pixel,
-    draw_target::DrawTarget,
-    geometry::{OriginDimensions, Size},
-    pixelcolor::BinaryColor,
-};
+use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
+use super::strip::{StripBuffer, STRIP_BUF_SIZE, STRIP_COUNT};
+
 // Display dimensions (physical)
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
-pub const FRAMEBUFFER_SIZE: usize = (WIDTH as usize * HEIGHT as usize) / 8;
 
 // SPI frequency
 pub const SPI_FREQ_MHZ: u32 = 20;
@@ -30,18 +26,14 @@ const PARTIAL_REFRESH_TIME_MS: u32 = 600;
 /// Display rotation
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Rotation {
-    /// Landscape, 800x480, no rotation
     #[default]
     Deg0,
-    /// Portrait, 480x800, rotated 90° clockwise
     Deg90,
-    /// Landscape, 800x480, upside down
     Deg180,
-    /// Portrait, 480x800, rotated 270° clockwise  
     Deg270,
 }
 
-// SSD1677 Commands (matching GxEPD2 exactly)
+// SSD1677 Commands (matching GxEPD2 
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
     pub const BOOSTER_SOFT_START: u8 = 0x0C;
@@ -49,6 +41,7 @@ mod cmd {
     pub const DATA_ENTRY_MODE: u8 = 0x11;
     pub const SW_RESET: u8 = 0x12;
     pub const TEMPERATURE_SENSOR: u8 = 0x18;
+    #[allow(dead_code)]
     pub const WRITE_TEMP_REGISTER: u8 = 0x1A;
     pub const MASTER_ACTIVATION: u8 = 0x20;
     pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
@@ -62,18 +55,18 @@ mod cmd {
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
 }
 
-/// Display driver for SSD1677-based e-paper (GDEQ0426T82)
+// Display driver for SSD1677-based e-paper (GDEQ0426T82)
+// No framebuffer — rendering is done through StripBuffer.
+// The display controller has its own 48KB RAM; we stream into it.
 pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     spi: SPI,
     dc: DC,
     rst: RST,
     busy: BUSY,
-    framebuffer: [u8; FRAMEBUFFER_SIZE],
     rotation: Rotation,
     power_is_on: bool,
     init_done: bool,
     initial_refresh: bool,
-    initial_write: bool,
 }
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
@@ -83,33 +76,28 @@ where
     RST: OutputPin,
     BUSY: InputPin,
 {
-    /// Create a new display driver
+    // Create a new display driver
     pub fn new(spi: SPI, dc: DC, rst: RST, busy: BUSY) -> Self {
         Self {
             spi,
             dc,
             rst,
             busy,
-            framebuffer: [0xFF; FRAMEBUFFER_SIZE], // White
             rotation: Rotation::Deg270,
             power_is_on: false,
             init_done: false,
             initial_refresh: true,
-            initial_write: true,
         }
     }
 
-    /// Set display rotation
     pub fn set_rotation(&mut self, rotation: Rotation) {
         self.rotation = rotation;
     }
 
-    /// Get current rotation
     pub fn rotation(&self) -> Rotation {
         self.rotation
     }
 
-    /// Get logical display size (accounts for rotation)
     pub fn size(&self) -> Size {
         match self.rotation {
             Rotation::Deg0 | Rotation::Deg180 => Size::new(WIDTH as u32, HEIGHT as u32),
@@ -117,7 +105,6 @@ where
         }
     }
 
-    /// Hardware reset
     pub fn reset(&mut self, delay: &mut Delay) {
         let _ = self.rst.set_high();
         delay.delay_millis(20);
@@ -127,92 +114,58 @@ where
         delay.delay_millis(20);
     }
 
-    /// Initialize the display
     pub fn init(&mut self, delay: &mut Delay) {
         self.reset(delay);
         self.init_display(delay);
     }
 
-    /// Clear the entire screen to white
     pub fn clear(&mut self, delay: &mut Delay) {
-        self.framebuffer.fill(0xFF);
         self.clear_screen(delay);
     }
 
-    /// Fill framebuffer only (no display update)
-    pub fn fill_white(&mut self) {
-        self.framebuffer.fill(0xFF);
-    }
-
-    /// Fill framebuffer with black (no display update)  
-    pub fn fill_black(&mut self) {
-        self.framebuffer.fill(0x00);
-    }
-
-    /// Set a pixel in the framebuffer using LOGICAL coordinates
-    /// Coordinates are transformed based on rotation
-    pub fn set_pixel(&mut self, x: u16, y: u16, black: bool) {
-        // Get logical dimensions for bounds check
-        let (log_w, log_h) = match self.rotation {
-            Rotation::Deg0 | Rotation::Deg180 => (WIDTH, HEIGHT),
-            Rotation::Deg90 | Rotation::Deg270 => (HEIGHT, WIDTH),
-        };
-
-        if x >= log_w || y >= log_h {
-            return;
-        }
-
-        // Transform logical → physical coordinates
-        let (px, py) = match self.rotation {
-            Rotation::Deg0 => (x, y),
-            Rotation::Deg90 => (WIDTH - 1 - y, x),
-            Rotation::Deg180 => (WIDTH - 1 - x, HEIGHT - 1 - y),
-            Rotation::Deg270 => (y, HEIGHT - 1 - x),
-        };
-
-        let idx = (px as usize / 8) + (py as usize * (WIDTH as usize / 8));
-        let bit = 7 - (px % 8);
-        if black {
-            self.framebuffer[idx] &= !(1 << bit);
-        } else {
-            self.framebuffer[idx] |= 1 << bit;
-        }
-    }
-
-    /// Fill framebuffer with color (true = black, false = white)
-    pub fn fill(&mut self, black: bool) {
-        self.framebuffer.fill(if black { 0x00 } else { 0xFF });
-    }
-
-    /// Full screen refresh (use after initial setup or to clear ghosting)
-    pub fn refresh_full(&mut self, delay: &mut Delay) {
+    pub fn render_full<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: F)
+    where
+        F: Fn(&mut StripBuffer),
+    {
         if !self.init_done {
             self.init_display(delay);
         }
 
-        // Small delay to ensure display is ready
         delay.delay_millis(1);
 
-        // Write to both buffers for full refresh
-        self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-        self.write_full_buffer(cmd::WRITE_RAM_RED); // Previous
+        // Write to both display RAM buffers via strips
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
 
-        delay.delay_millis(1); // Yield between large transfers
-
-        self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-        self.write_full_buffer(cmd::WRITE_RAM_BW); // Current
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+            }
+        }
 
         self.update_full(delay);
         self.initial_refresh = false;
-        self.initial_write = false;
     }
 
-    /// Partial screen refresh
-    /// Takes LOGICAL coordinates
-    pub fn refresh_partial(&mut self, x: u16, y: u16, w: u16, h: u16, delay: &mut Delay) {
+    /// Render a partial region and do a partial refresh.
+    pub fn render_partial<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        delay: &mut Delay,
+        draw: F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
         // Initial refresh must be full
         if self.initial_refresh {
-            return self.refresh_full(delay);
+            return self.render_full(strip, delay, draw);
         }
 
         if !self.init_done {
@@ -240,44 +193,34 @@ where
             return;
         }
 
-        // Step 1: Write to current buffer (0x24) only
-        self.write_image_partial_physical(cmd::WRITE_RAM_BW, px, py, pw, ph);
+        self.write_region_strips(strip, px, py, pw, ph, cmd::WRITE_RAM_BW, &draw);
 
-        // Step 2: Partial refresh
         self.set_partial_ram_area(px, py, pw, ph);
         self.update_partial(delay);
 
-        // Step 3: Sync buffers - write to BOTH previous (0x26) AND current (0x24)
-        // This is writeImageAgain() in GxEPD2
-        self.write_image_partial_physical(cmd::WRITE_RAM_RED, px, py, pw, ph);
-        self.write_image_partial_physical(cmd::WRITE_RAM_BW, px, py, pw, ph);
+        self.write_region_strips(strip, px, py, pw, ph, cmd::WRITE_RAM_RED, &draw);
+        self.write_region_strips(strip, px, py, pw, ph, cmd::WRITE_RAM_BW, &draw);
 
-        // Step 4: Power off display controller to save power.
-        // E-paper retains image without power. Leaving it on draws ~15mA idle.
         self.power_off(delay);
     }
 
-    /// Transform logical region to physical region based on rotation
-    fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
-        match self.rotation {
-            Rotation::Deg0 => (x, y, w, h),
-            Rotation::Deg90 => {
-                // Logical (x,y,w,h) in 480x800 → Physical in 800x480
-                // Logical top-left (x,y) → Physical (WIDTH-1-y, x)
-                // But we need the physical top-left of the region
-                (WIDTH - y - h, x, h, w)
-            }
-            Rotation::Deg180 => (WIDTH - x - w, HEIGHT - y - h, w, h),
-            Rotation::Deg270 => (y, HEIGHT - x - w, h, w),
-        }
+    // partial refresh with a region tuple
+    pub fn render_window<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        delay: &mut Delay,
+        draw: F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        self.render_partial(strip, x, y, w, h, delay, draw);
     }
 
-    /// Refresh a rectangular window (convenience method)
-    pub fn refresh_window(&mut self, x: u16, y: u16, w: u16, h: u16, delay: &mut Delay) {
-        self.refresh_partial(x, y, w, h, delay);
-    }
-
-    /// Power off the display (reduces power consumption, prevents fading)
+    // Power off the display 
     pub fn power_off(&mut self, delay: &mut Delay) {
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
@@ -296,7 +239,35 @@ where
         self.init_done = false;
     }
 
-    // ========== Private methods ==========
+    /// Write a physical region to display RAM using strip iteration.
+    /// Handles regions larger than the strip buffer by splitting into
+    /// multiple passes with as many rows as fit.
+    fn write_region_strips<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        px: u16,
+        py: u16,
+        pw: u16,
+        ph: u16,
+        ram_cmd: u8,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        let max_rows = StripBuffer::max_rows_for_width(pw);
+
+        self.set_partial_ram_area(px, py, pw, ph);
+        self.send_command(ram_cmd);
+
+        let mut y = py;
+        while y < py + ph {
+            let rows = max_rows.min(py + ph - y);
+            strip.begin_window(self.rotation, px, y, pw, rows);
+            draw(strip);
+            self.send_data(strip.data());
+            y += rows;
+        }
+    }
 
     fn init_display(&mut self, delay: &mut Delay) {
         // Software reset
@@ -327,6 +298,21 @@ where
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
 
         self.init_done = true;
+    }
+
+    // Transform logical region to physical region based on rotation
+    fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
+        match self.rotation {
+            Rotation::Deg0 => (x, y, w, h),
+            Rotation::Deg90 => {
+                // Logical (x,y,w,h) in 480x800 → Physical in 800x480
+                // Logical top-left (x,y) → Physical (WIDTH-1-y, x)
+                // But we need the physical top-left of the region
+                (WIDTH - y - h, x, h, w)
+            }
+            Rotation::Deg180 => (WIDTH - x - w, HEIGHT - y - h, w, h),
+            Rotation::Deg270 => (y, HEIGHT - x - w, h, w),
+        }
     }
 
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
@@ -372,14 +358,13 @@ where
             self.init_display(delay);
         }
 
-        // Write white to both buffers
+        // write white to both buffers
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
         self.write_screen_buffer(cmd::WRITE_RAM_RED, 0xFF);
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
         self.write_screen_buffer(cmd::WRITE_RAM_BW, 0xFF);
 
         self.update_full(delay);
-        self.initial_write = false;
         self.initial_refresh = false;
     }
 
@@ -395,63 +380,10 @@ where
         }
     }
 
-    fn write_full_buffer(&mut self, command: u8) {
-        self.send_command(command);
-        // Write in normal row order - gate reversal is handled by RAM address setup
-        // (Y-decrease mode in _setPartialRamArea), NOT by reversing rows here
-        let bytes_per_row = (WIDTH / 8) as usize;
-
-        // Use a temporary buffer to avoid borrow checker issues
-        let mut row_buf = [0u8; 256];
-
-        for row in 0..HEIGHT as usize {
-            let start = row * bytes_per_row;
-            // Write row in chunks to avoid issues
-            for chunk_start in (0..bytes_per_row).step_by(256) {
-                let chunk_end = (chunk_start + 256).min(bytes_per_row);
-                let chunk_len = chunk_end - chunk_start;
-
-                // Copy to temp buffer
-                row_buf[..chunk_len]
-                    .copy_from_slice(&self.framebuffer[start + chunk_start..start + chunk_end]);
-                self.send_data(&row_buf[..chunk_len]);
-            }
-        }
-    }
-
-    fn write_image_partial_physical(&mut self, command: u8, x: u16, y: u16, w: u16, h: u16) {
-        self.set_partial_ram_area(x, y, w, h);
-        self.send_command(command);
-
-        let bytes_per_row = (WIDTH / 8) as usize;
-        let window_bytes = (w / 8) as usize;
-        let x_byte = (x / 8) as usize;
-
-        // Use a temporary buffer to avoid borrow checker issues
-        // Max window width is 800/8 = 100 bytes per row
-        let mut row_buf = [0u8; 100];
-
-        // Write rows in NORMAL order (row 0, 1, 2, ...)
-        // Gate reversal is handled by the RAM address setup, not here!
-        // x, y, w, h are PHYSICAL coordinates
-        for row in 0..h as usize {
-            let src_row = y as usize + row;
-            let src_start = src_row * bytes_per_row + x_byte;
-
-            // Copy to temp buffer
-            row_buf[..window_bytes]
-                .copy_from_slice(&self.framebuffer[src_start..src_start + window_bytes]);
-            self.send_data(&row_buf[..window_bytes]);
-        }
-    }
-
     fn update_full(&mut self, delay: &mut Delay) {
-        // Display Update Control 1: bypass RED as 0
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        // Use standard full refresh (0xF7) - more reliable than fast mode (0xD7)
-        // Fast mode requires temperature register which may not work on all panels
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
         self.send_data(&[0xF7]);
 
@@ -462,7 +394,6 @@ where
     }
 
     fn update_partial(&mut self, delay: &mut Delay) {
-        // Display Update Control 1: RED normal
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
@@ -499,6 +430,7 @@ where
 }
 
 // embedded-graphics integration
+// NOTE: size queriies only, drawing goes through StripBuffer
 
 impl<SPI, DC, RST, BUSY, E> OriginDimensions for DisplayDriver<SPI, DC, RST, BUSY>
 where
@@ -512,37 +444,5 @@ where
             Rotation::Deg0 | Rotation::Deg180 => Size::new(WIDTH as u32, HEIGHT as u32),
             Rotation::Deg90 | Rotation::Deg270 => Size::new(HEIGHT as u32, WIDTH as u32),
         }
-    }
-}
-
-impl<SPI, DC, RST, BUSY, E> DrawTarget for DisplayDriver<SPI, DC, RST, BUSY>
-where
-    SPI: SpiDevice<Error = E>,
-    DC: OutputPin,
-    RST: OutputPin,
-    BUSY: InputPin,
-{
-    type Color = BinaryColor;
-    type Error = core::convert::Infallible;
-
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Self::Color>>,
-    {
-        let size = self.size();
-        let log_w = size.width as i32;
-        let log_h = size.height as i32;
-
-        for Pixel(coord, color) in pixels {
-            // Bounds check against LOGICAL dimensions
-            if coord.x >= 0 && coord.x < log_w && coord.y >= 0 && coord.y < log_h {
-                self.set_pixel(
-                    coord.x as u16,
-                    coord.y as u16,
-                    color == BinaryColor::On, // On = black (foreground), Off = white (background)
-                );
-            }
-        }
-        Ok(())
     }
 }

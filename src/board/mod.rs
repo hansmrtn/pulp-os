@@ -7,9 +7,11 @@
 pub mod button;
 pub mod display;
 pub mod pins;
+pub mod strip;
 
 pub use button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
-pub use display::{DisplayDriver, FRAMEBUFFER_SIZE, HEIGHT, SPI_FREQ_MHZ, WIDTH};
+pub use display::{DisplayDriver, HEIGHT, SPI_FREQ_MHZ, WIDTH};
+pub use strip::StripBuffer;
 
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{
