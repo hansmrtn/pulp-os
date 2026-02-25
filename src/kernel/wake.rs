@@ -79,7 +79,6 @@ pub fn signal_timer() {
     WAKE_TIMER.store(true, Ordering::Release);
 }
 
-
 #[inline]
 pub fn wait_for_interrupt() {
     #[cfg(target_arch = "riscv32")]

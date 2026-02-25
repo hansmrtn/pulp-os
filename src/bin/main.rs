@@ -6,8 +6,8 @@ use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::interrupt::Priority;
 use esp_hal::time::Duration;
-use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::PeriodicTimer;
+use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
 use core::cell::RefCell;
@@ -18,8 +18,8 @@ use embedded_graphics::mono_font::ascii::FONT_10X20;
 use pulp_os::board::Board;
 use pulp_os::board::button::Button as HwButton;
 use pulp_os::drivers::input::{Event, InputDriver};
+use pulp_os::kernel::wake::{WakeReason, signal_timer, try_wake};
 use pulp_os::kernel::{AdaptivePoller, Job, Scheduler};
-use pulp_os::kernel::wake::{signal_timer, try_wake, WakeReason};
 use pulp_os::ui::{Button, Label, Region, Widget};
 
 extern crate alloc;
@@ -40,7 +40,7 @@ fn timer0_handler() {
     signal_timer();
 }
 
-// test ui 
+// test ui
 const TITLE: Region = Region::new(16, 16, 200, 32);
 const ITEM0: Region = Region::new(16, 80, 200, 48);
 const ITEM1: Region = Region::new(16, 144, 200, 48);
@@ -62,6 +62,7 @@ fn main() -> ! {
     critical_section::with(|cs| {
         timer0.set_interrupt_handler(timer0_handler);
         timer0.start(Duration::from_millis(10)).unwrap();
+        timer0.listen();
         TIMER0.borrow_ref_mut(cs).replace(timer0);
     });
 
@@ -98,9 +99,8 @@ fn main() -> ! {
 
     info!("kernel ready.");
 
-    let mut tick_count: u32 = 0;
-
     loop {
+        // 1. drain pending jobs
         while let Some(job) = scheduler.pop() {
             match job {
                 Job::RenderPage => {
@@ -122,108 +122,114 @@ fn main() -> ! {
             }
         }
 
-        let timer_wake = match try_wake() {
-            Some(WakeReason::Timer) | Some(WakeReason::Multiple) => true,
+        // 2. Check wake events (non-blocking).
+        //    When nothing is pending, idle briefly so we don't spin at full speed.
+        //    TODO: replace with proper WFI once esp-hal wake sources are configured.
+        let should_poll = match try_wake() {
+            Some(WakeReason::Timer) | Some(WakeReason::Multiple) => poller.tick(),
+
             Some(WakeReason::Button) => {
                 poller.on_activity();
                 true
             }
+
             Some(WakeReason::Display) => {
-                info!("Display ready");
+                info!("display ready.");
                 false
             }
-            None => false,
+
+            None => {
+                delay.delay_millis(1);
+                continue;
+            }
         };
 
-        tick_count += 1;
-        let should_poll = timer_wake || (tick_count >= 10);
-
-        if should_poll {
-            tick_count = 0;
-
-            if poller.tick() {
-                if let Some(event) = input.poll() {
-                    poller.on_activity();
-
-                    // Handle input and only act on Press for navigation
-                    // LongPress/Repeat only for special actions
-                    match event {
-                        Event::Press(button) => {
-                            info!("[BTN] Press: {}", button.name());
-
-                            match button {
-                                HwButton::Right | HwButton::VolUp => {
-                                    let old = selected;
-                                    selected = (selected + 1) % 2;
-                                    if old != selected {
-                                        update_selection(
-                                            selected,
-                                            &mut item0,
-                                            &mut item1,
-                                            &mut board.display.epd,
-                                            &mut delay,
-                                        );
-                                    }
-                                    scheduler.push_or_drop(Job::PrefetchNext);
-                                }
-                                HwButton::Left | HwButton::VolDown => {
-                                    let old = selected;
-                                    selected = if selected == 0 { 1 } else { 0 };
-                                    if old != selected {
-                                        update_selection(
-                                            selected,
-                                            &mut item0,
-                                            &mut item1,
-                                            &mut board.display.epd,
-                                            &mut delay,
-                                        );
-                                    }
-                                    scheduler.push_or_drop(Job::PrefetchPrev);
-                                }
-                                HwButton::Confirm => {
-                                    let msg = if selected == 0 {
-                                        "Selected: Item 0"
-                                    } else {
-                                        "Selected: Item 1"
-                                    };
-                                    status.set_text(msg);
-                                    status.draw(&mut board.display.epd).unwrap();
-                                    let r = status.refresh_bounds();
-                                    board.display.epd.refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
-                                    scheduler.push_or_drop(Job::RenderPage);
-                                }
-                                HwButton::Power => {
-                                    // TODO: do smth but just log for now
-                                    info!("Power pressed");
-                                }
-                                _ => {}
-                            }
-                        }
-                        Event::Release(button) => {
-                            info!("[BTN] Release: {}", button.name());
-                        }
-                        Event::LongPress(button) => {
-                            info!("[BTN] LongPress: {}", button.name());
-                            // TODO: could use for special actions like shutdown
-                            if button == HwButton::Power {
-                                status.set_text("Shutting down...");
-                                status.draw(&mut board.display.epd).unwrap();
-                                let r = status.refresh_bounds();
-                                board.display.epd.refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
-                            }
-                        }
-                        Event::Repeat(button) => {
-                            // TODO: figure it out
-                            info!("[BTN] Repeat: {}", button.name());
-                        }
-                    }
-                } else {
-                    poller.on_idle();
-                }
-            }
+        if !should_poll {
+            continue;
         }
 
-        delay.delay_millis(1);
+        // 3. poll input and handle events
+        let Some(event) = input.poll() else {
+            poller.on_idle();
+            continue;
+        };
+
+        poller.on_activity();
+
+        match event {
+            Event::Press(button) => {
+                info!("[BTN] Press: {}", button.name());
+
+                match button {
+                    HwButton::Right | HwButton::VolUp => {
+                        let old = selected;
+                        selected = (selected + 1) % 2;
+                        if old != selected {
+                            update_selection(
+                                selected,
+                                &mut item0,
+                                &mut item1,
+                                &mut board.display.epd,
+                                &mut delay,
+                            );
+                        }
+                        scheduler.push_or_drop(Job::PrefetchNext);
+                    }
+                    HwButton::Left | HwButton::VolDown => {
+                        let old = selected;
+                        selected = if selected == 0 { 1 } else { 0 };
+                        if old != selected {
+                            update_selection(
+                                selected,
+                                &mut item0,
+                                &mut item1,
+                                &mut board.display.epd,
+                                &mut delay,
+                            );
+                        }
+                        scheduler.push_or_drop(Job::PrefetchPrev);
+                    }
+                    HwButton::Confirm => {
+                        let msg = if selected == 0 {
+                            "Selected: Item 0"
+                        } else {
+                            "Selected: Item 1"
+                        };
+                        status.set_text(msg);
+                        status.draw(&mut board.display.epd).unwrap();
+                        let r = status.refresh_bounds();
+                        board
+                            .display
+                            .epd
+                            .refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
+                        scheduler.push_or_drop(Job::RenderPage);
+                    }
+                    HwButton::Power => {
+                        // TODO: sleep/shutdown
+                        info!("Power pressed");
+                    }
+                    _ => {}
+                }
+            }
+            Event::Release(button) => {
+                info!("[BTN] Release: {}", button.name());
+            }
+            Event::LongPress(button) => {
+                info!("[BTN] LongPress: {}", button.name());
+                if button == HwButton::Power {
+                    status.set_text("Shutting down...");
+                    status.draw(&mut board.display.epd).unwrap();
+                    let r = status.refresh_bounds();
+                    board
+                        .display
+                        .epd
+                        .refresh_partial(r.x, r.y, r.w, r.h, &mut delay);
+                }
+            }
+            Event::Repeat(button) => {
+                info!("[BTN] Repeat: {}", button.name());
+            }
+        }
     }
 }
 

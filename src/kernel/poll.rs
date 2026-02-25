@@ -6,7 +6,7 @@
 
 use core::fmt;
 
-/// Base timer tick interval (ms)
+// Base timer tick interval (ms)
 pub const BASE_TICK_MS: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,7 +43,7 @@ impl fmt::Display for PollRate {
     }
 }
 
-// Thresholds for rate transitions 
+// Thresholds for rate transitions
 mod thresholds {
     pub const FAST_TO_NORMAL: u32 = 20; // 20 × 10ms = 200ms
     pub const NORMAL_TO_SLOW: u32 = 20; // 20 × 50ms = 1000ms
@@ -54,7 +54,7 @@ pub struct AdaptivePoller {
     rate: PollRate,
     // since last poll
     tick_count: u32,
-    // consecutive idle polls 
+    // consecutive idle polls
     idle_count: u32,
 }
 
@@ -134,4 +134,3 @@ impl Default for AdaptivePoller {
         Self::new()
     }
 }
-

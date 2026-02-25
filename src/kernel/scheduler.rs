@@ -150,9 +150,9 @@ impl<const N: usize> Default for JobQueue<N> {
 
 // The job scheduler
 pub struct Scheduler {
-    high: JobQueue<4>,   
-    normal: JobQueue<8>, 
-    low: JobQueue<16>,   
+    high: JobQueue<4>,
+    normal: JobQueue<8>,
+    low: JobQueue<16>,
 }
 
 impl Scheduler {
@@ -227,7 +227,7 @@ impl Scheduler {
         }
     }
 
-    // the next job to execute 
+    // the next job to execute
     pub fn pop(&mut self) -> Option<Job> {
         self.high
             .pop()
@@ -278,4 +278,3 @@ impl Default for Scheduler {
         Self::new()
     }
 }
-

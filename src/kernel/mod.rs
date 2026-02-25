@@ -9,6 +9,6 @@ pub mod poll;
 pub mod scheduler;
 pub mod wake;
 
+pub use poll::{AdaptivePoller, BASE_TICK_MS, PollRate};
 pub use scheduler::{Job, Priority, PushError, Scheduler};
-pub use poll::{PollRate, AdaptivePoller, BASE_TICK_MS};
-pub use wake::{WakeReason, sleep_until_wake, signal_button, signal_display, signal_timer};
+pub use wake::{WakeReason, signal_button, signal_display, signal_timer, sleep_until_wake};

@@ -3,7 +3,7 @@
 // The X4 has three physical input sources that all funnel into a
 // single "one button at a time" deal:
 // - Row 1 ADC (GPIO1): Right, Left, Confirm, Back via resistance ladder
-// - Row 2 ADC (GPIO2): Volume Up/Down via resistance ladder  
+// - Row 2 ADC (GPIO2): Volume Up/Down via resistance ladder
 // - Power button (GPIO3): Digital input, active low
 // NOTE: Because each resistance ladder can only report one press at a time,
 // we collapse everything into `Option<Button>` per poll cycle.
