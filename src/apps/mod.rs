@@ -233,6 +233,11 @@ impl Launcher {
 
             Transition::Push(id) => {
                 if self.depth >= MAX_STACK_DEPTH {
+                    log::warn!(
+                        "nav stack full (depth {}), Push({:?}) degraded to Replace",
+                        self.depth,
+                        id
+                    );
                     self.stack[self.depth - 1] = id;
                     (false, false)
                 } else {

@@ -7,6 +7,7 @@ extern crate alloc;
 pub mod apps;
 pub mod board;
 pub mod drivers;
+pub mod fonts;
 pub mod formats;
 pub mod kernel;
 pub mod ui;

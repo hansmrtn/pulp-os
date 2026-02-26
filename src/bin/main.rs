@@ -303,7 +303,9 @@ fn main() -> ! {
             }
         }
 
-        if wake.display {}
+        if wake.display {
+            // TODO: use display-BUSY-done signal to avoid polling in wait_busy()
+        }
     }
 }
 

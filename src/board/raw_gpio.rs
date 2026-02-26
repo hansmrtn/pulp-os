@@ -22,9 +22,9 @@ impl RawOutputPin {
         let mux_reg = (IO_MUX_BASE + pin as u32 * IO_MUX_PIN_STRIDE) as *mut u32;
 
         unsafe {
-            // IO_MUX: MCU_SEL[2:0] = 1 selects GPIO function
+            // IO_MUX: MCU_SEL[14:12] = 1 selects GPIO function on ESP32-C3
             let val = mux_reg.read_volatile();
-            let val = (val & !0b111) | 1;
+            let val = (val & !(0b111 << 12)) | (1 << 12);
             mux_reg.write_volatile(val);
 
             // GPIO_FUNCn_OUT_SEL_CFG: 0x80 = simple GPIO output

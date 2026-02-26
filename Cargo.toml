@@ -33,6 +33,9 @@ embedded-sdmmc = "0.9.0"
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 
+[build-dependencies]
+fontdue = "0.9"
+
 [profile.dev]
 opt-level = "s"
 

@@ -67,8 +67,12 @@ impl<'a> Button<'a> {
     }
 
     fn text_size(&self) -> Size {
-        let char_width = self.font.character_size.width + self.font.character_spacing;
-        let width = self.label.len() as u32 * char_width;
+        let n = self.label.len() as u32;
+        let width = if n > 0 {
+            n * self.font.character_size.width + (n - 1) * self.font.character_spacing
+        } else {
+            0
+        };
         let height = self.font.character_size.height;
         Size::new(width, height)
     }

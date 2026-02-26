@@ -1,19 +1,9 @@
-// Reader app — plain text and EPUB support
+// Plain text and EPUB reader
 //
-// Plain text mode: lazy indexed with prefetch. Page 1 appears after
-// a single SD read. Each page load discovers the next page's byte
-// offset as a side effect of line wrapping (fused index+load).
-// A second 8KB buffer prefetches the next page so forward turns
-// are zero-I/O.
-//
-// EPUB mode: ZIP central directory is parsed once on open, then
-// the OPF spine gives reading order. Each chapter is decompressed
-// (STORED or DEFLATE) and HTML-stripped into a heap Vec. The same
-// paging/wrapping engine then operates on that in-memory text,
-// giving instant page turns within a chapter. Chapter transitions
-// decompress the next/prev chapter on demand.
-//
-// 66 columns x 58 lines per page (FONT_6X13 in 480x800).
+// TXT: lazy indexed with prefetch; page 1 after a single SD read.
+// EPUB: ZIP/OPF parsed once, chapters streamed and HTML-stripped
+// into a heap Vec. Same paging engine for both modes.
+// Proportional fonts via build-time rasterised bitmaps in flash.
 
 extern crate alloc;
 
@@ -31,12 +21,11 @@ use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::button::Button as HwButton;
 use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
+use crate::fonts;
 use crate::formats::epub::{self, EpubMeta, EpubSpine};
 use crate::formats::html_strip;
 use crate::formats::zip::{self, ZipIndex};
 use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region, Widget};
-
-// ── Layout constants ────────────────────────────────────────────
 
 const MARGIN: u16 = 8;
 const HEADER_Y: u16 = CONTENT_TOP + 2;
@@ -53,28 +42,18 @@ const STATUS_REGION: Region = Region::new(308, HEADER_Y, 164, HEADER_H);
 
 const NO_PREFETCH: usize = usize::MAX;
 
-// ── EOCD tail read size ─────────────────────────────────────────
-// ZIP End-of-Central-Directory is at least 22 bytes; we read 512
-// to cover files with a short ZIP comment.
+const TEXT_W: f32 = (480 - 2 * MARGIN) as f32;
+const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
-
-// ── State machine ───────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
-    /// EPUB only: parse ZIP central directory, container.xml, OPF.
     NeedInit,
-    /// EPUB only: decompress + HTML-strip the current chapter.
     NeedChapter,
-    /// Load or re-derive one page of text into `buf`.
     NeedPage,
-    /// Page is loaded and ready for display.
     Ready,
-    /// Unrecoverable error — show message.
     Error,
 }
-
-// ── Line span ───────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct LineSpan {
@@ -86,62 +65,44 @@ impl LineSpan {
     const EMPTY: Self = Self { start: 0, len: 0 };
 }
 
-// ── ReaderApp ───────────────────────────────────────────────────
-
 pub struct ReaderApp {
-    // ── Common state ────────────────────────────────────────────
-    /// SD card filename (8.3 format, used for I/O).
     filename: [u8; 32],
     filename_len: usize,
-
-    /// Display name: book title for EPUB, filename for plain text.
     title: [u8; 96],
     title_len: usize,
-
-    /// For plain text: total file size on SD.
-    /// For EPUB: length of `chapter_text` (set after chapter load).
     file_size: u32,
 
-    /// Byte offsets of discovered pages (into SD file or chapter_text).
     offsets: [u32; MAX_PAGES],
-    /// Number of known page offsets so far.
     total_pages: usize,
-    /// True once EOF (or end of chapter text) seen during wrapping.
     fully_indexed: bool,
 
-    /// Current page index.
     page: usize,
-    /// Primary page buffer — holds raw bytes for the current page.
     buf: [u8; PAGE_BUF],
     buf_len: usize,
-    /// Wrapped visual lines into `buf`.
     lines: [LineSpan; LINES_PER_PAGE],
     line_count: usize,
 
-    /// Prefetch buffer for the next page (plain text mode only).
     prefetch: [u8; PAGE_BUF],
     prefetch_len: usize,
-    /// Which page is in the prefetch buffer (NO_PREFETCH = empty).
     prefetch_page: usize,
 
     state: State,
     error: Option<&'static str>,
 
-    // ── EPUB state ──────────────────────────────────────────────
-    /// True when the opened file is an EPUB archive.
+    // epub
     is_epub: bool,
-    /// ZIP central directory index.
     zip: ZipIndex,
-    /// Book metadata (title, author).
     meta: EpubMeta,
-    /// Reading-order spine (indices into zip).
     spine: EpubSpine,
-    /// Current chapter index within the spine.
     chapter: u16,
-    /// Stripped plain text of the current chapter (heap).
     chapter_text: Vec<u8>,
-    /// When true, after loading a chapter navigate to its last page.
     goto_last_page: bool,
+
+    // fonts (None → FONT_6X13 fallback)
+    fonts: Option<fonts::FontSet>,
+    font_line_h: u16,
+    font_ascent: u16,
+    max_lines: usize,
 }
 
 impl ReaderApp {
@@ -177,25 +138,24 @@ impl ReaderApp {
             chapter: 0,
             chapter_text: Vec::new(),
             goto_last_page: false,
+
+            fonts: None,
+            font_line_h: LINE_H,
+            font_ascent: LINE_H,
+            max_lines: LINES_PER_PAGE,
         }
     }
 
-    // ── Name / title helpers ────────────────────────────────────
-
-    /// SD card filename for I/O.
     fn name(&self) -> &str {
         core::str::from_utf8(&self.filename[..self.filename_len]).unwrap_or("???")
     }
 
-    /// Copy filename to stack so `&mut self.buf` doesn't conflict
-    /// with the borrow on `self.filename`.
     fn name_copy(&self) -> ([u8; 32], usize) {
         let mut buf = [0u8; 32];
         buf[..self.filename_len].copy_from_slice(&self.filename[..self.filename_len]);
         (buf, self.filename_len)
     }
 
-    /// Display name: title for EPUB, filename for txt.
     fn display_name(&self) -> &str {
         if self.title_len > 0 {
             core::str::from_utf8(&self.title[..self.title_len]).unwrap_or(self.name())
@@ -203,8 +163,6 @@ impl ReaderApp {
             self.name()
         }
     }
-
-    // ── Progress ────────────────────────────────────────────────
 
     fn progress_pct(&self) -> u8 {
         if self.file_size == 0 {
@@ -218,13 +176,23 @@ impl ReaderApp {
         ((pos * 100) / size).min(100) as u8
     }
 
-    // ── Line wrapping ───────────────────────────────────────────
-
-    /// Wrap first `n` bytes of `self.buf` into visual lines,
-    /// returning the number of source bytes consumed. Stops after
-    /// LINES_PER_PAGE lines. Returns `n` verbatim when the buffer
-    /// is a partial (final) page.
     fn wrap_lines_counted(&mut self, n: usize) -> usize {
+        let fonts_copy = self.fonts;
+
+        let consumed = if let Some(fs) = fonts_copy {
+            let (c, count) =
+                wrap_proportional(&self.buf, n, &fs, &mut self.lines, self.max_lines, TEXT_W);
+            self.line_count = count;
+            c
+        } else {
+            self.wrap_monospace(n)
+        };
+
+        consumed
+    }
+
+    fn wrap_monospace(&mut self, n: usize) -> usize {
+        let max = self.max_lines;
         self.line_count = 0;
         let mut col: usize = 0;
         let mut line_start: usize = 0;
@@ -238,7 +206,7 @@ impl ReaderApp {
                     self.push_line(line_start, end);
                     line_start = i + 1;
                     col = 0;
-                    if self.line_count >= LINES_PER_PAGE {
+                    if self.line_count >= max {
                         return line_start;
                     }
                 }
@@ -248,7 +216,7 @@ impl ReaderApp {
                         self.push_line(line_start, i + 1);
                         line_start = i + 1;
                         col = 0;
-                        if self.line_count >= LINES_PER_PAGE {
+                        if self.line_count >= max {
                             return line_start;
                         }
                     }
@@ -256,7 +224,7 @@ impl ReaderApp {
             }
         }
 
-        if line_start < n && self.line_count < LINES_PER_PAGE {
+        if line_start < n && self.line_count < max {
             let end = trim_trailing_cr(&self.buf, line_start, n);
             self.push_line(line_start, end);
         }
@@ -274,8 +242,6 @@ impl ReaderApp {
         }
     }
 
-    // ── Paging state reset (shared by txt first-load and epub chapter load) ──
-
     fn reset_paging(&mut self) {
         self.page = 0;
         self.offsets[0] = 0;
@@ -287,10 +253,6 @@ impl ReaderApp {
         self.prefetch_len = 0;
     }
 
-    // ── Page loading: discover next offset as a side effect ─────
-
-    /// Load a page and discover the next page offset.
-    /// In epub mode reads from `chapter_text`; in txt mode reads from SD.
     fn load_page_from_memory(&mut self) {
         let ct_len = self.chapter_text.len();
         let offset = self.offsets[self.page] as usize;
@@ -306,7 +268,7 @@ impl ReaderApp {
         let next_offset = offset + consumed;
 
         if self.page + 1 >= self.total_pages && !self.fully_indexed {
-            if self.line_count >= LINES_PER_PAGE && next_offset < ct_len {
+            if self.line_count >= self.max_lines && next_offset < ct_len {
                 if self.total_pages < MAX_PAGES {
                     self.offsets[self.total_pages] = next_offset as u32;
                     self.total_pages += 1;
@@ -323,8 +285,6 @@ impl ReaderApp {
         self.prefetch_len = 0;
     }
 
-    /// Plain text mode: load current page from SD, wrap lines,
-    /// prefetch next page.
     fn load_and_prefetch<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -361,7 +321,7 @@ impl ReaderApp {
         let next_offset = self.offsets[self.page] + consumed as u32;
 
         if self.page + 1 >= self.total_pages && !self.fully_indexed {
-            if self.line_count >= LINES_PER_PAGE && next_offset < self.file_size {
+            if self.line_count >= self.max_lines && next_offset < self.file_size {
                 if self.total_pages < MAX_PAGES {
                     self.offsets[self.total_pages] = next_offset;
                     self.total_pages += 1;
@@ -394,10 +354,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // ── EPUB initialisation ─────────────────────────────────────
-
-    /// Parse ZIP structure, container.xml, OPF. Populates
-    /// `self.zip`, `self.meta`, `self.spine`.
     fn epub_init<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -488,9 +444,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // ── EPUB chapter loading ────────────────────────────────────
-
-    /// Decompress + HTML-strip the current chapter into `chapter_text`.
     fn epub_load_chapter<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -541,10 +494,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // ── EPUB: navigate to last page of chapter_text ─────────────
-
-    /// After a chapter load with `goto_last_page`, scan forward
-    /// through all pages to find the last one.
     fn scan_to_last_page(&mut self) {
         // Load pages sequentially until fully indexed
         while !self.fully_indexed && self.total_pages < MAX_PAGES {
@@ -560,10 +509,6 @@ impl ReaderApp {
         self.load_page_from_memory();
     }
 
-    // ── Event helpers for chapter boundary navigation ────────────
-
-    /// Try to advance to the next page. Returns true if the state
-    /// machine was kicked (needs_work will return true).
     fn page_forward(&mut self) -> bool {
         if self.state != State::Ready {
             return false;
@@ -589,8 +534,6 @@ impl ReaderApp {
         false
     }
 
-    /// Try to go to the previous page. Returns true if the state
-    /// machine was kicked.
     fn page_backward(&mut self) -> bool {
         if self.state != State::Ready {
             return false;
@@ -624,7 +567,111 @@ fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {
     }
 }
 
-/// Read exactly `buf.len()` bytes from a file via Services.
+fn wrap_proportional(
+    buf: &[u8],
+    n: usize,
+    fonts: &fonts::FontSet,
+    lines: &mut [LineSpan],
+    max_lines: usize,
+    max_width_px: f32,
+) -> (usize, usize) {
+    let max_l = max_lines.min(lines.len());
+    let max_w = max_width_px as u32;
+    let mut lc: usize = 0;
+    let mut ls: usize = 0;
+    let mut px: u32 = 0;
+    let mut sp: usize = 0;
+    let mut sp_px: u32 = 0;
+
+    macro_rules! emit {
+        ($start:expr, $end:expr) => {
+            if lc < max_l {
+                let e = trim_trailing_cr(buf, $start, $end);
+                lines[lc] = LineSpan {
+                    start: ($start) as u16,
+                    len: (e - ($start)) as u16,
+                };
+                lc += 1;
+            }
+        };
+    }
+
+    let sty = fonts::Style::Regular;
+
+    for i in 0..n {
+        let b = buf[i];
+
+        if b == b'\r' {
+            continue;
+        }
+
+        if b == b'\n' {
+            emit!(ls, i);
+            ls = i + 1;
+            px = 0;
+            sp = ls;
+            sp_px = 0;
+            if lc >= max_l {
+                return (ls, lc);
+            }
+            continue;
+        }
+
+        let adv = fonts.advance_byte(b, sty) as u32;
+
+        if b == b' ' {
+            px += adv;
+            sp = i + 1;
+            sp_px = px;
+            // Space itself pushed us over — break before it
+            if px > max_w {
+                emit!(ls, i);
+                ls = i + 1;
+                px = 0;
+                sp = ls;
+                sp_px = 0;
+                if lc >= max_l {
+                    return (ls, lc);
+                }
+            }
+            continue;
+        }
+
+        px += adv;
+        if px > max_w {
+            if sp > ls {
+                // Word-wrap at last space
+                emit!(ls, sp);
+                px -= sp_px;
+                ls = sp;
+            } else {
+                // No space on this line — character-wrap
+                emit!(ls, i);
+                ls = i;
+                px = adv;
+            }
+            sp = ls;
+            sp_px = 0;
+            if lc >= max_l {
+                return (ls, lc);
+            }
+        }
+    }
+
+    if ls < n && lc < max_l {
+        let e = trim_trailing_cr(buf, ls, n);
+        if e > ls {
+            lines[lc] = LineSpan {
+                start: ls as u16,
+                len: (e - ls) as u16,
+            };
+            lc += 1;
+        }
+    }
+
+    (n, lc)
+}
+
 fn read_full<SPI: embedded_hal::spi::SpiDevice>(
     svc: &mut Services<'_, SPI>,
     name: &str,
@@ -642,8 +689,6 @@ fn read_full<SPI: embedded_hal::spi::SpiDevice>(
     Ok(())
 }
 
-/// Extract a ZIP entry by index, reading from SD and decompressing
-/// if needed. Returns a heap Vec with the uncompressed content.
 fn extract_zip_entry<SPI: embedded_hal::spi::SpiDevice>(
     svc: &mut Services<'_, SPI>,
     name: &str,
@@ -657,8 +702,6 @@ fn extract_zip_entry<SPI: embedded_hal::spi::SpiDevice>(
     })
 }
 
-// ── App trait implementation ────────────────────────────────────
-
 impl App for ReaderApp {
     fn on_enter(&mut self, ctx: &mut AppContext) {
         let msg = ctx.message();
@@ -671,17 +714,32 @@ impl App for ReaderApp {
         self.title[..n].copy_from_slice(&self.filename[..n]);
         self.title_len = n;
 
-        // Detect format
         self.is_epub = epub::is_epub_filename(self.name());
-
-        // Reset common state
         self.reset_paging();
         self.file_size = 0;
         self.error = None;
         self.goto_last_page = false;
 
+        self.fonts = None;
+        self.font_line_h = LINE_H;
+        self.font_ascent = LINE_H;
+        self.max_lines = LINES_PER_PAGE;
+
+        if fonts::font_data::HAS_REGULAR {
+            let fs = fonts::FontSet::new();
+            self.font_line_h = fs.line_height(fonts::Style::Regular);
+            self.font_ascent = fs.ascent(fonts::Style::Regular);
+            self.max_lines = ((TEXT_AREA_H / self.font_line_h) as usize).min(LINES_PER_PAGE);
+            log::info!(
+                "font: line_h={} ascent={} max_lines={}",
+                self.font_line_h,
+                self.font_ascent,
+                self.max_lines
+            );
+            self.fonts = Some(fs);
+        }
+
         if self.is_epub {
-            // EPUB: start with ZIP/OPF parsing
             self.zip.clear();
             self.meta = EpubMeta::new();
             self.spine = EpubSpine::new();
@@ -690,7 +748,6 @@ impl App for ReaderApp {
             self.state = State::NeedInit;
             log::info!("reader: opening epub {}", self.name());
         } else {
-            // Plain text: start loading first page
             self.state = State::NeedPage;
             log::info!("reader: opening txt {}", self.name());
         }
@@ -702,9 +759,8 @@ impl App for ReaderApp {
         self.prefetch_page = NO_PREFETCH;
         self.prefetch_len = 0;
 
-        // Free chapter heap memory
         if self.is_epub {
-            self.chapter_text = Vec::new(); // drops + frees
+            self.chapter_text = Vec::new();
         }
     }
 
@@ -726,62 +782,48 @@ impl App for ReaderApp {
         svc: &mut Services<'_, SPI>,
         ctx: &mut AppContext,
     ) {
-        // Loop allows NeedInit to chain into NeedChapter in one
-        // on_work call, avoiding a scheduler round-trip.
         loop {
             match self.state {
-                // ── EPUB: parse ZIP + OPF ───────────────────────────
-                State::NeedInit => {
-                    match self.epub_init(svc) {
-                        Ok(()) => {
-                            // Chain directly into NeedChapter without
-                            // waiting for the next scheduler cycle.
-                            self.state = State::NeedChapter;
-                            continue;
-                        }
-                        Err(e) => {
-                            log::info!("reader: epub init failed: {}", e);
-                            self.error = Some(e);
-                            self.state = State::Error;
+                State::NeedInit => match self.epub_init(svc) {
+                    Ok(()) => {
+                        self.state = State::NeedChapter;
+                        continue;
+                    }
+                    Err(e) => {
+                        log::info!("reader: epub init failed: {}", e);
+                        self.error = Some(e);
+                        self.state = State::Error;
+                        ctx.request_full_redraw();
+                    }
+                },
+
+                State::NeedChapter => match self.epub_load_chapter(svc) {
+                    Ok(()) => {
+                        if self.goto_last_page {
+                            self.goto_last_page = false;
+                            self.scan_to_last_page();
+                            self.state = State::Ready;
+                            ctx.request_full_redraw();
+                        } else {
+                            self.load_page_from_memory();
+                            self.state = State::Ready;
                             ctx.request_full_redraw();
                         }
                     }
-                }
-
-                // ── EPUB: decompress + strip chapter ────────────────
-                State::NeedChapter => {
-                    match self.epub_load_chapter(svc) {
-                        Ok(()) => {
-                            if self.goto_last_page {
-                                self.goto_last_page = false;
-                                self.scan_to_last_page();
-                                self.state = State::Ready;
-                                ctx.request_full_redraw();
-                            } else {
-                                // Load first page of this chapter
-                                self.load_page_from_memory();
-                                self.state = State::Ready;
-                                ctx.request_full_redraw();
-                            }
-                        }
-                        Err(e) => {
-                            log::info!("reader: chapter load failed: {}", e);
-                            self.error = Some(e);
-                            self.state = State::Error;
-                            ctx.request_full_redraw();
-                        }
+                    Err(e) => {
+                        log::info!("reader: chapter load failed: {}", e);
+                        self.error = Some(e);
+                        self.state = State::Error;
+                        ctx.request_full_redraw();
                     }
-                }
+                },
 
-                // ── Load one page ───────────────────────────────────
                 State::NeedPage => {
                     if self.is_epub {
-                        // Data is in memory — no SD I/O needed
                         self.load_page_from_memory();
                         self.state = State::Ready;
                         ctx.request_full_redraw();
                     } else {
-                        // Plain text: read from SD
                         match self.load_and_prefetch(svc) {
                             Ok(()) => {
                                 self.state = State::Ready;
@@ -824,13 +866,11 @@ impl App for ReaderApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        // ── Header: display name ────────────────────────────────
         Label::new(HEADER_REGION, self.display_name(), &FONT_6X13)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
 
-        // ── Status line ─────────────────────────────────────────
         if self.is_epub && self.spine.len() > 0 {
             let mut status = DynamicLabel::<32>::new(STATUS_REGION, &FONT_6X13)
                 .alignment(Alignment::CenterRight);
@@ -872,7 +912,6 @@ impl App for ReaderApp {
             status.draw(strip).unwrap();
         }
 
-        // ── Error message ───────────────────────────────────────
         if let Some(msg) = self.error {
             let r = Region::new(MARGIN, TEXT_Y, 464, 20);
             Label::new(r, msg, &FONT_6X13)
@@ -882,22 +921,38 @@ impl App for ReaderApp {
             return;
         }
 
-        // ── Loading indicator ───────────────────────────────────
         if self.state != State::Ready && self.state != State::Error {
             return;
         }
 
-        // ── Text lines ──────────────────────────────────────────
-        let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
-        for i in 0..self.line_count {
-            let span = self.lines[i];
-            let start = span.start as usize;
-            let end = start + span.len as usize;
-            let text = core::str::from_utf8(&self.buf[start..end]).unwrap_or("");
-            let y = TEXT_Y as i32 + i as i32 * LINE_H as i32 + LINE_H as i32;
-            Text::new(text, Point::new(MARGIN as i32, y), style)
-                .draw(strip)
-                .unwrap();
+        if let Some(ref fs) = self.fonts {
+            let line_h = self.font_line_h as i32;
+            let ascent = self.font_ascent as i32;
+            for i in 0..self.line_count {
+                let span = self.lines[i];
+                let start = span.start as usize;
+                let end = start + span.len as usize;
+                let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
+                fs.draw_bytes(
+                    strip,
+                    &self.buf[start..end],
+                    fonts::Style::Regular,
+                    MARGIN as i32,
+                    baseline,
+                );
+            }
+        } else {
+            let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
+            for i in 0..self.line_count {
+                let span = self.lines[i];
+                let start = span.start as usize;
+                let end = start + span.len as usize;
+                let text = core::str::from_utf8(&self.buf[start..end]).unwrap_or("");
+                let y = TEXT_Y as i32 + i as i32 * LINE_H as i32 + LINE_H as i32;
+                Text::new(text, Point::new(MARGIN as i32, y), style)
+                    .draw(strip)
+                    .unwrap();
+            }
         }
     }
 }
