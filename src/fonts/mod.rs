@@ -89,10 +89,6 @@ impl FontSet {
         self.font(style).advance(ch)
     }
 
-    pub fn measure(&self, text: &str, style: Style) -> u32 {
-        self.font(style).measure(text)
-    }
-
     #[inline]
     pub fn draw_char(
         &self,

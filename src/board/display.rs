@@ -15,8 +15,6 @@ pub const HEIGHT: u16 = 480;
 
 pub const SPI_FREQ_MHZ: u32 = 20;
 
-#[allow(dead_code)]
-const POWER_ON_TIME_MS: u32 = 100;
 const POWER_OFF_TIME_MS: u32 = 200;
 const FULL_REFRESH_TIME_MS: u32 = 1600;
 const PARTIAL_REFRESH_TIME_MS: u32 = 600;
@@ -31,6 +29,7 @@ pub enum Rotation {
 }
 
 // SSD1677 command table
+#[allow(dead_code)]
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
     pub const BOOSTER_SOFT_START: u8 = 0x0C;
@@ -38,7 +37,6 @@ mod cmd {
     pub const DATA_ENTRY_MODE: u8 = 0x11;
     pub const SW_RESET: u8 = 0x12;
     pub const TEMPERATURE_SENSOR: u8 = 0x18;
-    #[allow(dead_code)]
     pub const WRITE_TEMP_REGISTER: u8 = 0x1A;
     pub const MASTER_ACTIVATION: u8 = 0x20;
     pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
@@ -83,21 +81,6 @@ where
         }
     }
 
-    pub fn set_rotation(&mut self, rotation: Rotation) {
-        self.rotation = rotation;
-    }
-
-    pub fn rotation(&self) -> Rotation {
-        self.rotation
-    }
-
-    pub fn size(&self) -> Size {
-        match self.rotation {
-            Rotation::Deg0 | Rotation::Deg180 => Size::new(WIDTH as u32, HEIGHT as u32),
-            Rotation::Deg90 | Rotation::Deg270 => Size::new(HEIGHT as u32, WIDTH as u32),
-        }
-    }
-
     pub fn reset(&mut self, delay: &mut Delay) {
         let _ = self.rst.set_high();
         delay.delay_millis(20);
@@ -110,10 +93,6 @@ where
     pub fn init(&mut self, delay: &mut Delay) {
         self.reset(delay);
         self.init_display(delay);
-    }
-
-    pub fn clear(&mut self, delay: &mut Delay) {
-        self.clear_screen(delay);
     }
 
     pub fn render_full<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: F)
@@ -162,19 +141,13 @@ where
             self.init_display(delay);
         }
 
-        let (px, py, pw, ph) = self.transform_region(x, y, w, h);
+        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
 
-        let px_aligned = px & !7;
-        let extra = px - px_aligned;
-        let mut pw = pw + extra;
-        if pw % 8 > 0 {
-            pw += 8 - (pw % 8);
-        }
-
-        let px = px_aligned.min(WIDTH);
-        let py = py.min(HEIGHT);
-        let pw = pw.min(WIDTH - px);
-        let ph = ph.min(HEIGHT - py);
+        // Align to 8-pixel byte boundaries for SSD1677 RAM addressing
+        let px = (tx & !7).min(WIDTH);
+        let py = ty.min(HEIGHT);
+        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
+        let ph = th.min(HEIGHT - py);
 
         if pw == 0 || ph == 0 {
             return;
@@ -197,13 +170,6 @@ where
             self.wait_busy(POWER_OFF_TIME_MS);
             self.power_is_on = false;
         }
-    }
-
-    pub fn hibernate(&mut self) {
-        self.power_off();
-        self.send_command(cmd::DEEP_SLEEP);
-        self.send_data(&[0x01]);
-        self.init_done = false;
     }
 
     fn write_region_strips<F>(
@@ -326,31 +292,6 @@ where
             ((y_flipped + h - 1) & 0xFF) as u8,
             ((y_flipped + h - 1) >> 8) as u8,
         ]);
-    }
-
-    fn clear_screen(&mut self, delay: &mut Delay) {
-        if !self.init_done {
-            self.init_display(delay);
-        }
-
-        self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-        self.write_screen_buffer(cmd::WRITE_RAM_RED, 0xFF);
-        self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-        self.write_screen_buffer(cmd::WRITE_RAM_BW, 0xFF);
-
-        self.update_full();
-        self.initial_refresh = false;
-    }
-
-    fn write_screen_buffer(&mut self, command: u8, value: u8) {
-        self.send_command(command);
-        let total = (WIDTH as u32 * HEIGHT as u32 / 8) as usize;
-        let chunk_size = 256;
-        let chunk = [value; 256];
-        for i in (0..total).step_by(chunk_size) {
-            let len = (total - i).min(chunk_size);
-            self.send_data(&chunk[..len]);
-        }
     }
 
     fn update_full(&mut self) {

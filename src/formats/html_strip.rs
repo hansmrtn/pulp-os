@@ -4,139 +4,9 @@
 // emit paragraph breaks; <script>/<style>/<head> content is discarded.
 // Non-ASCII entities map to '?' (ASCII-only font for now).
 //
-// Two entry points:
-//   strip_html()          — into a separate Vec
-//   strip_html_inplace()  — overwrites the buffer (w <= r always holds)
+// strip_html_inplace() overwrites the buffer (w <= r always holds).
 
 use alloc::vec::Vec;
-
-pub fn strip_html(input: &[u8], output: &mut Vec<u8>) {
-    let mut pos = 0;
-    let len = input.len();
-    let mut last_was_space = true;
-    let mut trailing_newlines: u8 = 1;
-    let mut skip_until: Option<SkipTag> = None;
-
-    while pos < len {
-        if let Some(ref skip) = skip_until {
-            if let Some(end_pos) = find_close_tag(&input[pos..], skip.name()) {
-                pos += end_pos;
-                skip_until = None;
-            } else {
-                break;
-            }
-            continue;
-        }
-
-        let b = input[pos];
-
-        if b == b'<' {
-            pos += 1;
-            if pos >= len {
-                break;
-            }
-
-            if input[pos] == b'!' {
-                pos = skip_bang_construct(input, pos);
-                continue;
-            }
-            if input[pos] == b'?' {
-                pos = skip_pi(input, pos);
-                continue;
-            }
-
-            let is_close = input[pos] == b'/';
-            if is_close {
-                pos += 1;
-            }
-
-            let name_start = pos;
-            while pos < len && !is_tag_delim(input[pos]) {
-                pos += 1;
-            }
-            let name_end = pos;
-
-            let mut name_buf = [0u8; 16];
-            let name_len = (name_end - name_start).min(name_buf.len());
-            for i in 0..name_len {
-                name_buf[i] = input[name_start + i].to_ascii_lowercase();
-            }
-            let tag_name = &name_buf[..name_len];
-
-            if !is_close {
-                if let Some(skip) = SkipTag::from_name(tag_name) {
-                    skip_until = Some(skip);
-                }
-            }
-
-            if is_block_element(tag_name) {
-                emit_block_break(output, &mut last_was_space, &mut trailing_newlines);
-            }
-
-            if tag_name == b"br" {
-                emit_newline(output, &mut last_was_space, &mut trailing_newlines);
-            }
-
-            pos = skip_to_gt(input, pos);
-            continue;
-        }
-
-        if b == b'&' {
-            let (decoded, advance) = decode_entity(input, pos);
-            pos += advance;
-
-            match decoded {
-                DecodedChar::Byte(c) => {
-                    if c == b'\n' {
-                        emit_newline(output, &mut last_was_space, &mut trailing_newlines);
-                    } else if is_html_ws(c) {
-                        if !last_was_space {
-                            output.push(b' ');
-                            last_was_space = true;
-                            trailing_newlines = 0;
-                        }
-                    } else {
-                        output.push(c);
-                        last_was_space = false;
-                        trailing_newlines = 0;
-                    }
-                }
-                DecodedChar::Unicode(_) => {
-                    output.push(b'?');
-                    last_was_space = false;
-                    trailing_newlines = 0;
-                }
-                DecodedChar::None => {
-                    output.push(b'&');
-                    last_was_space = false;
-                    trailing_newlines = 0;
-                }
-            }
-            continue;
-        }
-
-        if is_html_ws(b) {
-            if !last_was_space {
-                output.push(b' ');
-                last_was_space = true;
-                trailing_newlines = 0;
-            }
-        } else {
-            output.push(b);
-            last_was_space = false;
-            trailing_newlines = 0;
-        }
-
-        pos += 1;
-    }
-
-    while output.last().is_some_and(|&b| b == b' ' || b == b'\n') {
-        output.pop();
-    }
-    if !output.is_empty() {
-        output.push(b'\n');
-    }
-}
 
 /// Strip HTML in place. The write cursor never passes the read cursor
 /// because stripping only removes or shortens content.
@@ -294,22 +164,6 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     }
 
     buf.truncate(w);
-}
-
-// -- block break / newline emission --
-
-fn emit_block_break(out: &mut Vec<u8>, last_was_space: &mut bool, trailing_newlines: &mut u8) {
-    while *trailing_newlines < 2 {
-        out.push(b'\n');
-        *trailing_newlines += 1;
-    }
-    *last_was_space = true;
-}
-
-fn emit_newline(out: &mut Vec<u8>, last_was_space: &mut bool, trailing_newlines: &mut u8) {
-    out.push(b'\n');
-    *trailing_newlines = (*trailing_newlines).saturating_add(1);
-    *last_was_space = true;
 }
 
 fn is_block_element(name: &[u8]) -> bool {

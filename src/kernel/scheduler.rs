@@ -95,10 +95,6 @@ impl<const N: usize> JobQueue<N> {
         job
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     fn contains(&self, job: &Job) -> bool {
         if self.len == 0 {
             return false;

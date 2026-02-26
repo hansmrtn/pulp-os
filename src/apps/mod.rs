@@ -287,8 +287,4 @@ impl Launcher {
             None
         }
     }
-
-    pub fn depth(&self) -> usize {
-        self.depth
-    }
 }

@@ -107,85 +107,6 @@ impl DirCache {
     pub fn invalidate(&mut self) {
         self.valid = false;
     }
-
-    pub fn total(&self) -> usize {
-        self.count
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.valid
-    }
-}
-
-pub fn list_page<SPI>(
-    sd: &SdStorage<SPI>,
-    skip: usize,
-    buf: &mut [DirEntry],
-) -> Result<DirPage, &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-
-    let mut total = 0usize;
-    let mut written = 0usize;
-    let page_size = buf.len();
-
-    root.iterate_dir(|entry| {
-        if entry.name.base_name()[0] == b'.' {
-            return;
-        }
-
-        if total >= skip && written < page_size {
-            let mut name_buf = [0u8; 13];
-            let name_len = format_83_name(&entry.name, &mut name_buf);
-            buf[written] = DirEntry {
-                name: name_buf,
-                name_len: name_len as u8,
-                is_dir: entry.attributes.is_directory(),
-                size: entry.size,
-            };
-            written += 1;
-        }
-        total += 1;
-    })
-    .map_err(|_| "iterate dir failed")?;
-
-    Ok(DirPage {
-        total,
-        count: written,
-    })
-}
-
-pub fn list_root_dir<SPI>(
-    sd: &SdStorage<SPI>,
-    mut cb: impl FnMut(&str, bool, u32),
-) -> Result<usize, &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-
-    let mut count = 0usize;
-    root.iterate_dir(|entry| {
-        let mut name_buf = [0u8; 13];
-        let name_len = format_83_name(&entry.name, &mut name_buf);
-        if let Ok(name) = core::str::from_utf8(&name_buf[..name_len]) {
-            cb(name, entry.attributes.is_directory(), entry.size);
-            count += 1;
-        }
-    })
-    .map_err(|_| "iterate dir failed")?;
-
-    Ok(count)
 }
 
 pub fn file_size<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<u32, &'static str>
@@ -204,35 +125,6 @@ where
     Ok(file.length())
 }
 
-pub fn read_file<SPI>(
-    sd: &SdStorage<SPI>,
-    name: &str,
-    buf: &mut [u8],
-) -> Result<usize, &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let mut file = root
-        .open_file_in_dir(name, Mode::ReadOnly)
-        .map_err(|_| "open file failed")?;
-
-    let mut total = 0;
-    while !file.is_eof() && total < buf.len() {
-        let n = file.read(&mut buf[total..]).map_err(|_| "read failed")?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-
-    Ok(total)
-}
-
 pub fn read_file_chunk<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -247,7 +139,7 @@ where
         .open_volume(VolumeIdx(0))
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let mut file = root
+    let file = root
         .open_file_in_dir(name, Mode::ReadOnly)
         .map_err(|_| "open file failed")?;
 
@@ -279,7 +171,7 @@ where
         .open_volume(VolumeIdx(0))
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let mut file = root
+    let file = root
         .open_file_in_dir(name, Mode::ReadOnly)
         .map_err(|_| "open file failed")?;
 
@@ -295,25 +187,6 @@ where
     }
 
     Ok((file_size, total))
-}
-
-pub fn write_file<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Result<(), &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let mut file = root
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| "open file for write failed")?;
-
-    file.write(data).map_err(|_| "write failed")?;
-    file.flush().map_err(|_| "flush failed")?;
-
-    Ok(())
 }
 
 fn format_83_name(sfn: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> usize {

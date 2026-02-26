@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // GPIO pin assignments for XTEink X4 (ESP32-C3)
 //
 // GPIO  Function         Notes

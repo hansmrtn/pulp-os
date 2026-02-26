@@ -290,26 +290,11 @@ fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
     let mut offset: u16 = 0;
     for (i, g) in glyphs.iter().enumerate() {
         let ch = (FIRST_CHAR + i as u8) as char;
-        let ch_repr = if ch == '\'' {
-            "\\'"
-        } else if ch == '\\' {
-            "\\\\"
-        } else {
-            ""
-        };
-        if ch_repr.is_empty() {
-            writeln!(
-                out,
-                "    BitmapGlyph {{ advance: {:>2}, offset_x: {:>3}, offset_y: {:>4}, width: {:>2}, height: {:>2}, bitmap_offset: {:>5} }}, // '{}'",
-                g.advance, g.offset_x, g.offset_y, g.width, g.height, offset, ch
-            ).unwrap();
-        } else {
-            writeln!(
-                out,
-                "    BitmapGlyph {{ advance: {:>2}, offset_x: {:>3}, offset_y: {:>4}, width: {:>2}, height: {:>2}, bitmap_offset: {:>5} }}, // '{}'",
-                g.advance, g.offset_x, g.offset_y, g.width, g.height, offset, ch_repr
-            ).unwrap();
-        }
+        writeln!(
+            out,
+            "    BitmapGlyph {{ advance: {:>2}, offset_x: {:>3}, offset_y: {:>4}, width: {:>2}, height: {:>2}, bitmap_offset: {:>5} }}, // {:?}",
+            g.advance, g.offset_x, g.offset_y, g.width, g.height, offset, ch
+        ).unwrap();
         offset += g.bits.len() as u16;
     }
     writeln!(out, "];").unwrap();

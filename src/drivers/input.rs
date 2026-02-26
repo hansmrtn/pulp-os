@@ -12,7 +12,7 @@ use esp_hal::time::{Duration, Instant};
 use crate::board::InputHw;
 use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
 
-const DEBOUNCE_MS: u64 = 30;
+const DEBOUNCE_MS: u64 = 15;
 const LONG_PRESS_MS: u64 = 1000;
 const REPEAT_MS: u64 = 150;
 

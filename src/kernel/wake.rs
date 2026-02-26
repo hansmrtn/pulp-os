@@ -109,16 +109,6 @@ pub fn wait_for_interrupt() {
     }
 }
 
-pub fn sleep_until_wake() -> WakeFlags {
-    loop {
-        if let Some(flags) = take_wake_flags() {
-            return flags;
-        }
-
-        wait_for_interrupt();
-    }
-}
-
 pub fn try_wake() -> Option<WakeFlags> {
     take_wake_flags()
 }

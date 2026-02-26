@@ -48,23 +48,6 @@ impl BitmapFont {
         self.glyph(ch).advance
     }
 
-    pub fn measure(&self, text: &str) -> u32 {
-        text.chars().map(|ch| self.advance(ch) as u32).sum()
-    }
-
-    pub fn measure_bytes(&self, text: &[u8]) -> u32 {
-        text.iter()
-            .map(|&b| {
-                let ch = if b >= 0x20 && b <= 0x7E {
-                    b as char
-                } else {
-                    '?'
-                };
-                self.advance(ch) as u32
-            })
-            .sum()
-    }
-
     #[inline]
     pub fn draw_char(&self, strip: &mut StripBuffer, ch: char, cx: i32, baseline: i32) -> u8 {
         let g = self.glyph(ch);
