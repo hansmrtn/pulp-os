@@ -182,11 +182,9 @@ where
 
         self.write_region_strips(strip, px, py, pw, ph, cmd::WRITE_RAM_BW, &draw);
 
-        self.set_partial_ram_area(px, py, pw, ph);
         self.update_partial();
 
-        self.write_region_strips(strip, px, py, pw, ph, cmd::WRITE_RAM_RED, &draw);
-        self.write_region_strips(strip, px, py, pw, ph, cmd::WRITE_RAM_BW, &draw);
+        self.write_region_both_planes(strip, px, py, pw, ph, &draw);
 
         self.power_off();
     }
@@ -231,6 +229,37 @@ where
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
             self.send_data(strip.data());
+            y += rows;
+        }
+    }
+
+    // Post-update copy: draw once per strip band, send to both RAM planes.
+    // Saves redundant draw calls compared to two separate write_region_strips.
+    fn write_region_both_planes<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        px: u16,
+        py: u16,
+        pw: u16,
+        ph: u16,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        let max_rows = StripBuffer::max_rows_for_width(pw);
+
+        let mut y = py;
+        while y < py + ph {
+            let rows = max_rows.min(py + ph - y);
+            strip.begin_window(self.rotation, px, y, pw, rows);
+            draw(strip);
+
+            for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+                self.set_partial_ram_area(px, y, pw, rows);
+                self.send_command(ram_cmd);
+                self.send_data(strip.data());
+            }
+
             y += rows;
         }
     }

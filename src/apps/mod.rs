@@ -121,6 +121,9 @@ impl AppContext {
     }
 }
 
+// TODO: hold Volume handle open for the lifetime of Services so that
+// read_file_chunk / file_size don't re-read the MBR on every call.
+// Deferred until the reader app does paged file reads.
 pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
     dir_cache: &'a mut DirCache,
     sd: &'a SdStorage<SPI>,

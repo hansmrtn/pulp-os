@@ -117,7 +117,7 @@ fn main() -> ! {
     let mut strip = StripBuffer::new();
 
     let mut statusbar = StatusBar::new();
-    let sd_ok = board
+    let mut sd_ok = board
         .storage
         .sd
         .volume_mgr
@@ -157,6 +157,7 @@ fn main() -> ! {
                             set_timer_period(ACTIVE_TIMER_MS);
                             timer_is_slow = false;
                             idle_polls = 0;
+                            continue;
                         }
 
                         idle_polls += 1;
@@ -265,6 +266,12 @@ fn main() -> ! {
                 }
 
                 Job::UpdateStatusBar => {
+                    sd_ok = board
+                        .storage
+                        .sd
+                        .volume_mgr
+                        .open_volume(embedded_sdmmc::VolumeIdx(0))
+                        .is_ok();
                     update_statusbar(&mut statusbar, &mut input, sd_ok);
                 }
             }

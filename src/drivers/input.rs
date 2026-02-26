@@ -26,15 +26,11 @@ pub enum Event {
 
 struct EventQueue {
     buf: [Option<Event>; 2],
-    read: u8,
 }
 
 impl EventQueue {
     const fn new() -> Self {
-        Self {
-            buf: [None; 2],
-            read: 0,
-        }
+        Self { buf: [None; 2] }
     }
 
     fn push(&mut self, ev: Event) {
@@ -47,14 +43,11 @@ impl EventQueue {
     }
 
     fn pop(&mut self) -> Option<Event> {
-        if (self.read as usize) < self.buf.len() {
-            let idx = self.read as usize;
-            if let Some(ev) = self.buf[idx].take() {
-                self.read += 1;
+        for slot in self.buf.iter_mut() {
+            if let Some(ev) = slot.take() {
                 return Some(ev);
             }
         }
-        self.read = 0;
         None
     }
 
