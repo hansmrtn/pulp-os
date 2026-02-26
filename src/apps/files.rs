@@ -21,19 +21,12 @@ use crate::ui::{Alignment, BitmapButton, BitmapDynLabel, BitmapLabel, CONTENT_TO
 
 const PAGE_SIZE: usize = 7;
 
-const HEADER_REGION: Region = Region::new(16, CONTENT_TOP + 4, 300, 28);
+// STATUS_REGION is fixed next to the header; its y matches CONTENT_TOP + 4.
 const STATUS_REGION: Region = Region::new(320, CONTENT_TOP + 4, 140, 28);
 
-const LIST_Y: u16 = CONTENT_TOP + 40;
 const ROW_H: u16 = 52;
-
-const LIST_REGION: Region = Region::new(8, LIST_Y, 464, ROW_H * PAGE_SIZE as u16);
-
-fn row_region(index: usize) -> Region {
-    Region::new(16, LIST_Y + index as u16 * ROW_H, 448, ROW_H - 4)
-}
-
-// ── Font helpers ──────────────────────────────────────────────────────────────
+// Vertical gap between the bottom of the heading and the first list row.
+const HEADER_LIST_GAP: u16 = 4;
 
 fn body_font(idx: u8) -> &'static BitmapFont {
     match idx {
@@ -43,7 +36,13 @@ fn body_font(idx: u8) -> &'static BitmapFont {
     }
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
+fn heading_font(idx: u8) -> &'static BitmapFont {
+    match idx {
+        1 => &font_data::REGULAR_HEADING_MEDIUM,
+        2 => &font_data::REGULAR_HEADING_LARGE,
+        _ => &font_data::REGULAR_HEADING_SMALL,
+    }
+}
 
 pub struct FilesApp {
     entries: [DirEntry; PAGE_SIZE],
@@ -56,10 +55,12 @@ pub struct FilesApp {
     error: Option<&'static str>,
     body_font: &'static BitmapFont,
     heading_font: &'static BitmapFont,
+    list_y: u16,
 }
 
 impl FilesApp {
     pub fn new() -> Self {
+        let hf = heading_font(0);
         Self {
             entries: [DirEntry::EMPTY; PAGE_SIZE],
             count: 0,
@@ -70,14 +71,15 @@ impl FilesApp {
             stale_cache: false,
             error: None,
             body_font: body_font(0),
-            heading_font: &font_data::REGULAR_HEADING,
+            heading_font: hf,
+            list_y: CONTENT_TOP + 4 + hf.line_height + HEADER_LIST_GAP,
         }
     }
 
-    /// Called by main.rs whenever ui_font_size_idx changes.
-    /// The heading font is always the fixed 24 px cut; only body text scales.
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.body_font = body_font(idx);
+        self.heading_font = heading_font(idx);
+        self.list_y = CONTENT_TOP + 4 + self.heading_font.line_height + HEADER_LIST_GAP;
     }
 
     pub fn selected_entry(&self) -> Option<&DirEntry> {
@@ -106,11 +108,19 @@ impl FilesApp {
         self.count = 0;
     }
 
+    fn row_region(&self, index: usize) -> Region {
+        Region::new(16, self.list_y + index as u16 * ROW_H, 448, ROW_H - 4)
+    }
+
+    fn list_region(&self) -> Region {
+        Region::new(8, self.list_y, 464, ROW_H * PAGE_SIZE as u16)
+    }
+
     fn move_up(&mut self, ctx: &mut AppContext) {
         if self.selected > 0 {
-            ctx.mark_dirty(row_region(self.selected));
+            ctx.mark_dirty(self.row_region(self.selected));
             self.selected -= 1;
-            ctx.mark_dirty(row_region(self.selected));
+            ctx.mark_dirty(self.row_region(self.selected));
             ctx.mark_dirty(STATUS_REGION);
         } else if self.scroll > 0 {
             self.scroll = self.scroll.saturating_sub(1);
@@ -120,9 +130,9 @@ impl FilesApp {
 
     fn move_down(&mut self, ctx: &mut AppContext) {
         if self.selected + 1 < self.count {
-            ctx.mark_dirty(row_region(self.selected));
+            ctx.mark_dirty(self.row_region(self.selected));
             self.selected += 1;
-            ctx.mark_dirty(row_region(self.selected));
+            ctx.mark_dirty(self.row_region(self.selected));
             ctx.mark_dirty(STATUS_REGION);
         } else if self.scroll + self.count < self.total {
             self.scroll += 1;
@@ -176,7 +186,7 @@ impl App for FilesApp {
             }
         }
 
-        ctx.mark_dirty(LIST_REGION);
+        ctx.mark_dirty(self.list_region());
         ctx.mark_dirty(STATUS_REGION);
     }
 
@@ -221,7 +231,8 @@ impl App for FilesApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        BitmapLabel::new(HEADER_REGION, "Files", self.heading_font)
+        let header_region = Region::new(16, CONTENT_TOP + 4, 300, self.heading_font.line_height);
+        BitmapLabel::new(header_region, "Files", self.heading_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
@@ -234,7 +245,7 @@ impl App for FilesApp {
         }
 
         if let Some(msg) = self.error {
-            BitmapLabel::new(row_region(0), msg, self.body_font)
+            BitmapLabel::new(self.row_region(0), msg, self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
@@ -242,7 +253,7 @@ impl App for FilesApp {
         }
 
         if self.count == 0 && !self.needs_load {
-            BitmapLabel::new(row_region(0), "No files found", self.body_font)
+            BitmapLabel::new(self.row_region(0), "No files found", self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
@@ -250,7 +261,7 @@ impl App for FilesApp {
         }
 
         for i in 0..PAGE_SIZE {
-            let region = row_region(i);
+            let region = self.row_region(i);
 
             if i < self.count {
                 let entry = &self.entries[i];

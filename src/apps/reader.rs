@@ -154,7 +154,7 @@ impl ReaderApp {
         }
     }
 
-    // 0 = Small (~14 px), 1 = Medium (~18 px), 2 = Large (~24 px)
+    // 0 = Small (14 px), 1 = Medium (21 px), 2 = Large (30 px)
     pub fn set_book_font_size(&mut self, idx: u8) {
         self.book_font_size_idx = idx;
         self.apply_font_metrics();

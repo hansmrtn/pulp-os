@@ -68,33 +68,36 @@ fn linker_be_nice() {
     );
 }
 
-// ── Build-time font rasterisation ───────────────────────────────
-//
-// Scans src/fonts/ for .ttf files, classifies them by weight/style,
-// rasterises ASCII glyphs (0x20–0x7E) to 1-bit bitmaps using
-// fontdue (runs on the host), and emits a Rust source file with
-// static tables that live in flash at runtime.  Zero heap cost on
-// the ESP32-C3.
+// Build-time font rasterisation.
+// Scans assets/fonts/ for TTF files, classifies by weight/style, rasterises
+// ASCII 0x20–0x7E to 1-bit bitmaps via fontdue, and emits font_data.rs.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Pixel sizes to rasterise at.
-const BODY_PX_SMALL: f32 = 16.0;
-const BODY_PX_MEDIUM: f32 = 20.0;
-const BODY_PX_LARGE: f32 = 26.0;
-const HEADING_PX: f32 = 24.0;
+// Body sizes: 0 = Small, 1 = Medium, 2 = Large.
+const BODY_PX_SMALL: f32 = 14.0;
+const BODY_PX_MEDIUM: f32 = 21.0;
+const BODY_PX_LARGE: f32 = 30.0;
+// Heading sizes scale with the body index: Small=20, Medium=28, Large=40.
+const HEADING_PX_SMALL: f32 = 20.0;
+const HEADING_PX_MEDIUM: f32 = 28.0;
+const HEADING_PX_LARGE: f32 = 40.0;
 
-/// All three body sizes in index order (0 = Small, 1 = Medium, 2 = Large).
 const BODY_SIZES: [(f32, &str); 3] = [
     (BODY_PX_SMALL, "SMALL"),
     (BODY_PX_MEDIUM, "MEDIUM"),
     (BODY_PX_LARGE, "LARGE"),
 ];
 
-/// Coverage threshold for 8-bit → 1-bit conversion.
-/// Pixels with fontdue coverage >= this value become black.
+const HEADING_SIZES: [(f32, &str); 3] = [
+    (HEADING_PX_SMALL, "SMALL"),
+    (HEADING_PX_MEDIUM, "MEDIUM"),
+    (HEADING_PX_LARGE, "LARGE"),
+];
+
+// Pixels with fontdue coverage >= this value become black.
 const THRESHOLD: u8 = 100;
 
 const FIRST_CHAR: u8 = 0x20;
@@ -153,23 +156,29 @@ fn generate_bitmap_fonts() {
         let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
             .expect("failed to parse regular TTF");
         eprintln!(
-            "cargo:warning=font: rasterising {} ({} glyphs) at {}px/{}px/{}px + {}px heading",
+            "cargo:warning=font: rasterising {} ({} glyphs) at {}/{}/{} px body, {}/{}/{} px heading",
             path.file_name().unwrap().to_string_lossy(),
             font.glyph_count(),
             BODY_PX_SMALL,
             BODY_PX_MEDIUM,
             BODY_PX_LARGE,
-            HEADING_PX,
+            HEADING_PX_SMALL,
+            HEADING_PX_MEDIUM,
+            HEADING_PX_LARGE,
         );
         for (px, suffix) in &BODY_SIZES {
             emit_font(&mut out, &font, &format!("REGULAR_BODY_{suffix}"), *px);
         }
-        emit_font(&mut out, &font, "REGULAR_HEADING", HEADING_PX);
+        for (px, suffix) in &HEADING_SIZES {
+            emit_font(&mut out, &font, &format!("REGULAR_HEADING_{suffix}"), *px);
+        }
     } else {
         for (_px, suffix) in &BODY_SIZES {
             emit_stub(&mut out, &format!("REGULAR_BODY_{suffix}"));
         }
-        emit_stub(&mut out, "REGULAR_HEADING");
+        for (_px, suffix) in &HEADING_SIZES {
+            emit_stub(&mut out, &format!("REGULAR_HEADING_{suffix}"));
+        }
     }
 
     // ── Bold ────────────────────────────────────────────────────
@@ -178,7 +187,7 @@ fn generate_bitmap_fonts() {
         let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
             .expect("failed to parse bold TTF");
         eprintln!(
-            "cargo:warning=font: rasterising {} at {}px/{}px/{}px",
+            "cargo:warning=font: rasterising {} at {}/{}/{} px body",
             path.file_name().unwrap().to_string_lossy(),
             BODY_PX_SMALL,
             BODY_PX_MEDIUM,
@@ -199,7 +208,7 @@ fn generate_bitmap_fonts() {
         let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
             .expect("failed to parse italic TTF");
         eprintln!(
-            "cargo:warning=font: rasterising {} at {}px/{}px/{}px",
+            "cargo:warning=font: rasterising {} at {}/{}/{} px body",
             path.file_name().unwrap().to_string_lossy(),
             BODY_PX_SMALL,
             BODY_PX_MEDIUM,

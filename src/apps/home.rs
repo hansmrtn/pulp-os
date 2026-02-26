@@ -8,38 +8,34 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
 use crate::ui::{Alignment, BitmapButton, BitmapLabel, CONTENT_TOP, Region};
 
-const TITLE_REGION: Region = Region::new(16, CONTENT_TOP, 448, 32);
-
-const ITEM_Y: u16 = CONTENT_TOP + 48;
 const ITEM_H: u16 = 48;
 const ITEM_GAP: u16 = 16;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
+const ITEM_X: u16 = 16;
+const ITEM_W: u16 = 200;
+// Gap between the bottom of the title and the first menu item.
+const TITLE_ITEM_GAP: u16 = 16;
 
 struct MenuItem {
-    region: Region,
     name: &'static str,
     app: AppId,
 }
 
 const ITEMS: &[MenuItem] = &[
     MenuItem {
-        region: Region::new(16, ITEM_Y, 200, ITEM_H),
         name: "Files",
         app: AppId::Files,
     },
     MenuItem {
-        region: Region::new(16, ITEM_Y + ITEM_STRIDE, 200, ITEM_H),
         name: "Reader",
         app: AppId::Reader,
     },
     MenuItem {
-        region: Region::new(16, ITEM_Y + ITEM_STRIDE * 2, 200, ITEM_H),
         name: "Settings",
         app: AppId::Settings,
     },
 ];
 
-// Select a body BitmapFont by size index (0 = Small, 1 = Medium, 2 = Large).
 fn body_font(idx: u8) -> &'static BitmapFont {
     match idx {
         1 => &font_data::REGULAR_BODY_MEDIUM,
@@ -48,38 +44,54 @@ fn body_font(idx: u8) -> &'static BitmapFont {
     }
 }
 
+fn heading_font(idx: u8) -> &'static BitmapFont {
+    match idx {
+        1 => &font_data::REGULAR_HEADING_MEDIUM,
+        2 => &font_data::REGULAR_HEADING_LARGE,
+        _ => &font_data::REGULAR_HEADING_SMALL,
+    }
+}
+
+fn compute_item_regions(heading_line_h: u16) -> [Region; 3] {
+    let item_y = CONTENT_TOP + heading_line_h + TITLE_ITEM_GAP;
+    [
+        Region::new(ITEM_X, item_y, ITEM_W, ITEM_H),
+        Region::new(ITEM_X, item_y + ITEM_STRIDE, ITEM_W, ITEM_H),
+        Region::new(ITEM_X, item_y + ITEM_STRIDE * 2, ITEM_W, ITEM_H),
+    ]
+}
+
 pub struct HomeApp {
     selected: usize,
     body_font: &'static BitmapFont,
     heading_font: &'static BitmapFont,
+    item_regions: [Region; 3],
 }
 
 impl HomeApp {
     pub fn new() -> Self {
+        let hf = heading_font(0);
         Self {
             selected: 0,
             body_font: body_font(0),
-            heading_font: &font_data::REGULAR_HEADING,
+            heading_font: hf,
+            item_regions: compute_item_regions(hf.line_height),
         }
     }
 
-    /// Called by main.rs whenever ui_font_size_idx changes.
-    /// The heading font is always the fixed 24 px cut; only body text scales.
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.body_font = body_font(idx);
-    }
-
-    fn item_count(&self) -> usize {
-        ITEMS.len()
+        self.heading_font = heading_font(idx);
+        self.item_regions = compute_item_regions(self.heading_font.line_height);
     }
 
     fn move_selection(&mut self, delta: isize, ctx: &mut AppContext) {
-        let count = self.item_count();
+        let count = ITEMS.len();
         let new = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
         if new != self.selected {
-            ctx.mark_dirty(ITEMS[self.selected].region);
+            ctx.mark_dirty(self.item_regions[self.selected]);
             self.selected = new;
-            ctx.mark_dirty(ITEMS[self.selected].region);
+            ctx.mark_dirty(self.item_regions[self.selected]);
         }
     }
 }
@@ -106,13 +118,14 @@ impl App for HomeApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        BitmapLabel::new(TITLE_REGION, "pulp-os", self.heading_font)
+        let title_region = Region::new(16, CONTENT_TOP, 448, self.heading_font.line_height);
+        BitmapLabel::new(title_region, "pulp-os", self.heading_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
 
         for (i, item) in ITEMS.iter().enumerate() {
-            let mut btn = BitmapButton::new(item.region, item.name, self.body_font);
+            let mut btn = BitmapButton::new(self.item_regions[i], item.name, self.body_font);
             if i == self.selected {
                 btn.set_pressed(true);
             }

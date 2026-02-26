@@ -142,6 +142,21 @@ fn main() -> ! {
     let mut partial_refreshes: u32 = 0;
     let mut dir_cache = DirCache::new();
 
+    // Load saved settings before the first render so font sizes and other
+    // preferences are in effect from frame zero, not only after the user
+    // visits the Settings app for the first time.
+    {
+        let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
+        settings.load_eager(&mut svc);
+        let s = settings.system_settings();
+        let ui_idx = s.ui_font_size_idx;
+        let book_idx = s.book_font_size_idx;
+        home.set_ui_font_size(ui_idx);
+        files.set_ui_font_size(ui_idx);
+        settings.set_ui_font_size(ui_idx);
+        reader.set_book_font_size(book_idx);
+    }
+
     home.on_enter(&mut launcher.ctx);
     update_statusbar(&mut statusbar, &mut input, sd_ok);
     board.display.epd.render_full(&mut strip, &mut delay, |s| {

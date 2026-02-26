@@ -6,9 +6,9 @@
 // FontSet is Copy (four &'static pointers, 32 bytes).
 //
 // Three body sizes are available (indexed 0–2):
-//   0 = Small  (~14 px)
-//   1 = Medium (~18 px)
-//   2 = Large  (~24 px)
+//   0 = Small  (body 14 px, heading 20 px)
+//   1 = Medium (body 21 px, heading 28 px)
+//   2 = Large  (body 30 px, heading 40 px)
 // Use `FontSet::for_size(idx)` to obtain a sized set.
 
 pub mod bitmap;
@@ -56,7 +56,7 @@ impl FontSet {
             regular,
             bold,
             italic,
-            heading: &font_data::REGULAR_HEADING,
+            heading: &font_data::REGULAR_HEADING_SMALL,
         }
     }
 
@@ -79,7 +79,7 @@ impl FontSet {
             regular,
             bold,
             italic,
-            heading: &font_data::REGULAR_HEADING,
+            heading: &font_data::REGULAR_HEADING_MEDIUM,
         }
     }
 
@@ -102,7 +102,7 @@ impl FontSet {
             regular,
             bold,
             italic,
-            heading: &font_data::REGULAR_HEADING,
+            heading: &font_data::REGULAR_HEADING_LARGE,
         }
     }
 

@@ -1,11 +1,4 @@
-// Proportional-font button widget backed by the build-time bitmap pipeline.
-//
-// Mirrors the API of the mono-font Button widget (Outlined / Filled /
-// Rounded styles, pressed/inverted state) but measures and renders text
-// through BitmapFont instead of MonoFont.  Background fill and outline
-// strokes are drawn via the DrawTarget impl on StripBuffer; glyph
-// blitting uses BitmapFont::draw_str_fg so that pressed (inverted)
-// buttons render white text on a black fill correctly.
+// Proportional-font button widget; bitmap pipeline equivalent of button.rs.
 
 use core::convert::Infallible;
 
@@ -19,8 +12,6 @@ use super::widget::{Alignment, Region};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 
-// ── Style ─────────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum BitmapButtonStyle {
     #[default]
@@ -28,8 +19,6 @@ pub enum BitmapButtonStyle {
     Filled,
     Rounded(u32),
 }
-
-// ── BitmapButton ──────────────────────────────────────────────────────────────
 
 pub struct BitmapButton<'a> {
     region: Region,
@@ -99,22 +88,19 @@ impl<'a> BitmapButton<'a> {
             return Ok(());
         }
 
-        // For Filled buttons the text colour is the background colour (inverted
-        // relative to the fill), matching the mono Button behaviour.
+        // Filled buttons invert text colour relative to fill, matching Button behaviour.
         let text_fg = match self.style {
             BitmapButtonStyle::Filled => bg,
             _ => fg,
         };
 
-        // Centre text within the region.
         let text_w = self.font.measure_str(self.label) as u32;
         let text_h = self.font.line_height as u32;
         let top_left = Alignment::Center.position(self.region, Size::new(text_w, text_h));
-        let cx = top_left.x;
         let baseline = top_left.y + self.font.ascent as i32;
 
         self.font
-            .draw_str_fg(strip, self.label, text_fg, cx, baseline);
+            .draw_str_fg(strip, self.label, text_fg, top_left.x, baseline);
 
         Ok(())
     }

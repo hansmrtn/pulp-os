@@ -55,27 +55,19 @@ use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 // Logical screen: 480 wide × 800 tall (Deg270 rotation).
 // Status bar occupies y 0..CONTENT_TOP (18 px).
 
-const TITLE_REGION: Region = Region::new(16, CONTENT_TOP + 4, 448, 28);
-
-const ITEMS_TOP: u16 = CONTENT_TOP + 44;
 const ROW_H: u16 = 40;
 const ROW_GAP: u16 = 6;
 const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
 
-// Left column: setting name.
 const LABEL_X: u16 = 16;
 const LABEL_W: u16 = 160;
-
-// Right column: current value.
 const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = 296; // reaches to x = 480 − 8 = 472
 
 const NUM_ITEMS: usize = 6;
-
-// Help line sits below the last item row.
-const HELP_Y: u16 = ITEMS_TOP + NUM_ITEMS as u16 * ROW_STRIDE + 14;
-const HELP_REGION: Region = Region::new(8, HELP_Y, 464, 18);
+// Gap between heading bottom and first settings row.
+const HEADING_ITEMS_GAP: u16 = 8;
 
 // ── Persistent settings ───────────────────────────────────────────────────────
 
@@ -161,10 +153,12 @@ pub struct SettingsApp {
     save_needed: bool,
     body_font: &'static BitmapFont,
     heading_font: &'static BitmapFont,
+    items_top: u16,
 }
 
 impl SettingsApp {
     pub fn new() -> Self {
+        let hf = &font_data::REGULAR_HEADING_SMALL;
         Self {
             settings: SystemSettings::defaults(),
             selected: 0,
@@ -172,18 +166,23 @@ impl SettingsApp {
             loaded: false,
             save_needed: false,
             body_font: &font_data::REGULAR_BODY_SMALL,
-            heading_font: &font_data::REGULAR_HEADING,
+            heading_font: hf,
+            items_top: CONTENT_TOP + 4 + hf.line_height + HEADING_ITEMS_GAP,
         }
     }
 
-    /// Called by main.rs whenever ui_font_size_idx changes.
-    /// The heading font is always the fixed 24 px cut; only body text scales.
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.body_font = match idx {
             1 => &font_data::REGULAR_BODY_MEDIUM,
             2 => &font_data::REGULAR_BODY_LARGE,
             _ => &font_data::REGULAR_BODY_SMALL,
         };
+        self.heading_font = match idx {
+            1 => &font_data::REGULAR_HEADING_MEDIUM,
+            2 => &font_data::REGULAR_HEADING_LARGE,
+            _ => &font_data::REGULAR_HEADING_SMALL,
+        };
+        self.items_top = CONTENT_TOP + 4 + self.heading_font.line_height + HEADING_ITEMS_GAP;
     }
 
     pub fn system_settings(&self) -> &SystemSettings {
@@ -192,6 +191,17 @@ impl SettingsApp {
 
     pub fn is_loaded(&self) -> bool {
         self.loaded
+    }
+
+    // Load settings from SD and apply font indices to self immediately.
+    // Called once at boot before the first render so saved preferences are
+    // in effect from the very first frame.
+    pub fn load_eager<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        services: &mut Services<'_, SPI>,
+    ) {
+        self.load(services);
+        self.set_ui_font_size(self.settings.ui_font_size_idx);
     }
 
     // ── Storage ───────────────────────────────────────────────────────────────
@@ -353,26 +363,40 @@ impl SettingsApp {
         self.save_needed = true;
     }
 
-    // ── Region helpers ────────────────────────────────────────────────────────
-
     #[inline]
-    fn label_region(i: usize) -> Region {
-        Region::new(LABEL_X, ITEMS_TOP + i as u16 * ROW_STRIDE, LABEL_W, ROW_H)
-    }
-
-    #[inline]
-    fn value_region(i: usize) -> Region {
-        Region::new(VALUE_X, ITEMS_TOP + i as u16 * ROW_STRIDE, VALUE_W, ROW_H)
-    }
-
-    #[inline]
-    fn row_region(i: usize) -> Region {
+    fn label_region(&self, i: usize) -> Region {
         Region::new(
             LABEL_X,
-            ITEMS_TOP + i as u16 * ROW_STRIDE,
+            self.items_top + i as u16 * ROW_STRIDE,
+            LABEL_W,
+            ROW_H,
+        )
+    }
+
+    #[inline]
+    fn value_region(&self, i: usize) -> Region {
+        Region::new(
+            VALUE_X,
+            self.items_top + i as u16 * ROW_STRIDE,
+            VALUE_W,
+            ROW_H,
+        )
+    }
+
+    #[inline]
+    fn row_region(&self, i: usize) -> Region {
+        Region::new(
+            LABEL_X,
+            self.items_top + i as u16 * ROW_STRIDE,
             LABEL_W + COL_GAP + VALUE_W,
             ROW_H,
         )
+    }
+
+    #[inline]
+    fn help_region(&self) -> Region {
+        let y = self.items_top + NUM_ITEMS as u16 * ROW_STRIDE + 14;
+        Region::new(8, y, 464, self.body_font.line_height)
     }
 }
 
@@ -389,7 +413,7 @@ impl App for SettingsApp {
             Event::Press(HwButton::Back) => {
                 if self.edit_mode {
                     self.edit_mode = false;
-                    ctx.mark_dirty(Self::row_region(self.selected));
+                    ctx.mark_dirty(self.row_region(self.selected));
                     return Transition::None;
                 }
                 Transition::Pop
@@ -398,13 +422,13 @@ impl App for SettingsApp {
             Event::Press(HwButton::Right | HwButton::VolDown) => {
                 if self.edit_mode {
                     self.increment();
-                    ctx.mark_dirty(Self::value_region(self.selected));
+                    ctx.mark_dirty(self.value_region(self.selected));
                 } else {
                     let old = self.selected;
                     self.selected = (self.selected + 1).min(NUM_ITEMS - 1);
                     if self.selected != old {
-                        ctx.mark_dirty(Self::row_region(old));
-                        ctx.mark_dirty(Self::row_region(self.selected));
+                        ctx.mark_dirty(self.row_region(old));
+                        ctx.mark_dirty(self.row_region(self.selected));
                     }
                 }
                 Transition::None
@@ -413,13 +437,13 @@ impl App for SettingsApp {
             Event::Press(HwButton::Left | HwButton::VolUp) => {
                 if self.edit_mode {
                     self.decrement();
-                    ctx.mark_dirty(Self::value_region(self.selected));
+                    ctx.mark_dirty(self.value_region(self.selected));
                 } else {
                     let old = self.selected;
                     self.selected = self.selected.saturating_sub(1);
                     if self.selected != old {
-                        ctx.mark_dirty(Self::row_region(old));
-                        ctx.mark_dirty(Self::row_region(self.selected));
+                        ctx.mark_dirty(self.row_region(old));
+                        ctx.mark_dirty(self.row_region(self.selected));
                     }
                 }
                 Transition::None
@@ -427,19 +451,19 @@ impl App for SettingsApp {
 
             Event::Press(HwButton::Confirm) => {
                 self.edit_mode = !self.edit_mode;
-                ctx.mark_dirty(Self::row_region(self.selected));
+                ctx.mark_dirty(self.row_region(self.selected));
                 Transition::None
             }
 
             Event::Repeat(HwButton::Right | HwButton::VolDown) if self.edit_mode => {
                 self.increment();
-                ctx.mark_dirty(Self::value_region(self.selected));
+                ctx.mark_dirty(self.value_region(self.selected));
                 Transition::None
             }
 
             Event::Repeat(HwButton::Left | HwButton::VolUp) if self.edit_mode => {
                 self.decrement();
-                ctx.mark_dirty(Self::value_region(self.selected));
+                ctx.mark_dirty(self.value_region(self.selected));
                 Transition::None
             }
 
@@ -468,13 +492,14 @@ impl App for SettingsApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        BitmapLabel::new(TITLE_REGION, "Settings", self.heading_font)
+        let title_region = Region::new(16, CONTENT_TOP + 4, 448, self.heading_font.line_height);
+        BitmapLabel::new(title_region, "Settings", self.heading_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
 
         if !self.loaded {
-            let r = Region::new(LABEL_X, ITEMS_TOP, 200, ROW_H);
+            let r = Region::new(LABEL_X, self.items_top, 200, ROW_H);
             BitmapLabel::new(r, "Loading...", self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
@@ -488,14 +513,14 @@ impl App for SettingsApp {
             let selected = i == self.selected;
             let editing = selected && self.edit_mode;
 
-            BitmapLabel::new(Self::label_region(i), Self::item_label(i), self.body_font)
+            BitmapLabel::new(self.label_region(i), Self::item_label(i), self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .inverted(selected)
                 .draw(strip)
                 .unwrap();
 
             self.format_value(i, &mut val_buf);
-            BitmapLabel::new(Self::value_region(i), val_buf.text(), self.body_font)
+            BitmapLabel::new(self.value_region(i), val_buf.text(), self.body_font)
                 .alignment(Alignment::Center)
                 .inverted(editing)
                 .draw(strip)
@@ -507,7 +532,7 @@ impl App for SettingsApp {
         } else {
             "L / R: select    Confirm: edit    Back: exit"
         };
-        BitmapLabel::new(HELP_REGION, help, self.body_font)
+        BitmapLabel::new(self.help_region(), help, self.body_font)
             .alignment(Alignment::Center)
             .draw(strip)
             .unwrap();
