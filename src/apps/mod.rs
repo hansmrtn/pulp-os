@@ -20,7 +20,7 @@ pub mod home;
 pub mod reader;
 pub mod settings;
 
-use crate::drivers::input::Event;
+use crate::board::action::ActionEvent;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{self, DirCache, DirEntry, DirPage};
 use crate::drivers::strip::StripBuffer;
@@ -184,7 +184,12 @@ pub trait App {
     fn on_resume(&mut self, ctx: &mut AppContext) {
         self.on_enter(ctx);
     }
-    fn on_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition;
+    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition;
+
+    /// Static help text describing available actions in the current state.
+    fn help_text(&self) -> &'static str {
+        ""
+    }
 
     // called once per strip during refresh; widgets clip automatically
     fn draw(&self, strip: &mut StripBuffer);

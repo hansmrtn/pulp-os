@@ -18,8 +18,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::text::Text;
 
 use crate::apps::{App, AppContext, Services, Transition};
-use crate::board::button::Button as HwButton;
-use crate::drivers::input::Event;
+use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::formats::epub::{self, EpubMeta, EpubSpine};
@@ -595,6 +594,57 @@ impl ReaderApp {
 
         false
     }
+
+    /// Jump to next chapter (epub) or forward 10 pages (txt).
+    fn jump_forward(&mut self) -> bool {
+        if self.state != State::Ready {
+            return false;
+        }
+        if self.is_epub {
+            if (self.chapter as usize + 1) < self.spine.len() {
+                self.chapter += 1;
+                self.goto_last_page = false;
+                self.state = State::NeedChapter;
+                return true;
+            }
+        } else {
+            let last = if self.total_pages > 0 {
+                self.total_pages - 1
+            } else {
+                0
+            };
+            let target = (self.page + 10).min(last);
+            if target != self.page {
+                self.page = target;
+                self.state = State::NeedPage;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Jump to previous chapter (epub) or back 10 pages (txt).
+    fn jump_backward(&mut self) -> bool {
+        if self.state != State::Ready {
+            return false;
+        }
+        if self.is_epub {
+            if self.chapter > 0 {
+                self.chapter -= 1;
+                self.goto_last_page = false;
+                self.state = State::NeedChapter;
+                return true;
+            }
+        } else {
+            let target = self.page.saturating_sub(10);
+            if target != self.page {
+                self.page = target;
+                self.state = State::NeedPage;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -878,23 +928,40 @@ impl App for ReaderApp {
         }
     }
 
-    fn on_event(&mut self, event: Event, _ctx: &mut AppContext) -> Transition {
+    fn on_event(&mut self, event: ActionEvent, _ctx: &mut AppContext) -> Transition {
         match event {
-            Event::Press(HwButton::Back) => Transition::Pop,
+            ActionEvent::Press(Action::Back) => Transition::Pop,
+            ActionEvent::LongPress(Action::Back) => Transition::Home,
 
-            Event::Press(HwButton::Right | HwButton::VolDown)
-            | Event::Repeat(HwButton::Right | HwButton::VolDown) => {
+            ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
                 self.page_forward();
                 Transition::None
             }
 
-            Event::Press(HwButton::Left | HwButton::VolUp)
-            | Event::Repeat(HwButton::Left | HwButton::VolUp) => {
+            ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
                 self.page_backward();
                 Transition::None
             }
 
+            ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
+                self.jump_forward();
+                Transition::None
+            }
+
+            ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
+                self.jump_backward();
+                Transition::None
+            }
+
             _ => Transition::None,
+        }
+    }
+
+    fn help_text(&self) -> &'static str {
+        if self.is_epub {
+            "Prev/Next: page  Jump: chapter  Menu: options"
+        } else {
+            "Prev/Next: page  Jump: +/-10  Menu: options"
         }
     }
 

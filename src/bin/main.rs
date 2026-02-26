@@ -6,6 +6,11 @@
 // Apps are stack allocated and dispatched via with_app! macro (no dyn).
 // Timer scales from 10ms (active) to 100ms (idle) to save power;
 // any button activity snaps it back immediately.
+//
+// Input events are translated through ButtonMapper into semantic
+// ActionEvents before reaching apps.  The Power button opens a
+// quick-action overlay that floats over the bottom of the screen;
+// while the overlay is open all input is routed to it.
 
 #![no_std]
 #![no_main]
@@ -25,15 +30,17 @@ use pulp_os::apps::files::FilesApp;
 use pulp_os::apps::home::HomeApp;
 use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
-use pulp_os::apps::{App, AppId, Launcher, Redraw, Services};
+use pulp_os::apps::{App, AppId, Launcher, Redraw, Services, Transition};
 use pulp_os::board::Board;
+use pulp_os::board::action::{Action, ActionEvent, ButtonMapper, ButtonProfile};
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::DirCache;
 use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::wake::{self, signal_timer, try_wake};
 use pulp_os::kernel::{Job, Scheduler};
-use pulp_os::ui::{BAR_HEIGHT, StatusBar, SystemStatus, free_stack_bytes};
+use pulp_os::ui::quick_menu::{QuickMenuResult, QuickMenuValues};
+use pulp_os::ui::{BAR_HEIGHT, QuickMenu, StatusBar, SystemStatus, free_stack_bytes};
 
 extern crate alloc;
 
@@ -133,6 +140,8 @@ fn main() -> ! {
     let mut settings = SettingsApp::new();
 
     let mut launcher = Launcher::new();
+    let mut mapper = ButtonMapper::new();
+    let mut quick_menu = QuickMenu::new();
 
     let mut sched = Scheduler::new();
     let mut input = InputDriver::new(board.input);
@@ -148,13 +157,14 @@ fn main() -> ! {
     {
         let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
         settings.load_eager(&mut svc);
-        let s = settings.system_settings();
-        let ui_idx = s.ui_font_size_idx;
-        let book_idx = s.book_font_size_idx;
+        let ui_idx = settings.system_settings().ui_font_size_idx;
+        let book_idx = settings.system_settings().book_font_size_idx;
+        let btn_map = settings.system_settings().button_map;
         home.set_ui_font_size(ui_idx);
         files.set_ui_font_size(ui_idx);
         settings.set_ui_font_size(ui_idx);
         reader.set_book_font_size(book_idx);
+        mapper.set_profile(ButtonProfile::from_u8(btn_map));
     }
 
     home.on_enter(&mut launcher.ctx);
@@ -175,7 +185,7 @@ fn main() -> ! {
         while let Some(job) = sched.pop() {
             match job {
                 Job::PollInput => {
-                    let Some(event) = input.poll() else {
+                    let Some(hw_event) = input.poll() else {
                         if timer_is_slow && input.is_debouncing() {
                             set_timer_period(ACTIVE_TIMER_MS);
                             timer_is_slow = false;
@@ -199,6 +209,96 @@ fn main() -> ! {
                     }
                     idle_polls = 0;
 
+                    // Translate physical button event to semantic action
+                    let event = mapper.map_event(hw_event);
+
+                    // ── Quick menu intercept ────────────────────────
+                    //
+                    // While the overlay is visible every press/repeat
+                    // is routed to the quick menu instead of the app.
+                    if quick_menu.open {
+                        if let ActionEvent::Press(action) | ActionEvent::Repeat(action) = event {
+                            let result = quick_menu.on_action(action);
+                            match result {
+                                QuickMenuResult::Consumed => {
+                                    if quick_menu.dirty {
+                                        launcher.ctx.mark_dirty(quick_menu.region());
+                                        quick_menu.dirty = false;
+                                    }
+                                }
+                                QuickMenuResult::Close => {
+                                    // Sync changed values back to settings
+                                    apply_quick_menu_values(
+                                        &quick_menu,
+                                        &mut settings,
+                                        &mut reader,
+                                    );
+                                    // Redraw the area the overlay covered
+                                    // to restore the app content beneath
+                                    launcher.ctx.mark_dirty(quick_menu.region());
+                                }
+                                QuickMenuResult::GoHome => {
+                                    apply_quick_menu_values(
+                                        &quick_menu,
+                                        &mut settings,
+                                        &mut reader,
+                                    );
+                                    // Navigate home
+                                    let transition = Transition::Home;
+                                    if let Some(nav) = launcher.apply(transition) {
+                                        info!(
+                                            "app: {:?} -> {:?} (quick menu GoHome)",
+                                            nav.from, nav.to
+                                        );
+                                        with_app!(nav.from, home, files, reader, settings, |app| {
+                                            app.on_exit();
+                                        });
+
+                                        {
+                                            let ui_idx =
+                                                settings.system_settings().ui_font_size_idx;
+                                            let book_idx =
+                                                settings.system_settings().book_font_size_idx;
+                                            let btn_map = settings.system_settings().button_map;
+                                            if nav.to == AppId::Reader {
+                                                reader.set_book_font_size(book_idx);
+                                            }
+                                            home.set_ui_font_size(ui_idx);
+                                            files.set_ui_font_size(ui_idx);
+                                            settings.set_ui_font_size(ui_idx);
+                                            mapper.set_profile(ButtonProfile::from_u8(btn_map));
+                                        }
+
+                                        with_app!(nav.to, home, files, reader, settings, |app| {
+                                            app.on_resume(&mut launcher.ctx);
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        // Whether consumed, closed, or GoHome —
+                        // check if we need a render
+                        if launcher.ctx.has_redraw() {
+                            let _ = sched.push_unique(Job::Render);
+                        }
+                        continue;
+                    }
+
+                    // ── Menu toggle (open overlay) ──────────────────
+                    if matches!(event, ActionEvent::Press(Action::Menu)) {
+                        let s = settings.system_settings();
+                        quick_menu.show(QuickMenuValues {
+                            book_font_size_idx: s.book_font_size_idx,
+                            contrast: s.contrast,
+                            ghost_clear_every: s.ghost_clear_every,
+                        });
+                        launcher.ctx.mark_dirty(quick_menu.region());
+                        let _ = sched.push_unique(Job::Render);
+                        continue;
+                    }
+
+                    // ── Normal app dispatch ─────────────────────────
                     let active = launcher.active();
                     let transition = with_app!(active, home, files, reader, settings, |app| {
                         app.on_event(event, &mut launcher.ctx)
@@ -223,19 +323,18 @@ fn main() -> ! {
                         // a setting changed while an app was suspended in the
                         // stack takes effect immediately on return.
                         {
-                            let s = settings.system_settings();
-                            let ui_idx = s.ui_font_size_idx;
-                            let book_idx = s.book_font_size_idx;
+                            let ui_idx = settings.system_settings().ui_font_size_idx;
+                            let book_idx = settings.system_settings().book_font_size_idx;
+                            let btn_map = settings.system_settings().button_map;
 
-                            // Book font — reader only.
                             if nav.to == AppId::Reader {
                                 reader.set_book_font_size(book_idx);
                             }
 
-                            // UI font — all shell apps.
                             home.set_ui_font_size(ui_idx);
                             files.set_ui_font_size(ui_idx);
                             settings.set_ui_font_size(ui_idx);
+                            mapper.set_profile(ButtonProfile::from_u8(btn_map));
                         }
 
                         if nav.resume {
@@ -272,6 +371,9 @@ fn main() -> ! {
                                 board.display.epd.render_full(&mut strip, &mut delay, |s| {
                                     statusbar.draw(s).unwrap();
                                     app.draw(s);
+                                    if quick_menu.open {
+                                        quick_menu.draw(s);
+                                    }
                                 });
                             });
                             partial_refreshes = 0;
@@ -290,6 +392,9 @@ fn main() -> ! {
                                     board.display.epd.render_full(&mut strip, &mut delay, |s| {
                                         statusbar.draw(s).unwrap();
                                         app.draw(s);
+                                        if quick_menu.open {
+                                            quick_menu.draw(s);
+                                        }
                                     });
                                 });
                                 partial_refreshes = 0;
@@ -310,6 +415,9 @@ fn main() -> ! {
                                                 statusbar.draw(s).unwrap();
                                             }
                                             app.draw(s);
+                                            if quick_menu.open {
+                                                quick_menu.draw(s);
+                                            }
                                         },
                                     );
                                 });
@@ -375,6 +483,8 @@ fn main() -> ! {
     }
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────
+
 fn update_statusbar(bar: &mut StatusBar, input: &mut InputDriver, sd_ok: bool) {
     const HEAP_TOTAL: usize = 256720;
     let stats = esp_alloc::HEAP.stats();
@@ -392,4 +502,19 @@ fn update_statusbar(bar: &mut StatusBar, input: &mut InputDriver, sd_ok: bool) {
         stack_free: free_stack_bytes(),
         sd_ok,
     });
+}
+
+/// Push values that were changed in the quick menu overlay back
+/// into SystemSettings and mark the settings file for save.
+fn apply_quick_menu_values(qm: &QuickMenu, settings: &mut SettingsApp, reader: &mut ReaderApp) {
+    let vals = qm.values;
+    let ss = settings.system_settings_mut();
+    ss.book_font_size_idx = vals.book_font_size_idx;
+    ss.contrast = vals.contrast;
+    ss.ghost_clear_every = vals.ghost_clear_every;
+    settings.mark_save_needed();
+
+    // Propagate font change to reader immediately so it takes
+    // effect on the next page render without a Settings detour.
+    reader.set_book_font_size(vals.book_font_size_idx);
 }

@@ -4,6 +4,7 @@
 // ADC resistance ladders for buttons, GPIO3 power button with interrupt.
 // SPI bus arbitrated via RefCellDevice (single threaded, no ISR access).
 
+pub mod action;
 pub mod button;
 pub mod pins;
 pub mod raw_gpio;

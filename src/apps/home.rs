@@ -1,8 +1,7 @@
 // Launcher screen, entry point after boot
 
 use crate::apps::{App, AppContext, AppId, Transition};
-use crate::board::button::Button as HwButton;
-use crate::drivers::input::Event;
+use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
@@ -102,19 +101,23 @@ impl App for HomeApp {
         ctx.request_screen_redraw();
     }
 
-    fn on_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {
+    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
         match event {
-            Event::Press(HwButton::Right | HwButton::VolDown) => {
+            ActionEvent::Press(Action::Next) => {
                 self.move_selection(1, ctx);
                 Transition::None
             }
-            Event::Press(HwButton::Left | HwButton::VolUp) => {
+            ActionEvent::Press(Action::Prev) => {
                 self.move_selection(-1, ctx);
                 Transition::None
             }
-            Event::Press(HwButton::Confirm) => Transition::Push(ITEMS[self.selected].app),
+            ActionEvent::Press(Action::Select) => Transition::Push(ITEMS[self.selected].app),
             _ => Transition::None,
         }
+    }
+
+    fn help_text(&self) -> &'static str {
+        "Prev/Next: select    Confirm: open"
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

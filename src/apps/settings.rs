@@ -43,8 +43,7 @@
 use core::fmt::Write as _;
 
 use crate::apps::{App, AppContext, Services, Transition};
-use crate::board::button::Button as HwButton;
-use crate::drivers::input::Event;
+use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
@@ -148,7 +147,6 @@ impl SystemSettings {
 pub struct SettingsApp {
     settings: SystemSettings,
     selected: usize,
-    edit_mode: bool,
     loaded: bool,
     save_needed: bool,
     body_font: &'static BitmapFont,
@@ -162,7 +160,6 @@ impl SettingsApp {
         Self {
             settings: SystemSettings::defaults(),
             selected: 0,
-            edit_mode: false,
             loaded: false,
             save_needed: false,
             body_font: &font_data::REGULAR_BODY_SMALL,
@@ -187,6 +184,14 @@ impl SettingsApp {
 
     pub fn system_settings(&self) -> &SystemSettings {
         &self.settings
+    }
+
+    pub fn system_settings_mut(&mut self) -> &mut SystemSettings {
+        &mut self.settings
+    }
+
+    pub fn mark_save_needed(&mut self) {
+        self.save_needed = true;
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -282,10 +287,8 @@ impl SettingsApp {
                 let _ = write!(buf, "{}", s);
             }
             5 => {
-                let s = match self.settings.button_map {
-                    1 => "Swapped",
-                    _ => "Default",
-                };
+                let s =
+                    crate::board::action::ButtonProfile::from_u8(self.settings.button_map).name();
                 let _ = write!(buf, "{}", s);
             }
             _ => {}
@@ -392,83 +395,59 @@ impl SettingsApp {
             ROW_H,
         )
     }
-
-    #[inline]
-    fn help_region(&self) -> Region {
-        let y = self.items_top + NUM_ITEMS as u16 * ROW_STRIDE + 14;
-        Region::new(8, y, 464, self.body_font.line_height)
-    }
 }
 
 impl App for SettingsApp {
     fn on_enter(&mut self, ctx: &mut AppContext) {
         self.selected = 0;
-        self.edit_mode = false;
         self.save_needed = false;
         ctx.request_screen_redraw();
     }
 
-    fn on_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {
+    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
         match event {
-            Event::Press(HwButton::Back) => {
-                if self.edit_mode {
-                    self.edit_mode = false;
+            ActionEvent::Press(Action::Back) => Transition::Pop,
+            ActionEvent::LongPress(Action::Back) => Transition::Home,
+
+            ActionEvent::Press(Action::Next) => {
+                let old = self.selected;
+                self.selected = (self.selected + 1).min(NUM_ITEMS - 1);
+                if self.selected != old {
+                    ctx.mark_dirty(self.row_region(old));
                     ctx.mark_dirty(self.row_region(self.selected));
-                    return Transition::None;
-                }
-                Transition::Pop
-            }
-
-            Event::Press(HwButton::Right | HwButton::VolDown) => {
-                if self.edit_mode {
-                    self.increment();
-                    ctx.mark_dirty(self.value_region(self.selected));
-                } else {
-                    let old = self.selected;
-                    self.selected = (self.selected + 1).min(NUM_ITEMS - 1);
-                    if self.selected != old {
-                        ctx.mark_dirty(self.row_region(old));
-                        ctx.mark_dirty(self.row_region(self.selected));
-                    }
                 }
                 Transition::None
             }
 
-            Event::Press(HwButton::Left | HwButton::VolUp) => {
-                if self.edit_mode {
-                    self.decrement();
-                    ctx.mark_dirty(self.value_region(self.selected));
-                } else {
-                    let old = self.selected;
-                    self.selected = self.selected.saturating_sub(1);
-                    if self.selected != old {
-                        ctx.mark_dirty(self.row_region(old));
-                        ctx.mark_dirty(self.row_region(self.selected));
-                    }
+            ActionEvent::Press(Action::Prev) => {
+                let old = self.selected;
+                self.selected = self.selected.saturating_sub(1);
+                if self.selected != old {
+                    ctx.mark_dirty(self.row_region(old));
+                    ctx.mark_dirty(self.row_region(self.selected));
                 }
                 Transition::None
             }
 
-            Event::Press(HwButton::Confirm) => {
-                self.edit_mode = !self.edit_mode;
-                ctx.mark_dirty(self.row_region(self.selected));
-                Transition::None
-            }
-
-            Event::Repeat(HwButton::Right | HwButton::VolDown) if self.edit_mode => {
+            ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
                 self.increment();
                 ctx.mark_dirty(self.value_region(self.selected));
                 Transition::None
             }
 
-            Event::Repeat(HwButton::Left | HwButton::VolUp) if self.edit_mode => {
+            ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
                 self.decrement();
                 ctx.mark_dirty(self.value_region(self.selected));
                 Transition::None
             }
 
+            // Select on a row is a no-op; use Jump axis to adjust values.
             _ => Transition::None,
         }
+    }
+
+    fn help_text(&self) -> &'static str {
+        "Prev/Next: select  Jump: adjust  Back: exit"
     }
 
     fn needs_work(&self) -> bool {
@@ -511,7 +490,6 @@ impl App for SettingsApp {
 
         for i in 0..NUM_ITEMS {
             let selected = i == self.selected;
-            let editing = selected && self.edit_mode;
 
             BitmapLabel::new(self.label_region(i), Self::item_label(i), self.body_font)
                 .alignment(Alignment::CenterLeft)
@@ -522,19 +500,9 @@ impl App for SettingsApp {
             self.format_value(i, &mut val_buf);
             BitmapLabel::new(self.value_region(i), val_buf.text(), self.body_font)
                 .alignment(Alignment::Center)
-                .inverted(editing)
+                .inverted(selected)
                 .draw(strip)
                 .unwrap();
         }
-
-        let help = if self.edit_mode {
-            "L / R: adjust    Confirm / Back: done"
-        } else {
-            "L / R: select    Confirm: edit    Back: exit"
-        };
-        BitmapLabel::new(self.help_region(), help, self.body_font)
-            .alignment(Alignment::Center)
-            .draw(strip)
-            .unwrap();
     }
 }
