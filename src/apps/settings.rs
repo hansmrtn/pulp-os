@@ -1,44 +1,20 @@
 // System settings with persistent storage
 //
-// Only settings that correspond to real hardware knobs or kernel-level
-// parameters live here.  Fields that have no physical target on the
-// XTEink X4 (e.g. backlight — absent on e-paper; orientation — hardwired
-// to Deg270 in the display driver) are intentionally excluded.
+// Only settings with a real hardware or kernel target live here.
 //
-// Wiring status of each field:
+// Wiring status:
 //
 //   sleep_timeout      — stored; kernel still uses a compile-time constant.
-//                        Short path: read SystemSettings in the main loop
-//                        and replace IDLE_THRESHOLD_POLLS with this value.
+//   contrast           — SSD1677 VCOM register 0x2C; stored, not yet sent.
+//   ghost_clear_every  — replaces FULL_REFRESH_INTERVAL once main loop reads it.
+//   book_font_size_idx — fully wired; ReaderApp consults on on_enter().
+//   ui_font_size_idx   — fully wired; propagated to all shell apps on nav.
 //
-//   contrast           — SSD1677 VCOM register 0x2C.  Stored; not yet sent
-//                        to the display driver.  Plumbing: add a
-//                        `set_vcom(u8)` method to DisplayDriver and call it
-//                        after loading settings.
+// Persistence: #[repr(C)] struct written as raw bytes to "settings.bin".
+// Never reorder or remove fields; see SystemSettings layout comment.
 //
-//   ghost_clear_every  — directly replaces FULL_REFRESH_INTERVAL in
-//                        main.rs once the main loop reads this value.
-//
-//   book_font_size_idx — reader body-font size selector (0=Small, 1=Medium,
-//                        2=Large).  ReaderApp consults this on on_enter().
-//
-//   ui_font_size_idx   — shell / settings UI font size selector.
-//                        Same index scale as book_font_size_idx.
-//                        Fully wired: HomeApp / FilesApp / SettingsApp all
-//                        store a body_font pointer updated via
-//                        set_ui_font_size().  main.rs propagates the index
-//                        to all three apps on every nav transition, before
-//                        the lifecycle callback fires.
-//
-//   button_map         — selects a key-layout profile.
-//                        0 = Default, 1 = Swapped (L/R swapped for left hand).
-//
-// Persistence: SystemSettings is a #[repr(C)] struct written as raw bytes
-// to "settings.bin" in the SD card root.  The struct is 8 bytes; the pad
-// field reserves room for future additions without a breaking change.
-//
-// I/O discipline: load and save are deferred entirely to on_work() so
-// the render path is never blocked by SD card access.
+// I/O: load and save are deferred to on_work() so the render path is
+// never blocked by SD card access.
 
 use core::fmt::Write as _;
 
@@ -64,7 +40,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = 296; // reaches to x = 480 − 8 = 472
 
-const NUM_ITEMS: usize = 6;
+const NUM_ITEMS: usize = 5;
 // Gap between heading bottom and first settings row.
 const HEADING_ITEMS_GAP: u16 = 8;
 
@@ -72,30 +48,23 @@ const HEADING_ITEMS_GAP: u16 = 8;
 
 const SETTINGS_FILE: &str = "settings.bin";
 
-// Hardware-mapped settings persisted to the SD card as raw bytes.
-//
-// #[repr(C)] guarantees a stable on-disk layout. Never reorder or
-// remove fields; add new ones before _pad and shrink _pad by the
-// same number of bytes to keep size_of::<SystemSettings>() == 8.
-//
-// Layout (8 bytes total):
+// #[repr(C)] on-disk layout (8 bytes total):
 //   sleep_timeout      u16   bytes 0–1
 //   contrast           u8    byte  2
 //   ghost_clear_every  u8    byte  3
 //   book_font_size_idx u8    byte  4
 //   ui_font_size_idx   u8    byte  5
-//   button_map         u8    byte  6
-//   _pad               u8    byte  7
+//   _pad               [u8;2] bytes 6–7
+// Add new fields before _pad and shrink it by the same byte count.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SystemSettings {
-    pub sleep_timeout: u16,     // minutes of inactivity before sleep; 0 = never
-    pub contrast: u8,           // SSD1677 VCOM register 0x2C; higher = darker
+    pub sleep_timeout: u16,     // minutes idle before sleep; 0 = never
+    pub contrast: u8,           // SSD1677 VCOM 0x2C; higher = darker
     pub ghost_clear_every: u8,  // partial refreshes before a forced full refresh
     pub book_font_size_idx: u8, // 0 = Small, 1 = Medium, 2 = Large
     pub ui_font_size_idx: u8,   // 0 = Small, 1 = Medium, 2 = Large
-    pub button_map: u8,         // 0 = Default, 1 = Swapped (L/R)
-    _pad: [u8; 1],              // reserved; keeps struct at 8 bytes
+    _pad: [u8; 2],              // reserved
 }
 
 impl Default for SystemSettings {
@@ -112,8 +81,7 @@ impl SystemSettings {
             ghost_clear_every: 10,
             book_font_size_idx: 0,
             ui_font_size_idx: 0,
-            button_map: 0,
-            _pad: [0u8; 1],
+            _pad: [0u8; 2],
         }
     }
 
@@ -249,7 +217,6 @@ impl SettingsApp {
             2 => "Ghost Clear",
             3 => "Book Font",
             4 => "UI Font",
-            5 => "Button Map",
             _ => "",
         }
     }
@@ -286,11 +253,6 @@ impl SettingsApp {
                 };
                 let _ = write!(buf, "{}", s);
             }
-            5 => {
-                let s =
-                    crate::board::action::ButtonProfile::from_u8(self.settings.button_map).name();
-                let _ = write!(buf, "{}", s);
-            }
             _ => {}
         }
     }
@@ -323,9 +285,6 @@ impl SettingsApp {
                     self.settings.ui_font_size_idx += 1;
                 }
             }
-            5 => {
-                self.settings.button_map = (self.settings.button_map + 1).min(1);
-            }
             _ => return,
         }
         self.save_needed = true;
@@ -354,11 +313,6 @@ impl SettingsApp {
             4 => {
                 if self.settings.ui_font_size_idx > 0 {
                     self.settings.ui_font_size_idx -= 1;
-                }
-            }
-            5 => {
-                if self.settings.button_map > 0 {
-                    self.settings.button_map -= 1;
                 }
             }
             _ => return,

@@ -42,8 +42,8 @@ pub const DEFAULT_TOLERANCE: u16 = 150;
 pub const ROW1_THRESHOLDS: &[(u16, u16, Button)] = &[
     (3, 50, Button::Right),
     (1113, DEFAULT_TOLERANCE, Button::Left),
-    (1984, DEFAULT_TOLERANCE, Button::Back),
-    (2556, DEFAULT_TOLERANCE, Button::Confirm),
+    (1984, DEFAULT_TOLERANCE, Button::Confirm),
+    (2556, DEFAULT_TOLERANCE, Button::Back),
 ];
 
 pub const ROW2_THRESHOLDS: &[(u16, u16, Button)] = &[

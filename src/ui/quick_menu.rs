@@ -2,17 +2,18 @@
 //
 // Renders over the bottom portion of the current screen using a
 // partial refresh.  Provides instant access to the most common
-// settings adjustments and navigation without leaving the current app.
+// actions without leaving the current app.
 //
-// Layout:  the overlay occupies a fixed rectangle at the bottom of
-// the 480×800 logical screen.  It draws a solid white background
-// with a 2px black border, then a list of adjustable items.
+// Items:
+//   Book Font     — cycle Small / Medium / Large
+//   Refresh       — force a full GC display refresh to clear ghosting
+//   Go Home       — dismiss and navigate to HomeApp
 //
 // Navigation while open:
-//   Prev / Next       — move selection between rows
-//   PrevJump / NextJump — decrement / increment the selected value
-//   Menu or Back       — dismiss overlay, sync values to settings
-//   Select on "Go Home" — dismiss and navigate home
+//   Prev / Next          — move selection between rows
+//   PrevJump / NextJump  — decrement / increment the selected value
+//   Select               — activate the selected action row
+//   Menu or Back         — dismiss overlay, sync values to settings
 
 use core::fmt::Write as _;
 
@@ -26,29 +27,28 @@ use crate::fonts::font_data;
 
 // ── Layout constants ──────────────────────────────────────────────
 
-const OVERLAY_W: u16 = 440;
+const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (480 - OVERLAY_W) / 2; // centered horizontally
 const OVERLAY_BOTTOM: u16 = 790; // 10px from screen bottom
-const ITEM_H: u16 = 36;
+const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
 const BORDER: u16 = 2;
 const PAD_TOP: u16 = 10;
 const PAD_BOTTOM: u16 = 8;
-const LABEL_X: u16 = OVERLAY_X + 12;
-const LABEL_W: u16 = 160;
+const LABEL_X: u16 = OVERLAY_X + 16;
+const LABEL_W: u16 = 150;
 const VALUE_X: u16 = LABEL_X + LABEL_W + 8;
-const VALUE_W: u16 = OVERLAY_W - 12 - LABEL_W - 8 - 12;
+const VALUE_W: u16 = OVERLAY_W - 16 - LABEL_W - 8 - 16;
 const HELP_H: u16 = 20;
 
 /// Items shown in the quick menu.
-const NUM_ITEMS: usize = 4;
+const NUM_ITEMS: usize = 3;
 
 /// Indices into the item list.
 const IDX_FONT_SIZE: usize = 0;
-const IDX_CONTRAST: usize = 1;
-const IDX_GHOST: usize = 2;
-const IDX_HOME: usize = 3;
+const IDX_REFRESH: usize = 1;
+const IDX_HOME: usize = 2;
 
 /// Height of the full overlay including border and padding.
 const CONTENT_H: u16 = PAD_TOP + (ITEM_STRIDE * NUM_ITEMS as u16) + HELP_H + PAD_BOTTOM;
@@ -62,8 +62,6 @@ pub const OVERLAY_REGION: Region = Region::new(OVERLAY_X, OVERLAY_Y, OVERLAY_W, 
 #[derive(Clone, Copy)]
 pub struct QuickMenuValues {
     pub book_font_size_idx: u8,
-    pub contrast: u8,
-    pub ghost_clear_every: u8,
 }
 
 /// Result of quick menu interaction.
@@ -73,7 +71,9 @@ pub enum QuickMenuResult {
     Consumed,
     /// User dismissed the overlay; values may have changed.
     Close,
-    /// User chose "Home" — navigate to home screen.
+    /// User chose "Refresh" — force a full GC display refresh.
+    RefreshScreen,
+    /// User chose "Go Home" — navigate to home screen.
     GoHome,
 }
 
@@ -91,8 +91,6 @@ impl QuickMenu {
             selected: 0,
             values: QuickMenuValues {
                 book_font_size_idx: 0,
-                contrast: 150,
-                ghost_clear_every: 10,
             },
             dirty: false,
         }
@@ -131,7 +129,7 @@ impl QuickMenu {
     fn help_region() -> Region {
         Region::new(
             OVERLAY_X + 12,
-            OVERLAY_Y + BORDER + PAD_TOP + NUM_ITEMS as u16 * ITEM_STRIDE,
+            OVERLAY_Y + BORDER + PAD_TOP + NUM_ITEMS as u16 * ITEM_STRIDE + 2,
             OVERLAY_W - 24,
             HELP_H,
         )
@@ -140,8 +138,7 @@ impl QuickMenu {
     fn item_label(i: usize) -> &'static str {
         match i {
             IDX_FONT_SIZE => "Book Font",
-            IDX_CONTRAST => "Contrast",
-            IDX_GHOST => "Ghost Clear",
+            IDX_REFRESH => "Refresh",
             IDX_HOME => "Go Home",
             _ => "",
         }
@@ -158,11 +155,8 @@ impl QuickMenu {
                 };
                 let _ = write!(buf, "{}", s);
             }
-            IDX_CONTRAST => {
-                let _ = write!(buf, "{}", self.values.contrast);
-            }
-            IDX_GHOST => {
-                let _ = write!(buf, "Every {}", self.values.ghost_clear_every);
+            IDX_REFRESH => {
+                let _ = write!(buf, "Clear ghost");
             }
             IDX_HOME => {
                 let _ = write!(buf, ">>>");
@@ -171,42 +165,18 @@ impl QuickMenu {
         }
     }
 
-    fn increment(&mut self) {
-        match self.selected {
-            IDX_FONT_SIZE => {
-                if self.values.book_font_size_idx < 2 {
-                    self.values.book_font_size_idx += 1;
-                }
-            }
-            IDX_CONTRAST => {
-                self.values.contrast = self.values.contrast.saturating_add(16);
-            }
-            IDX_GHOST => {
-                self.values.ghost_clear_every =
-                    self.values.ghost_clear_every.saturating_add(5).min(50);
-            }
-            _ => {}
+    fn increment_font(&mut self) {
+        if self.values.book_font_size_idx < 2 {
+            self.values.book_font_size_idx += 1;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
-    fn decrement(&mut self) {
-        match self.selected {
-            IDX_FONT_SIZE => {
-                if self.values.book_font_size_idx > 0 {
-                    self.values.book_font_size_idx -= 1;
-                }
-            }
-            IDX_CONTRAST => {
-                self.values.contrast = self.values.contrast.saturating_sub(16);
-            }
-            IDX_GHOST => {
-                self.values.ghost_clear_every =
-                    self.values.ghost_clear_every.saturating_sub(5).max(5);
-            }
-            _ => {}
+    fn decrement_font(&mut self) {
+        if self.values.book_font_size_idx > 0 {
+            self.values.book_font_size_idx -= 1;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// Handle an action while the overlay is open.
@@ -232,22 +202,34 @@ impl QuickMenu {
                 QuickMenuResult::Consumed
             }
             Action::NextJump => {
-                self.increment();
+                if self.selected == IDX_FONT_SIZE {
+                    self.increment_font();
+                }
                 QuickMenuResult::Consumed
             }
             Action::PrevJump => {
-                self.decrement();
-                QuickMenuResult::Consumed
-            }
-            Action::Select => {
-                if self.selected == IDX_HOME {
-                    self.hide();
-                    return QuickMenuResult::GoHome;
+                if self.selected == IDX_FONT_SIZE {
+                    self.decrement_font();
                 }
-                // For adjustable items Select is a no-op;
-                // use NextJump / PrevJump to adjust.
                 QuickMenuResult::Consumed
             }
+            Action::Select => match self.selected {
+                IDX_REFRESH => {
+                    self.hide();
+                    QuickMenuResult::RefreshScreen
+                }
+                IDX_HOME => {
+                    self.hide();
+                    QuickMenuResult::GoHome
+                }
+                IDX_FONT_SIZE => {
+                    // Cycle forward on Select for convenience
+                    self.values.book_font_size_idx = (self.values.book_font_size_idx + 1) % 3;
+                    self.dirty = true;
+                    QuickMenuResult::Consumed
+                }
+                _ => QuickMenuResult::Consumed,
+            },
         }
     }
 
@@ -297,7 +279,7 @@ impl QuickMenu {
 
         BitmapLabel::new(
             Self::help_region(),
-            "Prev/Next: move  Jump: adjust  Menu: close",
+            "Prev/Next  Jump: adjust  Sel: act  Menu: close",
             font,
         )
         .alignment(Alignment::Center)

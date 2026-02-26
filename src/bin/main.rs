@@ -32,7 +32,7 @@ use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
 use pulp_os::apps::{App, AppId, Launcher, Redraw, Services, Transition};
 use pulp_os::board::Board;
-use pulp_os::board::action::{Action, ActionEvent, ButtonMapper, ButtonProfile};
+use pulp_os::board::action::{Action, ActionEvent, ButtonMapper};
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::DirCache;
@@ -40,7 +40,9 @@ use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::wake::{self, signal_timer, try_wake};
 use pulp_os::kernel::{Job, Scheduler};
 use pulp_os::ui::quick_menu::{QuickMenuResult, QuickMenuValues};
-use pulp_os::ui::{BAR_HEIGHT, QuickMenu, StatusBar, SystemStatus, free_stack_bytes};
+use pulp_os::ui::{
+    BAR_HEIGHT, ButtonFeedback, QuickMenu, StatusBar, SystemStatus, free_stack_bytes,
+};
 
 extern crate alloc;
 
@@ -140,8 +142,9 @@ fn main() -> ! {
     let mut settings = SettingsApp::new();
 
     let mut launcher = Launcher::new();
-    let mut mapper = ButtonMapper::new();
+    let mapper = ButtonMapper::new();
     let mut quick_menu = QuickMenu::new();
+    let mut bumps = ButtonFeedback::new();
 
     let mut sched = Scheduler::new();
     let mut input = InputDriver::new(board.input);
@@ -159,12 +162,10 @@ fn main() -> ! {
         settings.load_eager(&mut svc);
         let ui_idx = settings.system_settings().ui_font_size_idx;
         let book_idx = settings.system_settings().book_font_size_idx;
-        let btn_map = settings.system_settings().button_map;
         home.set_ui_font_size(ui_idx);
         files.set_ui_font_size(ui_idx);
         settings.set_ui_font_size(ui_idx);
         reader.set_book_font_size(book_idx);
-        mapper.set_profile(ButtonProfile::from_u8(btn_map));
     }
 
     home.on_enter(&mut launcher.ctx);
@@ -209,6 +210,21 @@ fn main() -> ! {
                     }
                     idle_polls = 0;
 
+                    // Track press/release on the raw event (physical button, not mapped action).
+                    match hw_event {
+                        pulp_os::drivers::input::Event::Press(btn) => {
+                            if let Some(r) = bumps.on_press(btn) {
+                                launcher.ctx.mark_dirty(r);
+                            }
+                        }
+                        pulp_os::drivers::input::Event::Release(_) => {
+                            if let Some(r) = bumps.on_release() {
+                                launcher.ctx.mark_dirty(r);
+                            }
+                        }
+                        _ => {}
+                    }
+
                     // Translate physical button event to semantic action
                     let event = mapper.map_event(hw_event);
 
@@ -237,6 +253,15 @@ fn main() -> ! {
                                     // to restore the app content beneath
                                     launcher.ctx.mark_dirty(quick_menu.region());
                                 }
+                                QuickMenuResult::RefreshScreen => {
+                                    apply_quick_menu_values(
+                                        &quick_menu,
+                                        &mut settings,
+                                        &mut reader,
+                                    );
+                                    // Force a full GC refresh on next render
+                                    launcher.ctx.request_full_redraw();
+                                }
                                 QuickMenuResult::GoHome => {
                                     apply_quick_menu_values(
                                         &quick_menu,
@@ -259,14 +284,12 @@ fn main() -> ! {
                                                 settings.system_settings().ui_font_size_idx;
                                             let book_idx =
                                                 settings.system_settings().book_font_size_idx;
-                                            let btn_map = settings.system_settings().button_map;
                                             if nav.to == AppId::Reader {
                                                 reader.set_book_font_size(book_idx);
                                             }
                                             home.set_ui_font_size(ui_idx);
                                             files.set_ui_font_size(ui_idx);
                                             settings.set_ui_font_size(ui_idx);
-                                            mapper.set_profile(ButtonProfile::from_u8(btn_map));
                                         }
 
                                         with_app!(nav.to, home, files, reader, settings, |app| {
@@ -290,8 +313,6 @@ fn main() -> ! {
                         let s = settings.system_settings();
                         quick_menu.show(QuickMenuValues {
                             book_font_size_idx: s.book_font_size_idx,
-                            contrast: s.contrast,
-                            ghost_clear_every: s.ghost_clear_every,
                         });
                         launcher.ctx.mark_dirty(quick_menu.region());
                         let _ = sched.push_unique(Job::Render);
@@ -325,8 +346,6 @@ fn main() -> ! {
                         {
                             let ui_idx = settings.system_settings().ui_font_size_idx;
                             let book_idx = settings.system_settings().book_font_size_idx;
-                            let btn_map = settings.system_settings().button_map;
-
                             if nav.to == AppId::Reader {
                                 reader.set_book_font_size(book_idx);
                             }
@@ -334,7 +353,6 @@ fn main() -> ! {
                             home.set_ui_font_size(ui_idx);
                             files.set_ui_font_size(ui_idx);
                             settings.set_ui_font_size(ui_idx);
-                            mapper.set_profile(ButtonProfile::from_u8(btn_map));
                         }
 
                         if nav.resume {
@@ -374,6 +392,7 @@ fn main() -> ! {
                                     if quick_menu.open {
                                         quick_menu.draw(s);
                                     }
+                                    bumps.draw(s);
                                 });
                             });
                             partial_refreshes = 0;
@@ -395,6 +414,7 @@ fn main() -> ! {
                                         if quick_menu.open {
                                             quick_menu.draw(s);
                                         }
+                                        bumps.draw(s);
                                     });
                                 });
                                 partial_refreshes = 0;
@@ -418,6 +438,7 @@ fn main() -> ! {
                                             if quick_menu.open {
                                                 quick_menu.draw(s);
                                             }
+                                            bumps.draw(s);
                                         },
                                     );
                                 });
@@ -510,8 +531,6 @@ fn apply_quick_menu_values(qm: &QuickMenu, settings: &mut SettingsApp, reader: &
     let vals = qm.values;
     let ss = settings.system_settings_mut();
     ss.book_font_size_idx = vals.book_font_size_idx;
-    ss.contrast = vals.contrast;
-    ss.ghost_clear_every = vals.ghost_clear_every;
     settings.mark_save_needed();
 
     // Propagate font change to reader immediately so it takes
