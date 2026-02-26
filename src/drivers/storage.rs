@@ -3,6 +3,9 @@
 // FAT directory iteration has no seek; every listing scans from entry 0.
 // DirCache reads all entries once into RAM and serves pages from there.
 // 128 entries * 20 bytes = 2.5KB of SRAM.
+//
+// read_file_start: single open, returns (file_size, bytes_read) from offset 0.
+// Avoids the separate file_size + read_file_chunk round-trip on first access.
 
 use embedded_sdmmc::{Mode, VolumeIdx};
 
@@ -260,6 +263,38 @@ where
     }
 
     Ok(total)
+}
+
+// open file, return (size, bytes_read) from offset 0 in a single open
+pub fn read_file_start<SPI>(
+    sd: &SdStorage<SPI>,
+    name: &str,
+    buf: &mut [u8],
+) -> Result<(u32, usize), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+    let mut file = root
+        .open_file_in_dir(name, Mode::ReadOnly)
+        .map_err(|_| "open file failed")?;
+
+    let file_size = file.length();
+
+    let mut total = 0;
+    while !file.is_eof() && total < buf.len() {
+        let n = file.read(&mut buf[total..]).map_err(|_| "read failed")?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+
+    Ok((file_size, total))
 }
 
 pub fn write_file<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Result<(), &'static str>

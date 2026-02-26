@@ -121,9 +121,10 @@ impl AppContext {
     }
 }
 
-// TODO: hold Volume handle open for the lifetime of Services so that
-// read_file_chunk / file_size don't re-read the MBR on every call.
-// Deferred until the reader app does paged file reads.
+// Each read_file_chunk / file_size call re-opens volume/dir/file.
+// The reader mitigates this with lazy indexing and prefetch so the
+// hot path (forward page turn) needs at most one SD open per turn.
+// read_file_start folds file_size + first read into a single open.
 pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
     dir_cache: &'a mut DirCache,
     sd: &'a SdStorage<SPI>,
@@ -154,6 +155,15 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         buf: &mut [u8],
     ) -> Result<usize, &'static str> {
         storage::read_file_chunk(self.sd, name, offset, buf)
+    }
+
+    // open file once, return (file_size, bytes_read) from offset 0
+    pub fn read_file_start(
+        &self,
+        name: &str,
+        buf: &mut [u8],
+    ) -> Result<(u32, usize), &'static str> {
+        storage::read_file_start(self.sd, name, buf)
     }
 
     pub fn file_size(&self, name: &str) -> Result<u32, &'static str> {

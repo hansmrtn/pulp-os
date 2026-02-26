@@ -95,7 +95,7 @@ fn main() -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
-    esp_alloc::heap_allocator!(size: 66320);
+    esp_alloc::heap_allocator!(size: 256720);
 
     info!("booting...");
 
@@ -308,7 +308,7 @@ fn main() -> ! {
 }
 
 fn update_statusbar(bar: &mut StatusBar, input: &mut InputDriver, sd_ok: bool) {
-    const HEAP_TOTAL: usize = 66320;
+    const HEAP_TOTAL: usize = 256720;
     let stats = esp_alloc::HEAP.stats();
 
     let adc_mv = input.read_battery_mv();
