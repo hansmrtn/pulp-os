@@ -48,19 +48,68 @@ impl BitmapFont {
         self.glyph(ch).advance
     }
 
+    /// Sum of advance widths for every character in `text`.
+    #[inline]
+    pub fn measure_str(&self, text: &str) -> u16 {
+        text.chars().map(|c| self.advance(c) as u16).sum()
+    }
+
+    /// Sum of advance widths for every byte in `text` (treats out-of-range
+    /// bytes as `?`).
+    #[inline]
+    pub fn measure_bytes(&self, text: &[u8]) -> u16 {
+        text.iter()
+            .map(|&b| {
+                let ch = if b >= 0x20 && b <= 0x7E {
+                    b as char
+                } else {
+                    '?'
+                };
+                self.advance(ch) as u16
+            })
+            .sum()
+    }
+
+    /// Draw a single glyph in `BinaryColor::On` (black).  Returns the advance width.
     #[inline]
     pub fn draw_char(&self, strip: &mut StripBuffer, ch: char, cx: i32, baseline: i32) -> u8 {
+        self.draw_char_fg(strip, ch, BinaryColor::On, cx, baseline)
+    }
+
+    /// Draw a single glyph in the given foreground colour.  Returns the advance width.
+    #[inline]
+    pub fn draw_char_fg(
+        &self,
+        strip: &mut StripBuffer,
+        ch: char,
+        fg: BinaryColor,
+        cx: i32,
+        baseline: i32,
+    ) -> u8 {
         let g = self.glyph(ch);
         if g.width > 0 && g.height > 0 {
-            blit_glyph(strip, self.bitmaps, g, cx, baseline);
+            blit_glyph(strip, self.bitmaps, g, fg, cx, baseline);
         }
         g.advance
     }
 
+    /// Draw `text` in `BinaryColor::On` (black).  Returns the x position after the last glyph.
     pub fn draw_str(&self, strip: &mut StripBuffer, text: &str, cx: i32, baseline: i32) -> i32 {
+        self.draw_str_fg(strip, text, BinaryColor::On, cx, baseline)
+    }
+
+    /// Draw `text` in the given foreground colour.  Returns the x position after the last glyph.
+    pub fn draw_str_fg(
+        &self,
+        strip: &mut StripBuffer,
+        text: &str,
+        fg: BinaryColor,
+        cx: i32,
+        baseline: i32,
+    ) -> i32 {
         let mut x = cx;
         for ch in text.chars() {
-            x += self.draw_char(strip, ch, x, baseline) as i32;
+            x += self.draw_char_fg(strip, ch, fg, x, baseline) as i32;
         }
         x
     }
@@ -79,7 +128,14 @@ impl BitmapFont {
     }
 }
 
-fn blit_glyph(strip: &mut StripBuffer, bitmaps: &[u8], g: &BitmapGlyph, cx: i32, baseline: i32) {
+fn blit_glyph(
+    strip: &mut StripBuffer,
+    bitmaps: &[u8],
+    g: &BitmapGlyph,
+    fg: BinaryColor,
+    cx: i32,
+    baseline: i32,
+) {
     let gx = cx + g.offset_x as i32;
     let gy = baseline + g.offset_y as i32;
     let w = g.width as usize;
@@ -95,10 +151,7 @@ fn blit_glyph(strip: &mut StripBuffer, bitmaps: &[u8], g: &BitmapGlyph, cx: i32,
         let row = base + y * stride;
         (0..w).filter_map(move |x| {
             if bitmaps[row + x / 8] & (1 << (7 - x % 8)) != 0 {
-                Some(Pixel(
-                    Point::new(gx + x as i32, gy + y as i32),
-                    BinaryColor::On,
-                ))
+                Some(Pixel(Point::new(gx + x as i32, gy + y as i32), fg))
             } else {
                 None
             }

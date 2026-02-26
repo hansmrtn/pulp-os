@@ -4,16 +4,20 @@
 // Scrolling across a page boundary sets needs_load; the kernel runs
 // AppWork which reads from DirCache and owns the render decision.
 
-use embedded_graphics::Drawable;
-use embedded_graphics::mono_font::ascii::{FONT_6X13, FONT_10X20};
-use embedded_graphics::prelude::Primitive;
+use core::fmt::Write as _;
+
+use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::PrimitiveStyle;
 
 use crate::apps::{App, AppContext, AppId, Services, Transition};
 use crate::board::button::Button as HwButton;
 use crate::drivers::input::Event;
 use crate::drivers::storage::DirEntry;
 use crate::drivers::strip::StripBuffer;
-use crate::ui::{Alignment, Button as UiButton, CONTENT_TOP, DynamicLabel, Label, Region, Widget};
+use crate::fonts::bitmap::BitmapFont;
+use crate::fonts::font_data;
+use crate::ui::{Alignment, BitmapButton, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 const PAGE_SIZE: usize = 7;
 
@@ -29,6 +33,18 @@ fn row_region(index: usize) -> Region {
     Region::new(16, LIST_Y + index as u16 * ROW_H, 448, ROW_H - 4)
 }
 
+// ── Font helpers ──────────────────────────────────────────────────────────────
+
+fn body_font(idx: u8) -> &'static BitmapFont {
+    match idx {
+        1 => &font_data::REGULAR_BODY_MEDIUM,
+        2 => &font_data::REGULAR_BODY_LARGE,
+        _ => &font_data::REGULAR_BODY_SMALL,
+    }
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
 pub struct FilesApp {
     entries: [DirEntry; PAGE_SIZE],
     count: usize,
@@ -38,10 +54,12 @@ pub struct FilesApp {
     needs_load: bool,
     stale_cache: bool,
     error: Option<&'static str>,
+    body_font: &'static BitmapFont,
+    heading_font: &'static BitmapFont,
 }
 
 impl FilesApp {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             entries: [DirEntry::EMPTY; PAGE_SIZE],
             count: 0,
@@ -51,7 +69,15 @@ impl FilesApp {
             needs_load: false,
             stale_cache: false,
             error: None,
+            body_font: body_font(0),
+            heading_font: &font_data::REGULAR_HEADING,
         }
+    }
+
+    /// Called by main.rs whenever ui_font_size_idx changes.
+    /// The heading font is always the fixed 24 px cut; only body text scales.
+    pub fn set_ui_font_size(&mut self, idx: u8) {
+        self.body_font = body_font(idx);
     }
 
     pub fn selected_entry(&self) -> Option<&DirEntry> {
@@ -195,21 +221,20 @@ impl App for FilesApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        Label::new(HEADER_REGION, "Files", &FONT_10X20)
+        BitmapLabel::new(HEADER_REGION, "Files", self.heading_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
 
         if self.total > 0 {
-            let mut status = DynamicLabel::<20>::new(STATUS_REGION, &FONT_6X13)
+            let mut status = BitmapDynLabel::<20>::new(STATUS_REGION, self.body_font)
                 .alignment(Alignment::CenterRight);
-            use core::fmt::Write;
             let _ = write!(status, "{}/{}", self.scroll + self.selected + 1, self.total);
             status.draw(strip).unwrap();
         }
 
         if let Some(msg) = self.error {
-            Label::new(row_region(0), msg, &FONT_10X20)
+            BitmapLabel::new(row_region(0), msg, self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
@@ -217,7 +242,7 @@ impl App for FilesApp {
         }
 
         if self.count == 0 && !self.needs_load {
-            Label::new(row_region(0), "No files found", &FONT_10X20)
+            BitmapLabel::new(row_region(0), "No files found", self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
@@ -231,17 +256,16 @@ impl App for FilesApp {
                 let entry = &self.entries[i];
                 let name = entry.name_str();
 
-                let mut btn = UiButton::new(region, name, &FONT_10X20);
+                let mut btn = BitmapButton::new(region, name, self.body_font);
                 if i == self.selected {
                     btn.set_pressed(true);
                 }
                 btn.draw(strip).unwrap();
             } else {
+                // Clear phantom rows below the list end.
                 region
                     .to_rect()
-                    .into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(
-                        embedded_graphics::pixelcolor::BinaryColor::Off,
-                    ))
+                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
                     .draw(strip)
                     .unwrap();
             }

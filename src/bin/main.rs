@@ -207,16 +207,21 @@ fn main() -> ! {
                         // block runs for both fresh enter and resume so that
                         // a setting changed while an app was suspended in the
                         // stack takes effect immediately on return.
-                        if nav.to == AppId::Reader {
+                        {
                             let s = settings.system_settings();
-                            reader.set_book_font_size(s.book_font_size_idx);
+                            let ui_idx = s.ui_font_size_idx;
+                            let book_idx = s.book_font_size_idx;
+
+                            // Book font — reader only.
+                            if nav.to == AppId::Reader {
+                                reader.set_book_font_size(book_idx);
+                            }
+
+                            // UI font — all shell apps.
+                            home.set_ui_font_size(ui_idx);
+                            files.set_ui_font_size(ui_idx);
+                            settings.set_ui_font_size(ui_idx);
                         }
-                        // ui_font_size_idx: stored and saved, but HomeApp /
-                        // FilesApp / SettingsApp currently use hard-coded
-                        // embedded-graphics mono fonts and have no
-                        // set_ui_font_size() receiver yet.  Wire it here once
-                        // those apps are ported to the bitmap font pipeline.
-                        // let ui_idx = settings.system_settings().ui_font_size_idx;
 
                         if nav.resume {
                             with_app!(nav.to, home, files, reader, settings, |app| {

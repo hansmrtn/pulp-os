@@ -24,11 +24,11 @@
 //
 //   ui_font_size_idx   — shell / settings UI font size selector.
 //                        Same index scale as book_font_size_idx.
-//                        NOT YET WIRED: HomeApp / FilesApp / SettingsApp
-//                        currently use hard-coded embedded-graphics mono
-//                        fonts.  Port those apps to the bitmap font pipeline
-//                        and add a set_ui_font_size() receiver, then
-//                        uncomment the propagation line in main.rs.
+//                        Fully wired: HomeApp / FilesApp / SettingsApp all
+//                        store a body_font pointer updated via
+//                        set_ui_font_size().  main.rs propagates the index
+//                        to all three apps on every nav transition, before
+//                        the lifecycle callback fires.
 //
 //   button_map         — selects a key-layout profile.
 //                        0 = Default, 1 = Swapped (L/R swapped for left hand).
@@ -42,13 +42,13 @@
 
 use core::fmt::Write as _;
 
-use embedded_graphics::mono_font::ascii::{FONT_8X13, FONT_10X20};
-
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::button::Button as HwButton;
 use crate::drivers::input::Event;
 use crate::drivers::strip::StripBuffer;
-use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region, Widget};
+use crate::fonts::bitmap::BitmapFont;
+use crate::fonts::font_data;
+use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 //
@@ -159,17 +159,31 @@ pub struct SettingsApp {
     edit_mode: bool,
     loaded: bool,
     save_needed: bool,
+    body_font: &'static BitmapFont,
+    heading_font: &'static BitmapFont,
 }
 
 impl SettingsApp {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             settings: SystemSettings::defaults(),
             selected: 0,
             edit_mode: false,
             loaded: false,
             save_needed: false,
+            body_font: &font_data::REGULAR_BODY_SMALL,
+            heading_font: &font_data::REGULAR_HEADING,
         }
+    }
+
+    /// Called by main.rs whenever ui_font_size_idx changes.
+    /// The heading font is always the fixed 24 px cut; only body text scales.
+    pub fn set_ui_font_size(&mut self, idx: u8) {
+        self.body_font = match idx {
+            1 => &font_data::REGULAR_BODY_MEDIUM,
+            2 => &font_data::REGULAR_BODY_LARGE,
+            _ => &font_data::REGULAR_BODY_SMALL,
+        };
     }
 
     pub fn system_settings(&self) -> &SystemSettings {
@@ -225,7 +239,7 @@ impl SettingsApp {
         }
     }
 
-    fn format_value<const N: usize>(&self, i: usize, buf: &mut DynamicLabel<N>) {
+    fn format_value<const N: usize>(&self, i: usize, buf: &mut BitmapDynLabel<N>) {
         buf.clear_text();
         match i {
             0 => {
@@ -454,34 +468,34 @@ impl App for SettingsApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        Label::new(TITLE_REGION, "Settings", &FONT_10X20)
+        BitmapLabel::new(TITLE_REGION, "Settings", self.heading_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
 
         if !self.loaded {
             let r = Region::new(LABEL_X, ITEMS_TOP, 200, ROW_H);
-            Label::new(r, "Loading...", &FONT_8X13)
+            BitmapLabel::new(r, "Loading...", self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
             return;
         }
 
-        let mut val_buf = DynamicLabel::<20>::new(Region::new(0, 0, 1, 1), &FONT_8X13);
+        let mut val_buf = BitmapDynLabel::<20>::new(Region::new(0, 0, 1, 1), self.body_font);
 
         for i in 0..NUM_ITEMS {
             let selected = i == self.selected;
             let editing = selected && self.edit_mode;
 
-            Label::new(Self::label_region(i), Self::item_label(i), &FONT_8X13)
+            BitmapLabel::new(Self::label_region(i), Self::item_label(i), self.body_font)
                 .alignment(Alignment::CenterLeft)
                 .inverted(selected)
                 .draw(strip)
                 .unwrap();
 
             self.format_value(i, &mut val_buf);
-            Label::new(Self::value_region(i), val_buf.text(), &FONT_8X13)
+            BitmapLabel::new(Self::value_region(i), val_buf.text(), self.body_font)
                 .alignment(Alignment::Center)
                 .inverted(editing)
                 .draw(strip)
@@ -493,7 +507,7 @@ impl App for SettingsApp {
         } else {
             "L / R: select    Confirm: edit    Back: exit"
         };
-        Label::new(HELP_REGION, help, &FONT_8X13)
+        BitmapLabel::new(HELP_REGION, help, self.body_font)
             .alignment(Alignment::Center)
             .draw(strip)
             .unwrap();

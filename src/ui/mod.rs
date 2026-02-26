@@ -1,11 +1,15 @@
 // Widget toolkit for 1-bit e-paper displays
 // Region based layout, dirty tracking, strip-buffered rendering.
 
+mod bitmap_button;
+mod bitmap_label;
 mod button;
 mod label;
 pub mod statusbar;
 mod widget;
 
+pub use bitmap_button::{BitmapButton, BitmapButtonStyle};
+pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
 pub use button::{Button, ButtonStyle};
 pub use label::{DynamicLabel, Label};
 pub use statusbar::{BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes};

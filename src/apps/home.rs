@@ -1,14 +1,14 @@
 // Launcher screen, entry point after boot
 
-use embedded_graphics::mono_font::ascii::FONT_10X20;
-
 use crate::apps::{App, AppContext, AppId, Transition};
 use crate::board::button::Button as HwButton;
 use crate::drivers::input::Event;
 use crate::drivers::strip::StripBuffer;
-use crate::ui::{Alignment, CONTENT_TOP, Label, Region, Widget};
+use crate::fonts::bitmap::BitmapFont;
+use crate::fonts::font_data;
+use crate::ui::{Alignment, BitmapButton, BitmapLabel, CONTENT_TOP, Region};
 
-const TITLE_REGION: Region = Region::new(16, CONTENT_TOP, 200, 32);
+const TITLE_REGION: Region = Region::new(16, CONTENT_TOP, 448, 32);
 
 const ITEM_Y: u16 = CONTENT_TOP + 48;
 const ITEM_H: u16 = 48;
@@ -39,13 +39,34 @@ const ITEMS: &[MenuItem] = &[
     },
 ];
 
+// Select a body BitmapFont by size index (0 = Small, 1 = Medium, 2 = Large).
+fn body_font(idx: u8) -> &'static BitmapFont {
+    match idx {
+        1 => &font_data::REGULAR_BODY_MEDIUM,
+        2 => &font_data::REGULAR_BODY_LARGE,
+        _ => &font_data::REGULAR_BODY_SMALL,
+    }
+}
+
 pub struct HomeApp {
     selected: usize,
+    body_font: &'static BitmapFont,
+    heading_font: &'static BitmapFont,
 }
 
 impl HomeApp {
-    pub const fn new() -> Self {
-        Self { selected: 0 }
+    pub fn new() -> Self {
+        Self {
+            selected: 0,
+            body_font: body_font(0),
+            heading_font: &font_data::REGULAR_HEADING,
+        }
+    }
+
+    /// Called by main.rs whenever ui_font_size_idx changes.
+    /// The heading font is always the fixed 24 px cut; only body text scales.
+    pub fn set_ui_font_size(&mut self, idx: u8) {
+        self.body_font = body_font(idx);
     }
 
     fn item_count(&self) -> usize {
@@ -85,12 +106,13 @@ impl App for HomeApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        let title =
-            Label::new(TITLE_REGION, "pulp-os", &FONT_10X20).alignment(Alignment::CenterLeft);
-        title.draw(strip).unwrap();
+        BitmapLabel::new(TITLE_REGION, "pulp-os", self.heading_font)
+            .alignment(Alignment::CenterLeft)
+            .draw(strip)
+            .unwrap();
 
         for (i, item) in ITEMS.iter().enumerate() {
-            let mut btn = crate::ui::Button::new(item.region, item.name, &FONT_10X20);
+            let mut btn = BitmapButton::new(item.region, item.name, self.body_font);
             if i == self.selected {
                 btn.set_pressed(true);
             }
