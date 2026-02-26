@@ -1,12 +1,13 @@
-//! Widgets are self-contained UI elements that know their bounds and can
-//! draw themselves. They work in logical coordinates (rotation-aware).
+// Region geometry, alignment, and base widget trait
+// All coordinates are logical (rotation aware). x/w should be 8 aligned
+// for partial refresh to avoid byte boundary fixups on the controller.
+
 use embedded_graphics::{
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
 };
 
-/// A rectangular region in logical coordinates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Region {
     pub x: u16,
@@ -16,12 +17,10 @@ pub struct Region {
 }
 
 impl Region {
-    /// Create a new region. X and W should be 8-pixel aligned for best performance.
     pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
         Self { x, y, w, h }
     }
 
-    /// Create from embedded-graphics Rectangle
     pub fn from_rect(rect: Rectangle) -> Self {
         Self {
             x: rect.top_left.x.max(0) as u16,
@@ -31,7 +30,6 @@ impl Region {
         }
     }
 
-    /// Convert to embedded-graphics Rectangle
     pub fn to_rect(self) -> Rectangle {
         Rectangle::new(
             Point::new(self.x as i32, self.y as i32),
@@ -47,22 +45,17 @@ impl Region {
         Point::new((self.x + self.w / 2) as i32, (self.y + self.h / 2) as i32)
     }
 
-    /// Align X to 8-pixel boundary (required for partial refresh)
     pub fn align8(self) -> Self {
         let aligned_x = (self.x / 8) * 8;
         let extra = self.x - aligned_x;
         Self {
             x: aligned_x,
             y: self.y,
-            w: ((self.w + extra + 7) / 8) * 8, // Round up width to compensate
+            w: ((self.w + extra + 7) / 8) * 8,
             h: self.h,
         }
     }
 
-    /// Bounding box union of two regions.
-    /// The result is the smallest region that contains both inputs.
-    /// May over-cover the gap between disjoint regions, but never
-    /// under-covers either one.
     pub fn union(self, other: Region) -> Self {
         let x1 = self.x.min(other.x);
         let y1 = self.y.min(other.y);
@@ -102,7 +95,6 @@ impl Region {
     }
 }
 
-/// Text/content alignment within a widget
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Alignment {
     #[default]
@@ -118,7 +110,6 @@ pub enum Alignment {
 }
 
 impl Alignment {
-    /// Calculate position for content of given size within a region
     pub fn position(self, region: Region, content_size: Size) -> Point {
         let cw = content_size.width as i32;
         let ch = content_size.height as i32;
@@ -141,47 +132,28 @@ impl Alignment {
     }
 }
 
-/// Widget state for tracking if redraw is needed
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum WidgetState {
-    /// Widget needs to be redrawn
     #[default]
     Dirty,
-    /// Widget is up to date
     Clean,
 }
 
-/// Core widget trait for UI elements
-///
-/// Widgets are self-contained UI components that:
-/// - Know their bounds (region)
-/// - Can draw themselves to any DrawTarget
-/// - Track dirty state for efficient updates
 pub trait Widget {
-    /// Get the widget's bounding region (in logical coordinates)
     fn bounds(&self) -> Region;
 
-    /// Draw the widget to a display
     fn draw<D>(&self, display: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = BinaryColor>;
 
-    /// Check if widget needs redraw
     fn is_dirty(&self) -> bool {
-        true // Default: always redraw
+        true
     }
 
-    /// Mark widget as clean (called after draw)
-    fn mark_clean(&mut self) {
-        // Default: no-op
-    }
+    fn mark_clean(&mut self) {}
 
-    /// Mark widget as needing redraw
-    fn mark_dirty(&mut self) {
-        // Default: no-op
-    }
+    fn mark_dirty(&mut self) {}
 
-    /// Clear the widget's region to background color
     fn clear<D>(&self, display: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = BinaryColor>,
@@ -192,7 +164,6 @@ pub trait Widget {
             .draw(display)
     }
 
-    /// Get the 8-pixel aligned bounds for partial refresh
     fn refresh_bounds(&self) -> Region {
         self.bounds().align8()
     }

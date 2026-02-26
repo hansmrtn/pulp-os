@@ -1,3 +1,7 @@
+// Static and dynamic text labels for e-paper
+// Label borrows its text; DynamicLabel<N> owns a fixed buffer
+// and implements core::fmt::Write for formatted output.
+
 use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle},
     pixelcolor::BinaryColor,
@@ -8,8 +12,6 @@ use embedded_graphics::{
 
 use super::widget::{Alignment, Region, Widget, WidgetState};
 
-/// A text label widget
-/// Automatically handles background clearing on redraw.
 pub struct Label<'a> {
     region: Region,
     text: &'a str,
@@ -55,7 +57,6 @@ impl<'a> Label<'a> {
         }
     }
 
-    /// Calculate text size based on font metrics
     fn text_size(&self) -> Size {
         let char_width = self.font.character_size.width + self.font.character_spacing;
         let width = self.text.len() as u32 * char_width;
@@ -79,20 +80,16 @@ impl<'a> Widget for Label<'a> {
             (BinaryColor::Off, BinaryColor::On)
         };
 
-        // Clear background
         self.region
             .to_rect()
             .into_styled(PrimitiveStyle::with_fill(bg))
             .draw(display)?;
 
-        // Calculate text position
         let text_size = self.text_size();
         let mut pos = self.alignment.position(self.region, text_size);
 
-        // Adjust for text baseline (embedded-graphics draws from baseline)
         pos.y += self.font.character_size.height as i32;
 
-        // Draw text
         let style = MonoTextStyle::new(self.font, fg);
         Text::new(self.text, pos, style).draw(display)?;
 
@@ -112,7 +109,6 @@ impl<'a> Widget for Label<'a> {
     }
 }
 
-/// A label that owns its text (for dynamic content)
 pub struct DynamicLabel<const N: usize> {
     region: Region,
     buffer: [u8; N],
@@ -154,7 +150,6 @@ impl<const N: usize> DynamicLabel<N> {
         self.state = WidgetState::Dirty;
     }
 
-    /// Clear the text buffer
     pub fn clear_text(&mut self) {
         self.len = 0;
         self.state = WidgetState::Dirty;
@@ -194,18 +189,15 @@ impl<const N: usize> Widget for DynamicLabel<N> {
             (BinaryColor::Off, BinaryColor::On)
         };
 
-        // Clear background
         self.region
             .to_rect()
             .into_styled(PrimitiveStyle::with_fill(bg))
             .draw(display)?;
 
-        // Calculate text position
         let text_size = self.text_size();
         let mut pos = self.alignment.position(self.region, text_size);
         pos.y += self.font.character_size.height as i32;
 
-        // Draw text
         let style = MonoTextStyle::new(self.font, fg);
         Text::new(self.text(), pos, style).draw(display)?;
 
@@ -225,13 +217,6 @@ impl<const N: usize> Widget for DynamicLabel<N> {
     }
 }
 
-/// Write formatted text to a DynamicLabel
-///
-/// Usage:
-/// ```ignore
-/// use core::fmt::Write;
-/// write!(label, "Count: {}", 42).ok();
-/// ```
 impl<const N: usize> core::fmt::Write for DynamicLabel<N> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();

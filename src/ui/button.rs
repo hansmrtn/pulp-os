@@ -1,4 +1,5 @@
-//! Button widget for interactive UI elements
+// Interactive button widget with outline, fill, and rounded styles
+// Inverts colors when pressed.
 
 use embedded_graphics::{
     mono_font::MonoFont,
@@ -11,19 +12,14 @@ use embedded_graphics::{
 
 use super::widget::{Alignment, Region, Widget, WidgetState};
 
-/// Button visual style
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum ButtonStyle {
-    /// Simple rectangle outline
     #[default]
     Outlined,
-    /// Filled rectangle
     Filled,
-    /// Rounded corners (specify radius)
     Rounded(u32),
 }
 
-/// A clickable button widget
 pub struct Button<'a> {
     region: Region,
     label: &'a str,
@@ -66,7 +62,6 @@ impl<'a> Button<'a> {
         self.state = WidgetState::Dirty;
     }
 
-    /// Check if a point is within this button's bounds
     pub fn contains(&self, point: Point) -> bool {
         self.region.contains(point)
     }
@@ -88,7 +83,6 @@ impl<'a> Widget for Button<'a> {
     where
         D: DrawTarget<Color = BinaryColor>,
     {
-        // When pressed, invert colors
         let (bg, fg) = if self.pressed {
             (BinaryColor::On, BinaryColor::Off)
         } else {
@@ -97,13 +91,10 @@ impl<'a> Widget for Button<'a> {
 
         let rect = self.region.to_rect();
 
-        // Draw button background/border based on style
         match self.style {
             ButtonStyle::Outlined => {
-                // Clear background
                 rect.into_styled(PrimitiveStyle::with_fill(bg))
                     .draw(display)?;
-                // Draw border
                 rect.into_styled(PrimitiveStyle::with_stroke(fg, 2))
                     .draw(display)?;
             }
@@ -114,29 +105,24 @@ impl<'a> Widget for Button<'a> {
             ButtonStyle::Rounded(radius) => {
                 let rounded =
                     RoundedRectangle::new(rect, CornerRadii::new(Size::new(radius, radius)));
-                // Clear background
                 rounded
                     .into_styled(PrimitiveStyle::with_fill(bg))
                     .draw(display)?;
-                // Draw border
                 rounded
                     .into_styled(PrimitiveStyle::with_stroke(fg, 2))
                     .draw(display)?;
             }
         }
 
-        // Calculate centered text position
         let text_size = self.text_size();
         let mut pos = Alignment::Center.position(self.region, text_size);
         pos.y += self.font.character_size.height as i32;
 
-        // For filled style, text color is inverted
         let text_color = match self.style {
             ButtonStyle::Filled => bg,
             _ => fg,
         };
 
-        // Draw label
         let style = MonoTextStyle::new(self.font, text_color);
         Text::new(self.label, pos, style).draw(display)?;
 

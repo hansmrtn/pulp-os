@@ -1,12 +1,11 @@
-// Input event driver for xteink x4
+// Debounced input from ADC ladders and power button
 //
-// The X4 has three physical input sources that all funnel into a
-// single "one button at a time" deal:
-// - Row 1 ADC (GPIO1): Right, Left, Confirm, Back via resistance ladder
-// - Row 2 ADC (GPIO2): Volume Up/Down via resistance ladder
-// - Power button (GPIO3): Interrupt-driven, read via board::power_button_is_low()
-// NOTE: Because each resistance ladder can only report one press at a time,
-// we collapse everything into `Option<Button>` per poll cycle.
+// Three sources, one button at a time (hardware limitation of ladders):
+//   Row1 ADC (GPIO1): Right, Left, Confirm, Back
+//   Row2 ADC (GPIO2): VolUp, VolDown
+//   Power    (GPIO3): interrupt driven, read via board::power_button_is_low()
+//
+// 30ms debounce, 1s long press, 150ms repeat.
 
 use esp_hal::time::{Duration, Instant};
 
@@ -25,7 +24,6 @@ pub enum Event {
     Repeat(Button),
 }
 
-// Small fixed-size event queue for buffering multiple events per poll.
 struct EventQueue {
     buf: [Option<Event>; 2],
     read: u8,
@@ -46,7 +44,6 @@ impl EventQueue {
                 return;
             }
         }
-        // If both slots are full, something is wrong with our logic.
     }
 
     fn pop(&mut self) -> Option<Event> {
@@ -57,7 +54,6 @@ impl EventQueue {
                 return Some(ev);
             }
         }
-        // Reset for next cycle
         self.read = 0;
         None
     }
@@ -67,7 +63,6 @@ impl EventQueue {
     }
 }
 
-// debounce, long-press, and repeat support.
 pub struct InputDriver {
     hw: InputHw,
     stable: Option<Button>,
@@ -94,9 +89,7 @@ impl InputDriver {
         }
     }
 
-    // poll for the next input event.
     pub fn poll(&mut self) -> Option<Event> {
-        // drain any buffd events first
         if !self.queue.is_empty() {
             return self.queue.pop();
         }
@@ -115,7 +108,6 @@ impl InputDriver {
             self.stable
         };
 
-        // normal press
         if debounced != self.stable {
             if let Some(old) = self.stable {
                 self.queue.push(Event::Release(old));
@@ -130,7 +122,6 @@ impl InputDriver {
             return self.queue.pop();
         }
 
-        // long press and repeat
         if let Some(btn) = self.stable {
             let held = now - self.press_since;
 
@@ -140,7 +131,6 @@ impl InputDriver {
                 return Some(Event::LongPress(btn));
             }
 
-            // Fire repeat events at interval
             if self.long_press_fired && (now - self.last_repeat) >= Duration::from_millis(REPEAT_MS)
             {
                 self.last_repeat = now;
@@ -151,31 +141,21 @@ impl InputDriver {
         None
     }
 
-    /// Read raw button state from hardware (before debouncing).
     fn read_raw(&mut self) -> Option<Button> {
-        // Power button: interrupt-driven, read level from shared static.
-        // The GPIO interrupt already woke us via signal_button();
-        // here we just need the current pin state for debounce.
         if crate::board::power_button_is_low() {
             return Some(Button::Power);
         }
 
-        // read adc channels & decode
         let mv1: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row1)).unwrap();
         let mv2: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row2)).unwrap();
 
         decode_ladder(mv1, ROW1_THRESHOLDS).or_else(|| decode_ladder(mv2, ROW2_THRESHOLDS))
     }
 
-    /// Read battery voltage in millivolts (ADC-calibrated, before divider correction).
-    /// The X4 has a voltage divider on GPIO0 — multiply by 2 for actual battery mV.
     pub fn read_battery_mv(&mut self) -> u16 {
         nb::block!(self.hw.adc.read_oneshot(&mut self.hw.battery)).unwrap()
     }
 
-    /// True when raw button activity was detected but debounce hasn't
-    /// confirmed it yet. Used by the idle timer to snap back to fast
-    /// polling so the confirmation arrives in ~10ms, not ~100ms.
     pub fn is_debouncing(&self) -> bool {
         self.candidate.is_some() && self.candidate != self.stable
     }

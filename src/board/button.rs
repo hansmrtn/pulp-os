@@ -1,21 +1,19 @@
-//! Button definitions and ADC decoding for XTEink X4
-//!
-//! The X4 uses resistance ladder circuits for most buttons.
-//! Each ladder is read via ADC and decoded by comparing the
-//! millivolt reading against known thresholds.
+// Button definitions and ADC resistance ladder decoding
+//
+// The X4 has two ADC ladders (Row1 on GPIO1, Row2 on GPIO2) and one
+// discrete power button on GPIO3. Each ladder encodes multiple buttons
+// as distinct voltage levels via a resistor network.
+//
+// Threshold table format: (center_mv, tolerance_mv, Button)
 
-/// All physical buttons on the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
-    // Navigation cluster (Row 1 - GPIO1)
     Right,
     Left,
     Confirm,
     Back,
-    // Volume buttons (Row 2 - GPIO2)
     VolUp,
     VolDown,
-    // Discrete digital button
     Power,
 }
 
@@ -39,20 +37,17 @@ impl core::fmt::Display for Button {
     }
 }
 
-// ADC Threshold Tables
-// Each entry: (center_mv, tolerance_mv, button)
-// A reading matches if: center - tolerance <= reading <= center + tolerance
 pub const DEFAULT_TOLERANCE: u16 = 150;
 
 pub const ROW1_THRESHOLDS: &[(u16, u16, Button)] = &[
-    (3, 50, Button::Right), // Near ground
+    (3, 50, Button::Right),
     (1113, DEFAULT_TOLERANCE, Button::Left),
     (1984, DEFAULT_TOLERANCE, Button::Back),
     (2556, DEFAULT_TOLERANCE, Button::Confirm),
 ];
 
 pub const ROW2_THRESHOLDS: &[(u16, u16, Button)] = &[
-    (3, 50, Button::VolDown), // Near ground
+    (3, 50, Button::VolDown),
     (1659, DEFAULT_TOLERANCE, Button::VolUp),
 ];
 

@@ -1,33 +1,21 @@
-// Priority-based job scheduler for cooperative multitasking.
+// Priority job scheduler, cooperative
 //
-// Jobs are signals, not data carriers. State lives in the app/driver
-// that handles the job. The scheduler only decides execution order.
+// Jobs are signals, not data carriers. State lives in the subsystem
+// that handles the job. Three priority tiers, FIFO within each.
+// Fixed size ring buffers, no allocation.
 //
-// No dynamic allocation — fixed-size ring buffer queues per priority tier.
+// High:   PollInput, Render
+// Normal: AppWork, UpdateStatusBar
+// Low:    (reserved)
+
 use core::fmt;
 
-/// Schedulable units of work.
-///
-/// Jobs carry no payload. The handler reads state from wherever it
-/// lives (app struct, driver, context) when the job executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
-    // ── High priority: interactive, latency-sensitive ──────────
-    /// Poll the input driver for debounced button events.
     PollInput,
-    /// Flush pending redraw (full or partial) to the display.
     Render,
-
-    // ── Normal priority: responsive but deferrable ─────────────
-    /// Run the active app's `on_work()` with OS services.
-    /// Generic — the kernel doesn't know what the app will do.
-    /// Replaces per-app job variants (no new jobs when adding apps).
     AppWork,
-    /// Sample battery ADC and refresh the status bar text.
     UpdateStatusBar,
-
-    // ── Low priority: speculative / background ─────────────────
-    // (Reserved for future work: prefetch, layout, cache)
 }
 
 impl fmt::Display for Job {
@@ -41,7 +29,6 @@ impl fmt::Display for Job {
     }
 }
 
-/// Job priority levels (lower numeric value = higher priority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     High = 0,
@@ -60,7 +47,6 @@ impl Job {
 
 #[derive(Debug, Clone, Copy)]
 pub enum PushError {
-    /// Queue for this priority level is full; contains the rejected job.
     Full(Job),
 }
 
@@ -72,12 +58,10 @@ impl fmt::Display for PushError {
     }
 }
 
-// ── Ring buffer ────────────────────────────────────────────────
-
 struct JobQueue<const N: usize> {
     buf: [Option<Job>; N],
-    head: usize, // next to read
-    tail: usize, // next to write
+    head: usize,
+    tail: usize,
     len: usize,
 }
 
@@ -132,13 +116,6 @@ impl<const N: usize> JobQueue<N> {
     }
 }
 
-// ── Scheduler ──────────────────────────────────────────────────
-
-/// Priority-based job scheduler.
-///
-/// `pop()` always returns the highest-priority pending job (FIFO
-/// within each tier). Jobs can enqueue follow-on work during
-/// execution — the drain loop picks it up immediately.
 pub struct Scheduler {
     high: JobQueue<4>,
     normal: JobQueue<8>,
@@ -154,7 +131,6 @@ impl Scheduler {
         }
     }
 
-    /// Push a job; returns error if the priority queue is full.
     pub fn push(&mut self, job: Job) -> Result<(), PushError> {
         let result = match job.priority() {
             Priority::High => self.high.push(job),
@@ -164,8 +140,6 @@ impl Scheduler {
         result.map_err(PushError::Full)
     }
 
-    /// Schedule a job only if it's not already queued (dedup).
-    /// Primary method for enqueuing — prevents duplicate work.
     pub fn push_unique(&mut self, job: Job) -> Result<(), PushError> {
         match job.priority() {
             Priority::High => {
@@ -189,7 +163,6 @@ impl Scheduler {
         }
     }
 
-    /// Pop the highest-priority pending job.
     pub fn pop(&mut self) -> Option<Job> {
         self.high
             .pop()

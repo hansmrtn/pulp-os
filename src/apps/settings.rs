@@ -1,4 +1,4 @@
-//! Settings app (stub).
+// System settings (stub)
 
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 

@@ -1,11 +1,11 @@
-//! Home screen — the app launcher.
+// Launcher screen, entry point after boot
 
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 
 use crate::apps::{App, AppContext, AppId, Transition};
+use crate::board::button::Button as HwButton;
 use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
-use crate::board::button::Button as HwButton;
 use crate::ui::{Alignment, CONTENT_TOP, Label, Region, Widget};
 
 const TITLE_REGION: Region = Region::new(16, CONTENT_TOP, 200, 32);
@@ -22,9 +22,21 @@ struct MenuItem {
 }
 
 const ITEMS: &[MenuItem] = &[
-    MenuItem { region: Region::new(16, ITEM_Y, 200, ITEM_H), name: "Files", app: AppId::Files },
-    MenuItem { region: Region::new(16, ITEM_Y + ITEM_STRIDE, 200, ITEM_H), name: "Reader", app: AppId::Reader },
-    MenuItem { region: Region::new(16, ITEM_Y + ITEM_STRIDE * 2, 200, ITEM_H), name: "Settings", app: AppId::Settings },
+    MenuItem {
+        region: Region::new(16, ITEM_Y, 200, ITEM_H),
+        name: "Files",
+        app: AppId::Files,
+    },
+    MenuItem {
+        region: Region::new(16, ITEM_Y + ITEM_STRIDE, 200, ITEM_H),
+        name: "Reader",
+        app: AppId::Reader,
+    },
+    MenuItem {
+        region: Region::new(16, ITEM_Y + ITEM_STRIDE * 2, 200, ITEM_H),
+        name: "Settings",
+        app: AppId::Settings,
+    },
 ];
 
 pub struct HomeApp {
@@ -33,9 +45,7 @@ pub struct HomeApp {
 
 impl HomeApp {
     pub const fn new() -> Self {
-        Self {
-            selected: 0,
-        }
+        Self { selected: 0 }
     }
 
     fn item_count(&self) -> usize {
@@ -69,16 +79,14 @@ impl App for HomeApp {
                 self.move_selection(-1, ctx);
                 Transition::None
             }
-            Event::Press(HwButton::Confirm) => {
-                Transition::Push(ITEMS[self.selected].app)
-            }
+            Event::Press(HwButton::Confirm) => Transition::Push(ITEMS[self.selected].app),
             _ => Transition::None,
         }
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        let title = Label::new(TITLE_REGION, "pulp-os", &FONT_10X20)
-            .alignment(Alignment::CenterLeft);
+        let title =
+            Label::new(TITLE_REGION, "pulp-os", &FONT_10X20).alignment(Alignment::CenterLeft);
         title.draw(strip).unwrap();
 
         for (i, item) in ITEMS.iter().enumerate() {

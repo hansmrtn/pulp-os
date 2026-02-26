@@ -1,3 +1,12 @@
+// pulp-os entry point and main loop
+//
+// Boot sequence: timer -> hardware -> UI -> enter Home app
+// Main loop: drain scheduler -> WFI -> translate wake flags -> repeat
+//
+// Apps are stack allocated and dispatched via with_app! macro (no dyn).
+// Timer scales from 10ms (active) to 100ms (idle) to save power;
+// any button activity snaps it back immediately.
+
 #![no_std]
 #![no_main]
 
@@ -12,11 +21,11 @@ use log::info;
 use core::cell::RefCell;
 use critical_section::Mutex;
 
-use pulp_os::apps::{App, AppId, Launcher, Redraw, Services};
 use pulp_os::apps::files::FilesApp;
 use pulp_os::apps::home::HomeApp;
 use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
+use pulp_os::apps::{App, AppId, Launcher, Redraw, Services};
 use pulp_os::board::Board;
 use pulp_os::board::StripBuffer;
 use pulp_os::drivers::battery;
@@ -24,36 +33,17 @@ use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::DirCache;
 use pulp_os::kernel::wake::{self, signal_timer, try_wake};
 use pulp_os::kernel::{Job, Scheduler};
-use pulp_os::ui::{StatusBar, SystemStatus, free_stack_bytes, BAR_HEIGHT};
+use pulp_os::ui::{BAR_HEIGHT, StatusBar, SystemStatus, free_stack_bytes};
 
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// How often to refresh the status bar (in 10ms ticks). 500 = 5 seconds.
-const STATUSBAR_INTERVAL_TICKS: u32 = 500;
+const STATUSBAR_INTERVAL_TICKS: u32 = 500; // 5 seconds in 10ms ticks
 
-// ── Idle timer scaling ─────────────────────────────────────────
-//
-// The timer interrupt wakes the CPU from WFI to poll ADC buttons.
-// During reading, no buttons are pressed for minutes — every 10ms
-// wake is wasted power. After a period of inactivity, we slow the
-// timer to 100ms (10× fewer wakes). Button presses snap it back.
-//
-// Power button (GPIO3) has its own interrupt and wakes instantly
-// regardless of timer period. ADC buttons get up to ~130ms latency
-// on first press during idle (100ms poll + 30ms debounce) — the
-// debounce snap-back ensures confirmation is fast once detected.
-
-/// Base timer period (ms). Used during active interaction.
 const ACTIVE_TIMER_MS: u64 = 10;
-/// Slow timer period (ms). Used after idle threshold.
 const IDLE_TIMER_MS: u64 = 100;
-/// How many consecutive empty polls before switching to slow timer.
-/// 200 × 10ms = 2 seconds of inactivity.
-const IDLE_THRESHOLD_POLLS: u32 = 200;
-
-// ── Timer interrupt ────────────────────────────────────────────
+const IDLE_THRESHOLD_POLLS: u32 = 200; // 200 * 10ms = 2s before idle
 
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
     Mutex::new(RefCell::new(None));
@@ -68,8 +58,6 @@ fn timer0_handler() {
     signal_timer();
 }
 
-/// Change the timer period at runtime. Updates the tick weight so
-/// uptime_ticks() stays in consistent 10ms units.
 fn set_timer_period(ms: u64) {
     wake::set_tick_weight((ms / ACTIVE_TIMER_MS) as u32);
     critical_section::with(|cs| {
@@ -79,14 +67,25 @@ fn set_timer_period(ms: u64) {
     });
 }
 
-/// Dispatch to the active app. Apps are stack-allocated — no dyn, no heap.
 macro_rules! with_app {
     ($id:expr, $home:expr, $files:expr, $reader:expr, $settings:expr, |$app:ident| $body:expr) => {
         match $id {
-            AppId::Home => { let $app = &mut $home; $body }
-            AppId::Files => { let $app = &mut $files; $body }
-            AppId::Reader => { let $app = &mut $reader; $body }
-            AppId::Settings => { let $app = &mut $settings; $body }
+            AppId::Home => {
+                let $app = &mut $home;
+                $body
+            }
+            AppId::Files => {
+                let $app = &mut $files;
+                $body
+            }
+            AppId::Reader => {
+                let $app = &mut $reader;
+                $body
+            }
+            AppId::Settings => {
+                let $app = &mut $settings;
+                $body
+            }
         }
     };
 }
@@ -100,7 +99,6 @@ fn main() -> ! {
 
     info!("booting...");
 
-    // Timer: 10ms tick
     let timg0 = TimerGroup::new(unsafe { peripherals.TIMG0.clone_unchecked() });
     let mut timer0 = PeriodicTimer::new(timg0.timer0);
     critical_section::with(|cs| {
@@ -111,7 +109,6 @@ fn main() -> ! {
     });
     info!("timer initialized.");
 
-    // Hardware
     let mut board = Board::init(peripherals);
     let mut delay = Delay::new();
     board.display.epd.init(&mut delay);
@@ -119,7 +116,6 @@ fn main() -> ! {
 
     let mut strip = StripBuffer::new();
 
-    // Status bar — persistent across all apps
     let mut statusbar = StatusBar::new();
     let sd_ok = board
         .storage
@@ -128,16 +124,13 @@ fn main() -> ! {
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .is_ok();
 
-    // Apps — all stack-allocated, zero heap
     let mut home = HomeApp::new();
     let mut files = FilesApp::new();
     let mut reader = ReaderApp::new();
     let mut settings = SettingsApp::new();
 
-    // Launcher (owns navigation stack + inter-app context)
     let mut launcher = Launcher::new();
 
-    // Scheduler + input
     let mut sched = Scheduler::new();
     let mut input = InputDriver::new(board.input);
     let mut last_statusbar_ticks: u32 = 0;
@@ -145,7 +138,6 @@ fn main() -> ! {
     let mut timer_is_slow = false;
     let mut dir_cache = DirCache::new();
 
-    // ── Boot: explicit init, no scheduler ──────────────────────
     home.on_enter(&mut launcher.ctx);
     update_statusbar(&mut statusbar, &mut input, sd_ok);
     board.display.epd.render_full(&mut strip, &mut delay, |s| {
@@ -155,21 +147,12 @@ fn main() -> ! {
     info!("ui ready.");
     info!("kernel ready.");
 
-    // ── Main loop ──────────────────────────────────────────────
     loop {
-        // 1. Drain all pending jobs by priority
+        // drain all pending jobs by priority (high first, FIFO within tier)
         while let Some(job) = sched.pop() {
             match job {
-                // ── PollInput (High) ───────────────────────────
                 Job::PollInput => {
                     let Some(event) = input.poll() else {
-                        // No confirmed event yet.
-                        //
-                        // If debouncing (raw activity, not yet confirmed),
-                        // snap timer to fast so confirmation arrives in
-                        // ~10ms instead of ~100ms. Worst-case first-press
-                        // latency: 100ms (idle poll) + 30ms (debounce) = 130ms
-                        // instead of 200ms without this check.
                         if timer_is_slow && input.is_debouncing() {
                             set_timer_period(ACTIVE_TIMER_MS);
                             timer_is_slow = false;
@@ -185,7 +168,6 @@ fn main() -> ! {
                         continue;
                     };
 
-                    // Got input — snap back to fast timer
                     if timer_is_slow {
                         set_timer_period(ACTIVE_TIMER_MS);
                         timer_is_slow = false;
@@ -193,18 +175,14 @@ fn main() -> ! {
                     }
                     idle_polls = 0;
 
-                    // Route to active app
                     let active = launcher.active();
-                    let transition =
-                        with_app!(active, home, files, reader, settings, |app| {
-                            app.on_event(event, &mut launcher.ctx)
-                        });
+                    let transition = with_app!(active, home, files, reader, settings, |app| {
+                        app.on_event(event, &mut launcher.ctx)
+                    });
 
-                    // Apply navigation
                     if let Some(nav) = launcher.apply(transition) {
                         info!("app: {:?} -> {:?}", nav.from, nav.to);
 
-                        // Departing app: suspend if staying on stack, exit if leaving
                         if nav.suspend {
                             with_app!(nav.from, home, files, reader, settings, |app| {
                                 app.on_suspend();
@@ -215,7 +193,6 @@ fn main() -> ! {
                             });
                         }
 
-                        // Arriving app: resume if returning, enter if fresh
                         if nav.resume {
                             with_app!(nav.to, home, files, reader, settings, |app| {
                                 app.on_resume(&mut launcher.ctx);
@@ -225,21 +202,10 @@ fn main() -> ! {
                                 app.on_enter(&mut launcher.ctx);
                             });
                         }
-                    } else {
-                        // No navigation — dirty regions (if any) were
-                        // already pushed into ctx by on_event via mark_dirty().
                     }
 
-                    // ── Cascade: enqueue follow-on work ────────
-                    //
-                    // RENDER OWNERSHIP INVARIANT:
-                    // When an app has pending async work, IT owns the
-                    // render decision. PollInput must not enqueue Render
-                    // alongside AppWork — doing so renders stale data
-                    // before the work completes, then renders again
-                    // after (double refresh, one wasted).
-                    //
-                    // The `else if` enforces this structurally.
+                    // if app has pending async work, let AppWork own the render
+                    // decision (else if); avoids double refresh on e-paper
                     let active = launcher.active();
                     let needs = with_app!(active, home, files, reader, settings, |app| {
                         app.needs_work()
@@ -251,21 +217,16 @@ fn main() -> ! {
                     }
                 }
 
-                // ── Render (High) ──────────────────────────────
                 Job::Render => {
                     let active = launcher.active();
                     match launcher.ctx.take_redraw() {
                         Redraw::Full => {
                             update_statusbar(&mut statusbar, &mut input, sd_ok);
                             with_app!(active, home, files, reader, settings, |app| {
-                                board.display.epd.render_full(
-                                    &mut strip,
-                                    &mut delay,
-                                    |s| {
-                                        statusbar.draw(s).unwrap();
-                                        app.draw(s);
-                                    },
-                                );
+                                board.display.epd.render_full(&mut strip, &mut delay, |s| {
+                                    statusbar.draw(s).unwrap();
+                                    app.draw(s);
+                                });
                             });
                         }
                         Redraw::Partial(r) => {
@@ -288,19 +249,10 @@ fn main() -> ! {
                                 );
                             });
                         }
-                        Redraw::None => {} // Race: already consumed
+                        Redraw::None => {}
                     }
                 }
 
-                // ── AppWork (Normal) ────────────────────────────
-                //
-                // Generic async work for the active app. The kernel
-                // constructs Services (just two refs, zero cost) and
-                // calls on_work(). The app handles everything — cache
-                // management, error handling, dirty region marking.
-                //
-                // No app-specific code lives here. Adding a new app
-                // with async I/O needs zero changes to this handler.
                 Job::AppWork => {
                     let active = launcher.active();
                     let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
@@ -312,17 +264,13 @@ fn main() -> ! {
                     }
                 }
 
-                // ── UpdateStatusBar (Normal) ───────────────────
                 Job::UpdateStatusBar => {
                     update_statusbar(&mut statusbar, &mut input, sd_ok);
-                    // Don't enqueue a render — the next full refresh
-                    // will pick up the new text. Avoids unnecessary
-                    // partial refreshes just for the status bar.
                 }
             }
         }
 
-        // 2. Wait for wake events
+        // wait for wake event then translate flags into jobs
         let wake = match try_wake() {
             Some(w) => w,
             None => {
@@ -331,18 +279,7 @@ fn main() -> ! {
             }
         };
 
-        // 3. Translate wake flags into jobs
-        //
-        // Each flag is checked independently — concurrent sources
-        // (e.g. Timer + Display) all get handled, nothing swallowed.
-        //
-        // Button and Timer both poll input: button because the user
-        // pressed something, timer because ADC-based buttons are
-        // sampled on the tick.
         if wake.has_input() {
-            // Power button GPIO interrupt — snap to fast timer immediately.
-            // ADC buttons snap back via is_debouncing() in PollInput,
-            // giving ~130ms worst-case latency (100ms + 30ms debounce).
             if wake.button && timer_is_slow {
                 set_timer_period(ACTIVE_TIMER_MS);
                 timer_is_slow = false;
@@ -359,12 +296,7 @@ fn main() -> ! {
             }
         }
 
-        // Display BUSY interrupt completion — currently no-op.
-        // Will be used when BUSY pin drives a GPIO interrupt
-        // to signal end-of-refresh without busy-waiting.
-        if wake.display {
-            // future: signal display-done to unblock render
-        }
+        if wake.display {}
     }
 }
 

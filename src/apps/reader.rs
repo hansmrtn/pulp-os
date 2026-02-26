@@ -1,7 +1,5 @@
-//! Reader app (stub).
-//!
-//! Will eventually render e-book content. For now shows the filename
-//! passed from the file browser.
+// File viewer (stub)
+// Receives filename from FilesApp via ctx.message() on entry.
 
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 

@@ -33,12 +33,10 @@ embedded-sdmmc = "0.9.0"
 
 
 [profile.dev]
-# Rust debug is too slow.
-# For debug builds always builds with some optimization
 opt-level = "s"
 
 [profile.release]
-codegen-units    = 1     # LLVM can perform better optimizations using a single thread
+codegen-units    = 1
 debug            = 2
 debug-assertions = false
 incremental      = false
