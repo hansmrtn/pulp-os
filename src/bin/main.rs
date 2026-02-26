@@ -203,11 +203,20 @@ fn main() -> ! {
                         }
 
                         // Propagate persisted preferences into apps that need
-                        // them before their lifecycle callbacks fire.
+                        // them before their lifecycle callbacks fire.  This
+                        // block runs for both fresh enter and resume so that
+                        // a setting changed while an app was suspended in the
+                        // stack takes effect immediately on return.
                         if nav.to == AppId::Reader {
-                            let idx = settings.system_settings().book_font_size_idx;
-                            reader.set_book_font_size(idx);
+                            let s = settings.system_settings();
+                            reader.set_book_font_size(s.book_font_size_idx);
                         }
+                        // ui_font_size_idx: stored and saved, but HomeApp /
+                        // FilesApp / SettingsApp currently use hard-coded
+                        // embedded-graphics mono fonts and have no
+                        // set_ui_font_size() receiver yet.  Wire it here once
+                        // those apps are ported to the bitmap font pipeline.
+                        // let ui_idx = settings.system_settings().ui_font_size_idx;
 
                         if nav.resume {
                             with_app!(nav.to, home, files, reader, settings, |app| {

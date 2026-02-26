@@ -24,6 +24,11 @@
 //
 //   ui_font_size_idx   — shell / settings UI font size selector.
 //                        Same index scale as book_font_size_idx.
+//                        NOT YET WIRED: HomeApp / FilesApp / SettingsApp
+//                        currently use hard-coded embedded-graphics mono
+//                        fonts.  Port those apps to the bitmap font pipeline
+//                        and add a set_ui_font_size() receiver, then
+//                        uncomment the propagation line in main.rs.
 //
 //   button_map         — selects a key-layout profile.
 //                        0 = Default, 1 = Swapped (L/R swapped for left hand).

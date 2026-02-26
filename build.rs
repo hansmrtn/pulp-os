@@ -306,8 +306,11 @@ fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
             }
         }
 
-        // offset_y: from baseline to top row of bitmap (negative = above)
-        let offset_y = -(metrics.ymin as i32) - (h as i32) + 1;
+        // offset_y: from baseline to top row of bitmap (positive y is down).
+        // fontdue ymin is the distance from the baseline to the bottom edge of
+        // the bounding box (positive = above baseline), so the top row sits at
+        // ymin + h above the baseline.  Negating gives the screen-space offset.
+        let offset_y = -(metrics.ymin as i32) - (h as i32);
 
         total_bits += bits.len();
         glyphs.push(Glyph {

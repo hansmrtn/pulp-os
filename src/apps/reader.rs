@@ -157,6 +157,33 @@ impl ReaderApp {
     // 0 = Small (~14 px), 1 = Medium (~18 px), 2 = Large (~24 px)
     pub fn set_book_font_size(&mut self, idx: u8) {
         self.book_font_size_idx = idx;
+        self.apply_font_metrics();
+    }
+
+    /// (Re-)initialise all font-derived metrics from `book_font_size_idx`.
+    /// Call whenever the index changes *or* on resume so the reader always
+    /// uses the currently selected size, even if it was changed in Settings
+    /// while the reader was suspended in the nav stack.
+    fn apply_font_metrics(&mut self) {
+        self.fonts = None;
+        self.font_line_h = LINE_H;
+        self.font_ascent = LINE_H;
+        self.max_lines = LINES_PER_PAGE;
+
+        if fonts::font_data::HAS_REGULAR {
+            let fs = fonts::FontSet::for_size(self.book_font_size_idx);
+            self.font_line_h = fs.line_height(fonts::Style::Regular);
+            self.font_ascent = fs.ascent(fonts::Style::Regular);
+            self.max_lines = ((TEXT_AREA_H / self.font_line_h) as usize).min(LINES_PER_PAGE);
+            log::info!(
+                "font: size_idx={} line_h={} ascent={} max_lines={}",
+                self.book_font_size_idx,
+                self.font_line_h,
+                self.font_ascent,
+                self.max_lines
+            );
+            self.fonts = Some(fs);
+        }
     }
 
     fn name(&self) -> &str {
@@ -733,25 +760,7 @@ impl App for ReaderApp {
         self.error = None;
         self.goto_last_page = false;
 
-        self.fonts = None;
-        self.font_line_h = LINE_H;
-        self.font_ascent = LINE_H;
-        self.max_lines = LINES_PER_PAGE;
-
-        if fonts::font_data::HAS_REGULAR {
-            let fs = fonts::FontSet::for_size(self.book_font_size_idx);
-            self.font_line_h = fs.line_height(fonts::Style::Regular);
-            self.font_ascent = fs.ascent(fonts::Style::Regular);
-            self.max_lines = ((TEXT_AREA_H / self.font_line_h) as usize).min(LINES_PER_PAGE);
-            log::info!(
-                "font: size_idx={} line_h={} ascent={} max_lines={}",
-                self.book_font_size_idx,
-                self.font_line_h,
-                self.font_ascent,
-                self.max_lines
-            );
-            self.fonts = Some(fs);
-        }
+        self.apply_font_metrics();
 
         if self.is_epub {
             self.zip.clear();
@@ -785,6 +794,12 @@ impl App for ReaderApp {
     fn on_suspend(&mut self) {}
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
+        // Re-apply font metrics in case book_font_size_idx was updated via
+        // set_book_font_size() while this app was suspended under Settings.
+        self.apply_font_metrics();
+        // A font size change also invalidates the current page layout; force
+        // a full re-wrap so line breaks match the new metrics.
+        self.reset_paging();
         ctx.request_screen_redraw();
     }
 
