@@ -73,7 +73,7 @@ impl ZipIndex {
         self.names = Vec::new();
     }
 
-    /// Parse EOCD from the tail of the file. Returns (cd_offset, cd_size).
+    // parse EOCD from the tail of the file; returns (cd_offset, cd_size)
     pub fn parse_eocd(tail: &[u8], file_size: u32) -> Result<(u32, u32), &'static str> {
         if tail.len() < 22 {
             return Err("zip: tail too short for EOCD");
@@ -100,7 +100,7 @@ impl ZipIndex {
         Ok((cd_offset, cd_size))
     }
 
-    /// Parse central directory bytes into the entry index.
+    // parse central directory bytes into the entry index
     pub fn parse_central_directory(&mut self, cd: &[u8]) -> Result<(), &'static str> {
         self.count = 0;
         self.names.clear();
@@ -207,7 +207,7 @@ impl ZipIndex {
         None
     }
 
-    /// Bytes to skip past a local file header to reach entry data.
+    // bytes to skip past a local file header to reach entry data
     pub fn local_header_data_skip(header: &[u8]) -> Result<u32, &'static str> {
         if header.len() < 30 {
             return Err("zip: local header too short");

@@ -27,10 +27,10 @@ use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
 use pulp_os::apps::{App, AppId, Launcher, Redraw, Services};
 use pulp_os::board::Board;
-use pulp_os::board::StripBuffer;
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::DirCache;
+use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::wake::{self, signal_timer, try_wake};
 use pulp_os::kernel::{Job, Scheduler};
 use pulp_os::ui::{BAR_HEIGHT, StatusBar, SystemStatus, free_stack_bytes};
@@ -45,7 +45,7 @@ const ACTIVE_TIMER_MS: u64 = 10;
 const IDLE_TIMER_MS: u64 = 100;
 const IDLE_THRESHOLD_POLLS: u32 = 200; // 200 * 10ms = 2s before idle
 
-/// Fallback ghost-clear interval used before settings are loaded from SD.
+// fallback ghost-clear interval used before settings are loaded from SD
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
 
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
@@ -200,6 +200,13 @@ fn main() -> ! {
                             with_app!(nav.from, home, files, reader, settings, |app| {
                                 app.on_exit();
                             });
+                        }
+
+                        // Propagate persisted preferences into apps that need
+                        // them before their lifecycle callbacks fire.
+                        if nav.to == AppId::Reader {
+                            let idx = settings.system_settings().book_font_size_idx;
+                            reader.set_book_font_size(idx);
                         }
 
                         if nav.resume {

@@ -9,7 +9,7 @@
 
 use embedded_sdmmc::{Mode, VolumeIdx};
 
-use crate::board::sdcard::SdStorage;
+use crate::drivers::sdcard::SdStorage;
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {

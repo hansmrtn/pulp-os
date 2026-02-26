@@ -19,8 +19,8 @@ use embedded_graphics::text::Text;
 
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::button::Button as HwButton;
-use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
+use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::formats::epub::{self, EpubMeta, EpubSpine};
 use crate::formats::html_strip;
@@ -39,6 +39,9 @@ const MAX_PAGES: usize = 1024;
 
 const HEADER_REGION: Region = Region::new(MARGIN, HEADER_Y, 300, HEADER_H);
 const STATUS_REGION: Region = Region::new(308, HEADER_Y, 164, HEADER_H);
+
+// full reader content area (header + text body); used by on_work for partial DU refreshes
+const PAGE_REGION: Region = Region::new(0, HEADER_Y, 480, 800 - HEADER_Y);
 
 const NO_PREFETCH: usize = usize::MAX;
 
@@ -103,6 +106,9 @@ pub struct ReaderApp {
     font_line_h: u16,
     font_ascent: u16,
     max_lines: usize,
+
+    // persisted preference — set by main before on_enter
+    book_font_size_idx: u8,
 }
 
 impl ReaderApp {
@@ -143,7 +149,14 @@ impl ReaderApp {
             font_line_h: LINE_H,
             font_ascent: LINE_H,
             max_lines: LINES_PER_PAGE,
+
+            book_font_size_idx: 0,
         }
+    }
+
+    // 0 = Small (~14 px), 1 = Medium (~18 px), 2 = Large (~24 px)
+    pub fn set_book_font_size(&mut self, idx: u8) {
+        self.book_font_size_idx = idx;
     }
 
     fn name(&self) -> &str {
@@ -726,12 +739,13 @@ impl App for ReaderApp {
         self.max_lines = LINES_PER_PAGE;
 
         if fonts::font_data::HAS_REGULAR {
-            let fs = fonts::FontSet::new();
+            let fs = fonts::FontSet::for_size(self.book_font_size_idx);
             self.font_line_h = fs.line_height(fonts::Style::Regular);
             self.font_ascent = fs.ascent(fonts::Style::Regular);
             self.max_lines = ((TEXT_AREA_H / self.font_line_h) as usize).min(LINES_PER_PAGE);
             log::info!(
-                "font: line_h={} ascent={} max_lines={}",
+                "font: size_idx={} line_h={} ascent={} max_lines={}",
+                self.book_font_size_idx,
                 self.font_line_h,
                 self.font_ascent,
                 self.max_lines
@@ -751,6 +765,10 @@ impl App for ReaderApp {
             self.state = State::NeedPage;
             log::info!("reader: opening txt {}", self.name());
         }
+
+        // Full GC refresh for the initial screen transition.
+        // Subsequent page turns in on_work use mark_dirty (DU partial).
+        ctx.request_screen_redraw();
     }
 
     fn on_exit(&mut self) {
@@ -793,7 +811,7 @@ impl App for ReaderApp {
                         log::info!("reader: epub init failed: {}", e);
                         self.error = Some(e);
                         self.state = State::Error;
-                        ctx.request_screen_redraw();
+                        ctx.mark_dirty(PAGE_REGION);
                     }
                 },
 
@@ -803,18 +821,18 @@ impl App for ReaderApp {
                             self.goto_last_page = false;
                             self.scan_to_last_page();
                             self.state = State::Ready;
-                            ctx.request_screen_redraw();
+                            ctx.mark_dirty(PAGE_REGION);
                         } else {
                             self.load_page_from_memory();
                             self.state = State::Ready;
-                            ctx.request_screen_redraw();
+                            ctx.mark_dirty(PAGE_REGION);
                         }
                     }
                     Err(e) => {
                         log::info!("reader: chapter load failed: {}", e);
                         self.error = Some(e);
                         self.state = State::Error;
-                        ctx.request_screen_redraw();
+                        ctx.mark_dirty(PAGE_REGION);
                     }
                 },
 
@@ -822,18 +840,18 @@ impl App for ReaderApp {
                     if self.is_epub {
                         self.load_page_from_memory();
                         self.state = State::Ready;
-                        ctx.request_screen_redraw();
+                        ctx.mark_dirty(PAGE_REGION);
                     } else {
                         match self.load_and_prefetch(svc) {
                             Ok(()) => {
                                 self.state = State::Ready;
-                                ctx.request_screen_redraw();
+                                ctx.mark_dirty(PAGE_REGION);
                             }
                             Err(e) => {
                                 log::info!("reader: load failed: {}", e);
                                 self.error = Some(e);
                                 self.state = State::Error;
-                                ctx.request_screen_redraw();
+                                ctx.mark_dirty(PAGE_REGION);
                             }
                         }
                     }

@@ -8,8 +8,7 @@
 
 use alloc::vec::Vec;
 
-/// Strip HTML in place. The write cursor never passes the read cursor
-/// because stripping only removes or shortens content.
+// write cursor never passes read cursor; stripping only removes or shortens content
 pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     let len = buf.len();
     if len == 0 {

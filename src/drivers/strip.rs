@@ -16,7 +16,7 @@ use embedded_graphics_core::{
     pixelcolor::BinaryColor,
 };
 
-use super::display::{HEIGHT, Rotation, WIDTH};
+use super::ssd1677::{HEIGHT, Rotation, WIDTH};
 
 pub const STRIP_ROWS: u16 = 40; // 800/8 * 40 = 4000B per strip
 pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8;

@@ -4,8 +4,8 @@ use embedded_graphics::mono_font::ascii::FONT_10X20;
 
 use crate::apps::{App, AppContext, AppId, Transition};
 use crate::board::button::Button as HwButton;
-use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
+use crate::drivers::strip::StripBuffer;
 use crate::ui::{Alignment, CONTENT_TOP, Label, Region, Widget};
 
 const TITLE_REGION: Region = Region::new(16, CONTENT_TOP, 200, 32);

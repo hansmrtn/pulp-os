@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // GPIO pin assignments for XTEink X4 (ESP32-C3)
 //
 // GPIO  Function         Notes
@@ -14,6 +13,8 @@
 // 10    SPI MOSI         shared data out
 // 12    SD CS            flash pin SPIHD, free in DIO mode
 // 21    EPD CS           display chip select
+
+#![allow(dead_code)]
 
 pub const EPD_CS: u8 = 21;
 pub const EPD_DC: u8 = 4;

@@ -10,9 +10,9 @@ use embedded_graphics::prelude::Primitive;
 
 use crate::apps::{App, AppContext, AppId, Services, Transition};
 use crate::board::button::Button as HwButton;
-use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
 use crate::drivers::storage::DirEntry;
+use crate::drivers::strip::StripBuffer;
 use crate::ui::{Alignment, Button as UiButton, CONTENT_TOP, DynamicLabel, Label, Region, Widget};
 
 const PAGE_SIZE: usize = 7;
@@ -85,6 +85,7 @@ impl FilesApp {
             ctx.mark_dirty(row_region(self.selected));
             self.selected -= 1;
             ctx.mark_dirty(row_region(self.selected));
+            ctx.mark_dirty(STATUS_REGION);
         } else if self.scroll > 0 {
             self.scroll = self.scroll.saturating_sub(1);
             self.needs_load = true;
@@ -96,6 +97,7 @@ impl FilesApp {
             ctx.mark_dirty(row_region(self.selected));
             self.selected += 1;
             ctx.mark_dirty(row_region(self.selected));
+            ctx.mark_dirty(STATUS_REGION);
         } else if self.scroll + self.count < self.total {
             self.scroll += 1;
             self.needs_load = true;
@@ -149,6 +151,7 @@ impl App for FilesApp {
         }
 
         ctx.mark_dirty(LIST_REGION);
+        ctx.mark_dirty(STATUS_REGION);
     }
 
     fn on_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {

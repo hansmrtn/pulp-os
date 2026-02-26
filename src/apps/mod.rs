@@ -20,11 +20,11 @@ pub mod home;
 pub mod reader;
 pub mod settings;
 
-use crate::board::SdStorage;
-use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
+use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{self, DirCache, DirEntry, DirPage};
-use crate::ui::{Region, SCREEN_REGION};
+use crate::drivers::strip::StripBuffer;
+use crate::ui::Region;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
@@ -94,11 +94,9 @@ impl AppContext {
         self.redraw = Redraw::Full;
     }
 
-    /// Repaint the entire screen using a partial-waveform refresh.
-    /// The kernel may promote this to a full hardware refresh
-    /// periodically to clear ghosting artifacts.
+    // full GC refresh; use mark_dirty for small same-screen updates
     pub fn request_screen_redraw(&mut self) {
-        self.request_partial_redraw(SCREEN_REGION);
+        self.request_full_redraw();
     }
 
     pub fn request_partial_redraw(&mut self, region: Region) {
@@ -111,7 +109,6 @@ impl AppContext {
         }
     }
 
-    // primary way apps request visual updates; coalesces via bounding box
     #[inline]
     pub fn mark_dirty(&mut self, region: Region) {
         self.request_partial_redraw(region);
@@ -128,10 +125,7 @@ impl AppContext {
     }
 }
 
-// Each read_file_chunk / file_size call re-opens volume/dir/file.
-// The reader mitigates this with lazy indexing and prefetch so the
-// hot path (forward page turn) needs at most one SD open per turn.
-// read_file_start folds file_size + first read into a single open.
+// Each call re-opens volume/dir/file; reader uses prefetch to amortize cost.
 pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
     dir_cache: &'a mut DirCache,
     sd: &'a SdStorage<SPI>,
@@ -164,7 +158,6 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::read_file_chunk(self.sd, name, offset, buf)
     }
 
-    // open file once, return (file_size, bytes_read) from offset 0
     pub fn read_file_start(
         &self,
         name: &str,

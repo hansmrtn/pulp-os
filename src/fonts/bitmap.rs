@@ -8,7 +8,7 @@ use embedded_graphics_core::Pixel;
 use embedded_graphics_core::pixelcolor::BinaryColor;
 use embedded_graphics_core::prelude::*;
 
-use crate::board::strip::StripBuffer;
+use crate::drivers::strip::StripBuffer;
 
 pub const FIRST_CHAR: u8 = 0x20;
 pub const LAST_CHAR: u8 = 0x7E;

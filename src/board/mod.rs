@@ -5,16 +5,13 @@
 // SPI bus arbitrated via RefCellDevice (single threaded, no ISR access).
 
 pub mod button;
-pub mod display;
 pub mod pins;
 pub mod raw_gpio;
-pub mod sdcard;
-pub mod strip;
 
+pub use crate::drivers::sdcard::SdStorage;
+pub use crate::drivers::ssd1677::{DisplayDriver, HEIGHT, SPI_FREQ_MHZ, WIDTH};
+pub use crate::drivers::strip::StripBuffer;
 pub use button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
-pub use display::{DisplayDriver, HEIGHT, SPI_FREQ_MHZ, WIDTH};
-pub use sdcard::SdStorage;
-pub use strip::StripBuffer;
 
 use core::cell::RefCell;
 

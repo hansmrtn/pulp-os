@@ -72,8 +72,7 @@ pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// Text content of the first element matching `tag_name`.
-/// Namespace-aware: searching for "title" matches "dc:title".
+// text content of the first element matching tag_name; namespace-aware ("title" matches "dc:title")
 pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
 
@@ -125,8 +124,7 @@ pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// Call `cb` for every opening tag matching `tag_name`.
-/// The callback receives raw bytes between `<` and `>`.
+// call cb for every opening tag matching tag_name; callback receives raw bytes between < and >
 pub fn for_each_tag<'a>(data: &'a [u8], tag_name: &[u8], mut cb: impl FnMut(&'a [u8])) {
     let mut pos = 0;
 

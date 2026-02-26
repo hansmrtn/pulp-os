@@ -77,7 +77,7 @@ impl EpubSpine {
     }
 }
 
-/// Parse container.xml to find the OPF path. Writes into `out`.
+// parse container.xml to find the OPF path; writes into out
 pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usize, &'static str> {
     let mut found_len: Option<usize> = None;
 
@@ -100,8 +100,7 @@ struct ManifestItem {
     href: Vec<u8>,
 }
 
-/// Parse OPF: extract metadata and build the reading-order spine
-/// as indices into the provided ZipIndex.
+// parse OPF: extract metadata and build the reading-order spine as indices into ZipIndex
 pub fn parse_opf(
     opf: &[u8],
     opf_dir: &str,
@@ -273,7 +272,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Check if a filename looks like an EPUB (.epub or .epu for FAT 8.3).
+// check if a filename looks like an EPUB (.epub or .epu for FAT 8.3)
 pub fn is_epub_filename(name: &str) -> bool {
     let b = name.as_bytes();
 

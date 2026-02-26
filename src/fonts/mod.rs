@@ -4,6 +4,12 @@
 // (on the host). The output is compact 1-bit bitmap tables in flash.
 // At runtime: zero heap, zero parsing, just table lookups and blits.
 // FontSet is Copy (four &'static pointers, 32 bytes).
+//
+// Three body sizes are available (indexed 0–2):
+//   0 = Small  (~14 px)
+//   1 = Medium (~18 px)
+//   2 = Large  (~24 px)
+// Use `FontSet::for_size(idx)` to obtain a sized set.
 
 pub mod bitmap;
 
@@ -11,7 +17,7 @@ pub mod font_data {
     include!(concat!(env!("OUT_DIR"), "/font_data.rs"));
 }
 
-use crate::board::strip::StripBuffer;
+use crate::drivers::strip::StripBuffer;
 use bitmap::BitmapFont;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,17 +37,17 @@ pub struct FontSet {
 }
 
 impl FontSet {
-    pub fn new() -> Self {
-        let regular = &font_data::REGULAR_BODY;
+    pub fn small() -> Self {
+        let regular = &font_data::REGULAR_BODY_SMALL;
 
-        let bold = if font_data::BOLD_BODY.glyph('A').advance > 0 {
-            &font_data::BOLD_BODY
+        let bold = if font_data::BOLD_BODY_SMALL.glyph('A').advance > 0 {
+            &font_data::BOLD_BODY_SMALL
         } else {
             regular
         };
 
-        let italic = if font_data::ITALIC_BODY.glyph('A').advance > 0 {
-            &font_data::ITALIC_BODY
+        let italic = if font_data::ITALIC_BODY_SMALL.glyph('A').advance > 0 {
+            &font_data::ITALIC_BODY_SMALL
         } else {
             regular
         };
@@ -52,6 +58,65 @@ impl FontSet {
             italic,
             heading: &font_data::REGULAR_HEADING,
         }
+    }
+
+    pub fn medium() -> Self {
+        let regular = &font_data::REGULAR_BODY_MEDIUM;
+
+        let bold = if font_data::BOLD_BODY_MEDIUM.glyph('A').advance > 0 {
+            &font_data::BOLD_BODY_MEDIUM
+        } else {
+            regular
+        };
+
+        let italic = if font_data::ITALIC_BODY_MEDIUM.glyph('A').advance > 0 {
+            &font_data::ITALIC_BODY_MEDIUM
+        } else {
+            regular
+        };
+
+        Self {
+            regular,
+            bold,
+            italic,
+            heading: &font_data::REGULAR_HEADING,
+        }
+    }
+
+    pub fn large() -> Self {
+        let regular = &font_data::REGULAR_BODY_LARGE;
+
+        let bold = if font_data::BOLD_BODY_LARGE.glyph('A').advance > 0 {
+            &font_data::BOLD_BODY_LARGE
+        } else {
+            regular
+        };
+
+        let italic = if font_data::ITALIC_BODY_LARGE.glyph('A').advance > 0 {
+            &font_data::ITALIC_BODY_LARGE
+        } else {
+            regular
+        };
+
+        Self {
+            regular,
+            bold,
+            italic,
+            heading: &font_data::REGULAR_HEADING,
+        }
+    }
+
+    pub fn for_size(idx: u8) -> Self {
+        match idx {
+            1 => Self::medium(),
+            2 => Self::large(),
+            _ => Self::small(),
+        }
+    }
+
+    // alias for FontSet::small(); kept for existing call-sites
+    pub fn new() -> Self {
+        Self::small()
     }
 
     #[inline]
