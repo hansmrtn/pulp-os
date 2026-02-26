@@ -215,3 +215,26 @@ fn format_83_name(sfn: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> us
 
     pos
 }
+
+pub fn write_file<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+
+    // Create the file if it doesn't exist, or truncate it if it does.
+    // ReadWriteCreate fails with FileAlreadyExists on subsequent saves;
+    // ReadWriteCreateOrTruncate handles both the first write and updates.
+    let file = root
+        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+        .map_err(|_| "open file for write failed")?;
+
+    file.write(data).map_err(|_| "write failed")?;
+    file.flush().map_err(|_| "flush failed")?;
+
+    Ok(())
+}

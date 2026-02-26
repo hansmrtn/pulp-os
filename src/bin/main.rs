@@ -45,10 +45,8 @@ const ACTIVE_TIMER_MS: u64 = 10;
 const IDLE_TIMER_MS: u64 = 100;
 const IDLE_THRESHOLD_POLLS: u32 = 200; // 200 * 10ms = 2s before idle
 
-/// Number of partial refreshes before forcing a full refresh to clear
-/// e-paper ghosting artifacts. Boot always does a full refresh; after
-/// that every render is partial until this counter is reached.
-const FULL_REFRESH_INTERVAL: u32 = 10;
+/// Fallback ghost-clear interval used before settings are loaded from SD.
+const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
 
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
     Mutex::new(RefCell::new(None));
@@ -243,7 +241,12 @@ fn main() -> ! {
                             partial_refreshes = 0;
                         }
                         Redraw::Partial(r) => {
-                            if partial_refreshes >= FULL_REFRESH_INTERVAL {
+                            let ghost_clear_every = if settings.is_loaded() {
+                                settings.system_settings().ghost_clear_every as u32
+                            } else {
+                                DEFAULT_GHOST_CLEAR_EVERY
+                            };
+                            if partial_refreshes >= ghost_clear_every {
                                 // Promote to a full hardware refresh to
                                 // clear accumulated ghosting artifacts.
                                 update_statusbar(&mut statusbar, &mut input, sd_ok);

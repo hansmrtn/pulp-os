@@ -176,6 +176,10 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
     pub fn file_size(&self, name: &str) -> Result<u32, &'static str> {
         storage::file_size(self.sd, name)
     }
+
+    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        storage::write_file(self.sd, name, data)
+    }
 }
 
 pub trait App {
