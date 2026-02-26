@@ -24,7 +24,7 @@ use crate::board::SdStorage;
 use crate::board::strip::StripBuffer;
 use crate::drivers::input::Event;
 use crate::drivers::storage::{self, DirCache, DirEntry, DirPage};
-use crate::ui::Region;
+use crate::ui::{Region, SCREEN_REGION};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
@@ -92,6 +92,13 @@ impl AppContext {
 
     pub fn request_full_redraw(&mut self) {
         self.redraw = Redraw::Full;
+    }
+
+    /// Repaint the entire screen using a partial-waveform refresh.
+    /// The kernel may promote this to a full hardware refresh
+    /// periodically to clear ghosting artifacts.
+    pub fn request_screen_redraw(&mut self) {
+        self.request_partial_redraw(SCREEN_REGION);
     }
 
     pub fn request_partial_redraw(&mut self, region: Region) {

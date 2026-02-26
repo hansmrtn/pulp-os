@@ -45,6 +45,11 @@ const ACTIVE_TIMER_MS: u64 = 10;
 const IDLE_TIMER_MS: u64 = 100;
 const IDLE_THRESHOLD_POLLS: u32 = 200; // 200 * 10ms = 2s before idle
 
+/// Number of partial refreshes before forcing a full refresh to clear
+/// e-paper ghosting artifacts. Boot always does a full refresh; after
+/// that every render is partial until this counter is reached.
+const FULL_REFRESH_INTERVAL: u32 = 10;
+
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
     Mutex::new(RefCell::new(None));
 
@@ -136,6 +141,7 @@ fn main() -> ! {
     let mut last_statusbar_ticks: u32 = 0;
     let mut idle_polls: u32 = 0;
     let mut timer_is_slow = false;
+    let mut partial_refreshes: u32 = 0;
     let mut dir_cache = DirCache::new();
 
     home.on_enter(&mut launcher.ctx);
@@ -144,6 +150,10 @@ fn main() -> ! {
         statusbar.draw(s).unwrap();
         home.draw(s);
     });
+    // Boot render_full was done outside the scheduler; drain any
+    // stale redraw that on_enter left behind so the first user
+    // interaction doesn't trigger a redundant screen repaint.
+    let _ = launcher.ctx.take_redraw();
     info!("ui ready.");
     info!("kernel ready.");
 
@@ -222,6 +232,7 @@ fn main() -> ! {
                     let active = launcher.active();
                     match launcher.ctx.take_redraw() {
                         Redraw::Full => {
+                            // Explicit full refresh request — always honour it.
                             update_statusbar(&mut statusbar, &mut input, sd_ok);
                             with_app!(active, home, files, reader, settings, |app| {
                                 board.display.epd.render_full(&mut strip, &mut delay, |s| {
@@ -229,26 +240,42 @@ fn main() -> ! {
                                     app.draw(s);
                                 });
                             });
+                            partial_refreshes = 0;
                         }
                         Redraw::Partial(r) => {
-                            let r = r.align8();
-                            let bar_overlaps = r.y < BAR_HEIGHT;
-                            with_app!(active, home, files, reader, settings, |app| {
-                                board.display.epd.render_partial(
-                                    &mut strip,
-                                    r.x,
-                                    r.y,
-                                    r.w,
-                                    r.h,
-                                    &mut delay,
-                                    |s| {
-                                        if bar_overlaps {
-                                            statusbar.draw(s).unwrap();
-                                        }
+                            if partial_refreshes >= FULL_REFRESH_INTERVAL {
+                                // Promote to a full hardware refresh to
+                                // clear accumulated ghosting artifacts.
+                                update_statusbar(&mut statusbar, &mut input, sd_ok);
+                                with_app!(active, home, files, reader, settings, |app| {
+                                    board.display.epd.render_full(&mut strip, &mut delay, |s| {
+                                        statusbar.draw(s).unwrap();
                                         app.draw(s);
-                                    },
-                                );
-                            });
+                                    });
+                                });
+                                partial_refreshes = 0;
+                                info!("display: promoted partial to full (ghosting clear)");
+                            } else {
+                                let r = r.align8();
+                                let bar_overlaps = r.y < BAR_HEIGHT;
+                                with_app!(active, home, files, reader, settings, |app| {
+                                    board.display.epd.render_partial(
+                                        &mut strip,
+                                        r.x,
+                                        r.y,
+                                        r.w,
+                                        r.h,
+                                        &mut delay,
+                                        |s| {
+                                            if bar_overlaps {
+                                                statusbar.draw(s).unwrap();
+                                            }
+                                            app.draw(s);
+                                        },
+                                    );
+                                });
+                                partial_refreshes += 1;
+                            }
                         }
                         Redraw::None => {}
                     }

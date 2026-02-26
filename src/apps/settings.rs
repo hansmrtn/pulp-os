@@ -20,7 +20,7 @@ impl SettingsApp {
 
 impl App for SettingsApp {
     fn on_enter(&mut self, ctx: &mut AppContext) {
-        ctx.request_full_redraw();
+        ctx.request_screen_redraw();
     }
 
     fn on_event(&mut self, event: Event, _ctx: &mut AppContext) -> Transition {

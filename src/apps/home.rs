@@ -66,7 +66,7 @@ impl HomeApp {
 impl App for HomeApp {
     fn on_enter(&mut self, ctx: &mut AppContext) {
         ctx.clear_message();
-        ctx.request_full_redraw();
+        ctx.request_screen_redraw();
     }
 
     fn on_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {

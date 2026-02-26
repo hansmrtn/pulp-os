@@ -110,7 +110,7 @@ impl App for FilesApp {
         self.needs_load = true;
         self.stale_cache = true;
         self.error = None;
-        ctx.request_full_redraw();
+        ctx.request_screen_redraw();
     }
 
     fn on_exit(&mut self) {
@@ -120,7 +120,7 @@ impl App for FilesApp {
     fn on_suspend(&mut self) {}
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
-        ctx.request_full_redraw();
+        ctx.request_screen_redraw();
     }
 
     fn needs_work(&self) -> bool {

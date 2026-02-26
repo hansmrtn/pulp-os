@@ -767,7 +767,7 @@ impl App for ReaderApp {
     fn on_suspend(&mut self) {}
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
-        ctx.request_full_redraw();
+        ctx.request_screen_redraw();
     }
 
     fn needs_work(&self) -> bool {
@@ -793,7 +793,7 @@ impl App for ReaderApp {
                         log::info!("reader: epub init failed: {}", e);
                         self.error = Some(e);
                         self.state = State::Error;
-                        ctx.request_full_redraw();
+                        ctx.request_screen_redraw();
                     }
                 },
 
@@ -803,18 +803,18 @@ impl App for ReaderApp {
                             self.goto_last_page = false;
                             self.scan_to_last_page();
                             self.state = State::Ready;
-                            ctx.request_full_redraw();
+                            ctx.request_screen_redraw();
                         } else {
                             self.load_page_from_memory();
                             self.state = State::Ready;
-                            ctx.request_full_redraw();
+                            ctx.request_screen_redraw();
                         }
                     }
                     Err(e) => {
                         log::info!("reader: chapter load failed: {}", e);
                         self.error = Some(e);
                         self.state = State::Error;
-                        ctx.request_full_redraw();
+                        ctx.request_screen_redraw();
                     }
                 },
 
@@ -822,18 +822,18 @@ impl App for ReaderApp {
                     if self.is_epub {
                         self.load_page_from_memory();
                         self.state = State::Ready;
-                        ctx.request_full_redraw();
+                        ctx.request_screen_redraw();
                     } else {
                         match self.load_and_prefetch(svc) {
                             Ok(()) => {
                                 self.state = State::Ready;
-                                ctx.request_full_redraw();
+                                ctx.request_screen_redraw();
                             }
                             Err(e) => {
                                 log::info!("reader: load failed: {}", e);
                                 self.error = Some(e);
                                 self.state = State::Error;
-                                ctx.request_full_redraw();
+                                ctx.request_screen_redraw();
                             }
                         }
                     }
