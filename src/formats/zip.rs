@@ -1,22 +1,15 @@
 // ZIP central directory parser and streaming entry extraction
 //
-// Reads EPUB archives from SD without holding compressed data in RAM.
-// Caller provides all I/O; this module operates on byte slices.
-//
-// Workflow: parse_eocd → parse_central_directory → find → extract_entry
-//
-// ZipIndex is ~5KB inline (256 entries); names are heap-allocated
-// during parsing and freed on clear(). Streaming DEFLATE reads
-// compressed data in 4KB chunks from SD through the decompressor;
-// only the output buffer (uncompressed size) lives on the heap.
-// All allocations use try_reserve for graceful OOM.
+// parse_eocd -> parse_central_directory -> find -> extract_entry
+// ZipIndex ~5KB inline (256 entries); names heap-allocated during
+// parse, freed on clear(). DEFLATE in 4KB SD chunks; all allocs
+// use try_reserve for graceful OOM.
 
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-// refuse to extract entries larger than this to avoid OOM
-const MAX_ENTRY_SIZE: u32 = 192 * 1024;
+const MAX_ENTRY_SIZE: u32 = 192 * 1024; // OOM guard
 
 const EOCD_SIG: u32 = 0x0605_4b50;
 const CD_SIG: u32 = 0x0201_4b50;
@@ -227,7 +220,7 @@ impl ZipIndex {
     }
 }
 
-// -- entry extraction (requires alloc) --
+// ── Entry extraction (requires alloc) ─────────────────────────────────
 
 pub fn extract_entry<E, F>(
     entry: &ZipEntry,
@@ -298,15 +291,8 @@ where
         .map_err(|_| "zip: chapter too large for memory")?;
     output.resize(uncomp_size, 0);
 
-    // DecompressorOxide is ~11 KB (huffman tables) and rbuf is 4 KB.
-    // Both must live on the heap to avoid stack overflow on ESP32-C3
-    // whose main stack is limited.
-    //
-    // Box::new(DecompressorOxide::new()) would construct the struct on
-    // the stack first (~11 KB) then memcpy to the heap — still
-    // overflows.  Allocate zeroed memory directly instead.
-    // Safety: DecompressorOxide::default() is all-zeros
-    // (State::Start = 0, every other field = 0).
+    // ~11KB DecompressorOxide + 4KB rbuf on heap to avoid stack overflow.
+    // Alloc zeroed directly — Box::new() would construct on stack first.
     let decomp_ptr =
         unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<DecompressorOxide>()) };
     if decomp_ptr.is_null() {

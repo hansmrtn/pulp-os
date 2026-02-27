@@ -1,11 +1,8 @@
 // Debounced input from ADC ladders and power button
 //
-// Three sources, one button at a time (hardware limitation of ladders):
-//   Row1 ADC (GPIO1): Right, Left, Confirm, Back
-//   Row2 ADC (GPIO2): VolUp, VolDown
-//   Power    (GPIO3): interrupt driven, read via board::power_button_is_low()
-//
-// 30ms debounce, 1s long press, 150ms repeat.
+// One button at a time (ladder hw limitation). Three sources:
+// Row1 (GPIO1), Row2 (GPIO2), Power (GPIO3 interrupt).
+// 15ms debounce, 1s long press, 150ms repeat.
 
 use esp_hal::time::{Duration, Instant};
 

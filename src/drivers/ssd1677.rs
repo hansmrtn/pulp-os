@@ -1,14 +1,7 @@
-// SSD1677 e-paper display driver (generic, board-independent).
-// Tested on GDEQ0426T82 (800×480) via XTEink X4 board.
-// No framebuffer in SRAM; pixels are streamed to the controller
-// through a 4KB StripBuffer.
-//
-// Partial refresh sequence matches GxEPD2_426_GDEQ0426T82:
-//   1. Write new content to BW RAM (0x24) only
-//   2. DU refresh (Mode 2, 0xFC)
-//   3. Write new content to BOTH RED (0x26) AND BW (0x24)
-// This ensures both RAM planes are perfectly synced after every
-// partial update, giving the DU waveform a correct baseline.
+// SSD1677 e-paper driver (board-independent)
+// Tested on GDEQ0426T82 (800x480). No framebuffer; pixels streamed
+// through a 4KB StripBuffer. Partial refresh per GxEPD2 sequence:
+// BW-only write -> DU update -> sync both planes.
 
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
@@ -35,7 +28,7 @@ pub enum Rotation {
     Deg270,
 }
 
-// SSD1677 command table
+// SSD1677 commands
 #[allow(dead_code)]
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
@@ -102,12 +95,7 @@ where
         self.init_display(delay);
     }
 
-    // ── Full refresh ────────────────────────────────────────────
-    //
-    // Matches GxEPD2 clearScreen / writeImageForFullRefresh:
-    //   Write identical content to RED (0x26) then BW (0x24),
-    //   followed by a GC (Mode 1) update.
-
+    // full refresh: identical content to RED then BW, GC update
     pub fn render_full<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: F)
     where
         F: Fn(&mut StripBuffer),
@@ -134,16 +122,7 @@ where
         self.initial_refresh = false;
     }
 
-    // ── Partial refresh (DU waveform) ───────────────────────────
-    //
-    // Matches GxEPD2 drawImage:
-    //   1. writeImage        → BW (0x24) only
-    //   2. refresh (partial) → DU update (0xFC)
-    //   3. writeImageAgain   → RED (0x26) then BW (0x24)
-    //
-    // Step 3 ensures both planes are perfectly synced so the next
-    // DU refresh has the correct "old frame" in RED RAM.
-
+    // partial refresh (DU waveform): BW only -> DU -> sync both planes
     #[allow(clippy::too_many_arguments)]
     pub fn render_partial<F>(
         &mut self,
@@ -167,7 +146,7 @@ where
 
         let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
 
-        // Align to 8-pixel byte boundaries for SSD1677 RAM addressing
+        // align to 8-pixel byte boundaries
         let px = (tx & !7).min(WIDTH);
         let py = ty.min(HEIGHT);
         let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
@@ -177,24 +156,14 @@ where
             return;
         }
 
-        // Alignment padding masks.
-        //
-        // px may start up to 7 pixels before tx, and px+pw may
-        // extend up to 7 pixels past tx+tw.  The draw closure
-        // renders all visible widgets, so widgets just outside the
-        // logical dirty region can bleed pixels into those padding
-        // columns (their physical coordinates pass the strip-window
-        // clip check).
-        //
-        // Force padding columns to white (0xFF = no ink) in every
-        // RAM write so the DU waveform never alters the display
-        // outside the intended dirty region.
+        // force padding columns white so DU doesn't alter pixels
+        // outside the intended dirty region
         let lp = (tx - px) as u32;
         let rp = ((px + pw) - (tx + tw)) as u32;
         let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
         let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
 
-        // Step 1: write new content to BW RAM only (the "new frame").
+        // step 1: BW RAM only (new frame)
         self.write_region_strips(
             strip,
             px,
@@ -207,17 +176,11 @@ where
             right_mask,
         );
 
-        // Step 2: DU partial update.
-        // set_partial_ram_area was called inside write_region_strips
-        // with the full (px,py,pw,ph) region, so the update window
-        // is correct.  Call it again explicitly to be safe (matches
-        // GxEPD2's refresh() calling _setPartialRamArea before
-        // _Update_Part).
+        // step 2: DU partial update
         self.set_partial_ram_area(px, py, pw, ph);
         self.update_partial();
 
-        // Step 3: sync both planes (matches GxEPD2 writeImageAgain).
-        // Write RED first, then BW — both get the new content.
+        // step 3: sync both planes (RED then BW)
         for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
             self.write_region_strips(strip, px, py, pw, ph, ram_cmd, &draw, left_mask, right_mask);
         }
@@ -235,7 +198,7 @@ where
         }
     }
 
-    // ── Strip data helpers ──────────────────────────────────────
+    // ── Strip data helpers ──────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips<F>(
@@ -266,8 +229,6 @@ where
             draw(strip);
 
             if needs_mask && row_bytes > 0 {
-                // Mask padding columns in-place; begin_window clears
-                // on next iteration so mutation is harmless.
                 for row in strip.data_mut().chunks_mut(row_bytes) {
                     row[0] |= left_mask;
                     row[row.len() - 1] |= right_mask;
@@ -278,8 +239,7 @@ where
         }
     }
 
-    // ── Display init ────────────────────────────────────────────
-    // Matches GxEPD2 _InitDisplay exactly.
+    // ── Display init (matches GxEPD2 _InitDisplay) ──────────────
 
     fn init_display(&mut self, delay: &mut Delay) {
         self.send_command(cmd::SW_RESET);
@@ -302,7 +262,7 @@ where
         self.init_done = true;
     }
 
-    // ── Coordinate helpers ──────────────────────────────────────
+    // ── Coordinate helpers ──────────────────────────────────
 
     fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
         match self.rotation {
@@ -313,8 +273,7 @@ where
         }
     }
 
-    // Gates are wired in reverse on this panel; Y must be flipped.
-    // Matches GxEPD2 _setPartialRamArea exactly.
+    // gates wired in reverse; Y flipped (per GxEPD2)
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
         let y_flipped = HEIGHT - y - h;
 
@@ -348,15 +307,14 @@ where
         ]);
     }
 
-    // ── Update sequences ────────────────────────────────────────
-    // Match GxEPD2 _Update_Full / _Update_Part exactly.
+    // ── Update sequences ────────────────────────────────────
 
     fn update_full(&mut self) {
-        // 0x21: bypass RED as 0 (A[7:4]=0100), BW normal
+        // bypass RED as 0, BW normal
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        // 0xF7 = Display Mode 1 (GC full waveform)
+        // Mode 1 (GC full waveform)
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
         self.send_data(&[0xF7]);
 
@@ -367,11 +325,11 @@ where
     }
 
     fn update_partial(&mut self) {
-        // 0x21: RED normal, BW normal
+        // RED normal, BW normal
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
-        // 0xFC = Display Mode 2 (DU partial waveform)
+        // Mode 2 (DU partial waveform)
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
         self.send_data(&[0xFC]);
 
@@ -381,10 +339,9 @@ where
         self.power_is_on = true;
     }
 
-    // ── Low-level SPI / busy ────────────────────────────────────
+    // ── Low-level SPI / busy ────────────────────────────────
 
-    // Sleeps via WFI between polls. BUSY falling edge interrupt
-    // wakes immediately; 10ms timer tick is the backstop.
+    // WFI between polls; BUSY falling-edge IRQ wakes, timer backstop
     fn wait_busy(&mut self, timeout_ms: u32) {
         use esp_hal::time::{Duration, Instant};
 

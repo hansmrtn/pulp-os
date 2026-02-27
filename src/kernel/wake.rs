@@ -1,13 +1,10 @@
 // Wake flag signaling between ISRs and the main loop
 //
-// ISRs set atomic flags; the main loop consumes them via try_wake().
-// Flags are independent so concurrent sources (button + timer + display)
-// never swallow each other. All cleared atomically inside a critical
-// section to prevent races on riscv32imc (no hardware atomic RMW).
-//
-// Uptime is tracked in 10ms base ticks regardless of actual timer
-// period. When the timer slows to 100ms during idle, TICK_WEIGHT
-// is set to 10 so the counter stays in consistent units.
+// ISRs set atomic flags; main loop consumes via try_wake().
+// Independent flags prevent concurrent sources from swallowing
+// each other. Critical section guards riscv32imc (no atomic RMW).
+// Uptime tracked in 10ms base ticks; TICK_WEIGHT compensates
+// when the timer slows to 100ms during idle.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -15,10 +12,10 @@ static WAKE_BUTTON: AtomicBool = AtomicBool::new(false);
 static WAKE_DISPLAY: AtomicBool = AtomicBool::new(false);
 static WAKE_TIMER: AtomicBool = AtomicBool::new(false);
 
-// how many 10ms base ticks each timer interrupt represents (1 or 10)
+// 10ms base ticks per timer interrupt (1 or 10)
 static TICK_WEIGHT: AtomicU32 = AtomicU32::new(1);
 
-// critical section because riscv32imc has no atomic add
+// cs: riscv32imc has no atomic add
 static UPTIME_TICKS: critical_section::Mutex<core::cell::Cell<u32>> =
     critical_section::Mutex::new(core::cell::Cell::new(0));
 

@@ -1,10 +1,7 @@
 // Button definitions and ADC resistance ladder decoding
 //
-// The X4 has two ADC ladders (Row1 on GPIO1, Row2 on GPIO2) and one
-// discrete power button on GPIO3. Each ladder encodes multiple buttons
-// as distinct voltage levels via a resistor network.
-//
-// Threshold table format: (center_mv, tolerance_mv, Button)
+// Two ADC ladders (Row1 GPIO1, Row2 GPIO2) plus discrete power
+// button on GPIO3. Each ladder encodes buttons as voltage levels.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {

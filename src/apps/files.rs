@@ -1,8 +1,7 @@
 // Paginated file browser for SD card root directory
 //
-// Scrolling within a page marks two rows dirty (old + new selection).
-// Scrolling across a page boundary sets needs_load; the kernel runs
-// AppWork which reads from DirCache and owns the render decision.
+// In-page scroll marks two rows dirty; cross-page sets needs_load
+// and defers to AppWork for SD read + render decision.
 
 use core::fmt::Write as _;
 

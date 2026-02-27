@@ -98,7 +98,7 @@ pub const TOC_TITLE_CAP: usize = 48;
 pub struct TocEntry {
     pub title: [u8; TOC_TITLE_CAP],
     pub title_len: u8,
-    /// Index into `EpubSpine::items`; `0xFFFF` = unresolved / not in spine.
+    // index into EpubSpine::items; 0xFFFF = unresolved
     pub spine_idx: u16,
 }
 
@@ -161,13 +161,11 @@ impl EpubToc {
     }
 }
 
-/// Where the TOC data lives inside the EPUB ZIP.
+// where the TOC data lives inside the EPUB ZIP
 #[derive(Clone, Copy, Debug)]
 pub enum TocSource {
-    /// EPUB 2 NCX file (zip entry index).
-    Ncx(usize),
-    /// EPUB 3 navigation document (zip entry index).
-    Nav(usize),
+    Ncx(usize), // EPUB 2 NCX
+    Nav(usize), // EPUB 3 nav document
 }
 
 impl TocSource {
@@ -196,12 +194,18 @@ pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usiz
     found_len.ok_or("epub: no rootfile full-path in container.xml")
 }
 
-struct ManifestItem {
-    id: Vec<u8>,
-    href: Vec<u8>,
-}
-
 // parse OPF: extract metadata and build the reading-order spine as indices into ZipIndex
+//
+// Two-pass approach — zero heap allocation for manifest/idref bookkeeping.
+// The OPF buffer is already in memory; scanning it twice per spine entry
+// is negligible compared to the DEFLATE work that follows.
+//
+// Phase 1: collect <itemref idref="..."> locations as byte ranges
+//          within the OPF buffer.  Stack cost: MAX_SPINE × 4 = 1 KB.
+//
+// Phase 2: for each idref, scan <item> tags to find the matching id
+//          and resolve its href to a ZIP entry index.
+//          O(spine × manifest) — microseconds for typical EPUBs.
 pub fn parse_opf(
     opf: &[u8],
     opf_dir: &str,
@@ -219,45 +223,72 @@ pub fn parse_opf(
         meta.set_author(author);
     }
 
-    // build manifest: id → href (heap temporary, freed at end)
-    let mut manifest: Vec<ManifestItem> = Vec::with_capacity(64);
-    xml::for_each_tag(opf, b"item", |tag_bytes| {
-        let id = xml::get_attr(tag_bytes, b"id");
-        let href = xml::get_attr(tag_bytes, b"href");
-        if let (Some(id), Some(href)) = (id, href) {
-            manifest.push(ManifestItem {
-                id: Vec::from(id),
-                href: Vec::from(href),
-            });
-        }
-    });
+    // Phase 1: collect idref locations as byte offsets into the OPF.
+    // get_attr returns subslices of opf, so pointer subtraction gives
+    // the offset.  Stored as (start: u16, len: u16) to keep the array
+    // at 4 bytes per entry (1 KB total for MAX_SPINE = 256).
 
-    // collect spine idrefs
-    let mut idrefs: Vec<Vec<u8>> = Vec::with_capacity(64);
+    #[derive(Clone, Copy)]
+    struct IdrefLoc {
+        start: u16,
+        len: u16,
+    }
+
+    let mut idref_locs = [IdrefLoc { start: 0, len: 0 }; MAX_SPINE];
+    let mut idref_count: usize = 0;
+
     xml::for_each_tag(opf, b"itemref", |tag_bytes| {
+        if idref_count >= MAX_SPINE {
+            return;
+        }
         if let Some(idref) = xml::get_attr(tag_bytes, b"idref") {
-            idrefs.push(Vec::from(idref));
+            // idref is a subslice of opf; compute its byte offset.
+            let offset = idref.as_ptr() as usize - opf.as_ptr() as usize;
+            if offset <= u16::MAX as usize && idref.len() <= u16::MAX as usize {
+                idref_locs[idref_count] = IdrefLoc {
+                    start: offset as u16,
+                    len: idref.len() as u16,
+                };
+                idref_count += 1;
+            }
         }
     });
 
-    // resolve each idref → manifest href → zip entry index
+    // Phase 2: for each idref, scan the manifest for a matching <item>
+    // and resolve its href to a ZIP entry index.
     let mut path_buf = [0u8; 512];
-    for idref in &idrefs {
-        let Some(item) = manifest.iter().find(|m| m.id == *idref) else {
-            continue;
-        };
 
-        let decoded_href = percent_decode(&item.href);
-        let href_str = core::str::from_utf8(&decoded_href).unwrap_or("");
-        let full_len = resolve_path(opf_dir, href_str, &mut path_buf);
-        let full_path = core::str::from_utf8(&path_buf[..full_len]).unwrap_or("");
+    for loc in &idref_locs[..idref_count] {
+        let idref = &opf[loc.start as usize..loc.start as usize + loc.len as usize];
 
-        if let Some(idx) = zip.find(full_path).or_else(|| zip.find_icase(full_path))
-            && (spine.count as usize) < MAX_SPINE
-        {
-            spine.items[spine.count as usize] = idx as u16;
-            spine.count += 1;
-        }
+        let mut found = false;
+        xml::for_each_tag(opf, b"item", |item_tag| {
+            if found {
+                return;
+            }
+            let Some(id) = xml::get_attr(item_tag, b"id") else {
+                return;
+            };
+            if id != idref {
+                return;
+            }
+            let Some(href) = xml::get_attr(item_tag, b"href") else {
+                return;
+            };
+
+            let decoded_href = percent_decode(href);
+            let href_str = core::str::from_utf8(&decoded_href).unwrap_or("");
+            let full_len = resolve_path(opf_dir, href_str, &mut path_buf);
+            let full_path = core::str::from_utf8(&path_buf[..full_len]).unwrap_or("");
+
+            if let Some(idx) = zip.find(full_path).or_else(|| zip.find_icase(full_path))
+                && (spine.count as usize) < MAX_SPINE
+            {
+                spine.items[spine.count as usize] = idx as u16;
+                spine.count += 1;
+            }
+            found = true;
+        });
     }
 
     if spine.count == 0 {
@@ -269,10 +300,7 @@ pub fn parse_opf(
 
 // ── TOC discovery and parsing ─────────────────────────────────────────────
 
-/// Scan the OPF to locate the TOC file in the ZIP.
-///
-/// Checks EPUB 3 first (`<item properties="nav">`), then falls back to
-/// EPUB 2 (`<spine toc="ncx_id">` → manifest lookup).
+// locate TOC in ZIP: EPUB 3 nav first, then EPUB 2 NCX fallback
 pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocSource> {
     let mut path_buf = [0u8; 512];
 
@@ -392,10 +420,7 @@ pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocS
     None
 }
 
-/// Convenience dispatcher — parses TOC data using the correct format.
-///
-/// `data` is the decompressed TOC file content; `toc_dir` is the
-/// directory containing the TOC file (for resolving relative hrefs).
+// dispatch TOC parse by format (NCX vs nav)
 pub fn parse_toc(
     source: TocSource,
     data: &[u8],
@@ -410,11 +435,7 @@ pub fn parse_toc(
     }
 }
 
-/// Parse an EPUB 2 NCX file (`toc.ncx`) into flat TOC entries.
-///
-/// Linear scan: tracks the most-recent `<text>` content and pairs it
-/// with the next `<content src="...">` to produce each entry.  Nested
-/// `<navPoint>` elements are flattened automatically.
+// parse EPUB 2 NCX into flat TOC entries (nested navPoints flattened)
 pub fn parse_ncx_toc(
     ncx: &[u8],
     ncx_dir: &str,
@@ -496,11 +517,7 @@ pub fn parse_ncx_toc(
     }
 }
 
-/// Parse an EPUB 3 navigation document (XHTML with `<nav epub:type="toc">`).
-///
-/// Locates the `<nav>` element with `epub:type="toc"`, then extracts
-/// `<a href="...">Title</a>` entries from within it.  Nested `<ol>`
-/// lists (sub-chapters) are flattened.
+// parse EPUB 3 nav document; extract <a> entries, flatten nested <ol>
 pub fn parse_nav_toc(
     nav: &[u8],
     nav_dir: &str,

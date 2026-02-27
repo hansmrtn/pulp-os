@@ -1,11 +1,7 @@
 // SD card file operations and directory cache
 //
-// FAT directory iteration has no seek; every listing scans from entry 0.
-// DirCache reads all entries once into RAM and serves pages from there.
-// 128 entries * 20 bytes = 2.5KB of SRAM.
-//
-// read_file_start: single open, returns (file_size, bytes_read) from offset 0.
-// Avoids the separate file_size + read_file_chunk round-trip on first access.
+// DirCache reads all entries once into RAM, serves pages from there.
+// Subdirectory ops support the EPUB chapter cache pipeline.
 
 use embedded_sdmmc::{Mode, VolumeIdx};
 
@@ -116,7 +112,7 @@ impl DirCache {
     }
 }
 
-// insertion sort: dirs first, then case-insensitive name
+// insertion sort: dirs first, then case-insensitive
 fn sort_entries(entries: &mut [DirEntry]) {
     for i in 1..entries.len() {
         let key = entries[i];
@@ -264,15 +260,179 @@ where
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
 
-    // Create the file if it doesn't exist, or truncate it if it does.
-    // ReadWriteCreate fails with FileAlreadyExists on subsequent saves;
-    // ReadWriteCreateOrTruncate handles both the first write and updates.
+    // ReadWriteCreateOrTruncate handles both first write and updates
     let file = root
         .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| "open file for write failed")?;
 
     file.write(data).map_err(|_| "write failed")?;
     file.flush().map_err(|_| "flush failed")?;
+
+    Ok(())
+}
+
+// ── Subdirectory operations (EPUB chapter cache) ──────────────────────────
+
+// create dir in root if it doesn't already exist
+pub fn ensure_dir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+
+    // already exists → done
+    if root.open_dir(name).is_ok() {
+        return Ok(());
+    }
+
+    // create it
+    root.make_dir_in_dir(name).map_err(|_| "make dir failed")?;
+
+    Ok(())
+}
+
+// write (create-or-truncate) a file inside a subdirectory of root
+pub fn write_file_in_dir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+    data: &[u8],
+) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+    let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
+
+    let file = sub
+        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+        .map_err(|_| "create file in dir failed")?;
+
+    if !data.is_empty() {
+        file.write(data).map_err(|_| "write in dir failed")?;
+    }
+    file.flush().map_err(|_| "flush in dir failed")?;
+
+    Ok(())
+}
+
+// append to file (or create) inside a subdirectory
+pub fn append_file_in_dir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+    data: &[u8],
+) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+    let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
+
+    let file = sub
+        .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
+        .map_err(|_| "open file for append failed")?;
+
+    if !data.is_empty() {
+        file.write(data).map_err(|_| "append write failed")?;
+    }
+    file.flush().map_err(|_| "append flush failed")?;
+
+    Ok(())
+}
+
+// read chunk from file in subdir at `offset`
+pub fn read_file_chunk_in_dir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+    offset: u32,
+    buf: &mut [u8],
+) -> Result<usize, &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+    let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
+
+    let file = sub
+        .open_file_in_dir(name, Mode::ReadOnly)
+        .map_err(|_| "open file in dir failed")?;
+
+    file.seek_from_start(offset)
+        .map_err(|_| "seek in dir failed")?;
+
+    let mut total = 0;
+    while !file.is_eof() && total < buf.len() {
+        let n = file
+            .read(&mut buf[total..])
+            .map_err(|_| "read in dir failed")?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+
+    Ok(total)
+}
+
+// file size in subdir, or Err if not found
+pub fn file_size_in_dir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+) -> Result<u32, &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+    let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
+
+    let file = sub
+        .open_file_in_dir(name, Mode::ReadOnly)
+        .map_err(|_| "open file in dir for size failed")?;
+
+    Ok(file.length())
+}
+
+// delete file in subdir; no-op if absent
+pub fn delete_file_in_dir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+    let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
+
+    // idempotent: ignore "not found"
+    let _ = sub.delete_file_in_dir(name);
 
     Ok(())
 }

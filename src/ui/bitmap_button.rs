@@ -12,11 +12,9 @@ use super::widget::{Alignment, Region};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 
-/// Default corner radius for the Rounded style.
 pub const DEFAULT_RADIUS: u32 = 8;
 
-/// Inner horizontal padding (px each side) so text doesn't hug the border.
-const TEXT_PAD_X: u16 = 10;
+const TEXT_PAD_X: u16 = 10; // inner horizontal padding each side
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BitmapButtonStyle {

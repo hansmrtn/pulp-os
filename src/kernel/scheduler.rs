@@ -1,12 +1,7 @@
 // Priority job scheduler, cooperative
 //
-// Jobs are signals, not data carriers. State lives in the subsystem
-// that handles the job. Three priority tiers, FIFO within each.
-// Fixed size ring buffers, no allocation.
-//
-// High:   PollInput, Render
-// Normal: AppWork, UpdateStatusBar
-// Low:    (reserved)
+// Jobs are signals, not data carriers. Three tiers (High/Normal/Low),
+// FIFO within each. Fixed-size ring buffers, no allocation.
 
 use core::fmt;
 

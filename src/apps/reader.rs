@@ -1,9 +1,9 @@
 // Plain text and EPUB reader
 //
-// TXT: lazy indexed with prefetch; page 1 after a single SD read.
-// EPUB: ZIP/OPF parsed once, chapters streamed and HTML-stripped
-// into a heap Vec. Same paging engine for both modes.
-// Proportional fonts via build-time rasterised bitmaps in flash.
+// TXT: lazy page-indexed with prefetch. EPUB: ZIP/OPF parsed once,
+// chapters stream-decompressed + HTML-stripped to SD cache; after
+// caching both formats read identically. Cache keyed on file size +
+// name hash. Proportional fonts via build-time rasterised bitmaps.
 
 extern crate alloc;
 
@@ -22,8 +22,11 @@ use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
+use crate::formats::cache;
 use crate::formats::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
-use crate::formats::html_strip;
+use crate::formats::html_strip::{
+    BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF, QUOTE_ON,
+};
 use crate::formats::zip::{self, ZipIndex};
 use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region};
@@ -49,6 +52,7 @@ const NO_PREFETCH: usize = usize::MAX;
 const TEXT_W: f32 = (480 - 2 * MARGIN) as f32;
 const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
+const INDENT_PX: u32 = 24; // pixels per blockquote indent level
 
 // ── Progress bar ──────────────────────────────────────────────────────
 const PROGRESS_H: u16 = 2;
@@ -70,7 +74,8 @@ enum State {
     NeedBookmark,
     NeedInit,
     NeedToc,
-    NeedChapter,
+    NeedCache,
+    NeedIndex,
     NeedPage,
     Ready,
     ShowToc,
@@ -81,10 +86,39 @@ enum State {
 struct LineSpan {
     start: u16,
     len: u16,
+    // style flags: bit 0 = bold, bit 1 = italic, bit 2 = heading
+    flags: u8,
+    // blockquote indent depth (0 = none, 1+ = nested)
+    indent: u8,
 }
 
 impl LineSpan {
-    const EMPTY: Self = Self { start: 0, len: 0 };
+    const EMPTY: Self = Self {
+        start: 0,
+        len: 0,
+        flags: 0,
+        indent: 0,
+    };
+
+    const FLAG_BOLD: u8 = 1 << 0;
+    const FLAG_ITALIC: u8 = 1 << 1;
+    const FLAG_HEADING: u8 = 1 << 2;
+
+    fn style(&self) -> fonts::Style {
+        if self.flags & Self::FLAG_HEADING != 0 {
+            fonts::Style::Heading
+        } else if self.flags & Self::FLAG_BOLD != 0 {
+            fonts::Style::Bold
+        } else if self.flags & Self::FLAG_ITALIC != 0 {
+            fonts::Style::Italic
+        } else {
+            fonts::Style::Regular
+        }
+    }
+
+    fn pack_flags(bold: bool, italic: bool, heading: bool) -> u8 {
+        (bold as u8) | ((italic as u8) << 1) | ((heading as u8) << 2)
+    }
 }
 
 impl Default for ReaderApp {
@@ -123,8 +157,14 @@ pub struct ReaderApp {
     meta: EpubMeta,
     spine: EpubSpine,
     chapter: u16,
-    chapter_text: Vec<u8>,
     goto_last_page: bool,
+
+    // epub chapter cache (SD-backed, no heap for chapter text)
+    cache_dir: [u8; 8],
+    epub_name_hash: u32,
+    epub_file_size: u32,
+    chapter_sizes: [u32; cache::MAX_CACHE_CHAPTERS],
+    chapters_cached: bool,
 
     // table of contents
     toc: EpubToc,
@@ -178,8 +218,13 @@ impl ReaderApp {
             meta: EpubMeta::new(),
             spine: EpubSpine::new(),
             chapter: 0,
-            chapter_text: Vec::new(),
             goto_last_page: false,
+
+            cache_dir: [0u8; 8],
+            epub_name_hash: 0,
+            epub_file_size: 0,
+            chapter_sizes: [0u32; cache::MAX_CACHE_CHAPTERS],
+            chapters_cached: false,
 
             toc: EpubToc::new(),
             toc_source: None,
@@ -538,6 +583,8 @@ impl ReaderApp {
             self.lines[self.line_count] = LineSpan {
                 start: start as u16,
                 len: (end - start) as u16,
+                flags: 0,
+                indent: 0,
             };
             self.line_count += 1;
         }
@@ -550,38 +597,6 @@ impl ReaderApp {
         self.fully_indexed = false;
         self.buf_len = 0;
         self.line_count = 0;
-        self.prefetch_page = NO_PREFETCH;
-        self.prefetch_len = 0;
-    }
-
-    fn load_page_from_memory(&mut self) {
-        let ct_len = self.chapter_text.len();
-        let offset = self.offsets[self.page] as usize;
-        let remaining = ct_len.saturating_sub(offset);
-        let n = remaining.min(PAGE_BUF);
-
-        if n > 0 {
-            self.buf[..n].copy_from_slice(&self.chapter_text[offset..offset + n]);
-        }
-        self.buf_len = n;
-
-        let consumed = self.wrap_lines_counted(self.buf_len);
-        let next_offset = offset + consumed;
-
-        if self.page + 1 >= self.total_pages && !self.fully_indexed {
-            if self.line_count >= self.max_lines && next_offset < ct_len {
-                if self.total_pages < MAX_PAGES {
-                    self.offsets[self.total_pages] = next_offset as u32;
-                    self.total_pages += 1;
-                } else {
-                    self.fully_indexed = true;
-                }
-            } else {
-                self.fully_indexed = true;
-            }
-        }
-
-        // No prefetch needed — data is in memory
         self.prefetch_page = NO_PREFETCH;
         self.prefetch_len = 0;
     }
@@ -599,8 +614,16 @@ impl ReaderApp {
             self.buf_len = self.prefetch_len;
             self.prefetch_page = NO_PREFETCH;
             self.prefetch_len = 0;
+        } else if self.is_epub && self.chapters_cached {
+            // EPUB: read from cached styled-text file on SD
+            let dir_buf = self.cache_dir;
+            let dir = cache::dir_name_str(&dir_buf);
+            let ch_file = cache::chapter_file_name(self.chapter);
+            let ch_str = cache::chapter_file_str(&ch_file);
+            let n = svc.read_chunk_in_dir(dir, ch_str, self.offsets[self.page], &mut self.buf)?;
+            self.buf_len = n;
         } else if self.file_size == 0 {
-            // first load; read_file_start folds size + read into one open
+            // TXT first load; read_file_start folds size + read into one open
             let (size, n) = svc.read_file_start(name, &mut self.buf)?;
             self.file_size = size;
             self.buf_len = n;
@@ -612,7 +635,7 @@ impl ReaderApp {
                 return Ok(());
             }
         } else {
-            // cache miss (backward nav, etc.)
+            // TXT cache miss (backward nav, etc.)
             let n = svc.read_file_chunk(name, self.offsets[self.page], &mut self.buf)?;
             self.buf_len = n;
         }
@@ -637,7 +660,16 @@ impl ReaderApp {
         // prefetch next page
         if self.page + 1 < self.total_pages {
             let pf_offset = self.offsets[self.page + 1];
-            match svc.read_file_chunk(name, pf_offset, &mut self.prefetch) {
+            let pf_result = if self.is_epub && self.chapters_cached {
+                let dir_buf = self.cache_dir;
+                let dir = cache::dir_name_str(&dir_buf);
+                let ch_file = cache::chapter_file_name(self.chapter);
+                let ch_str = cache::chapter_file_str(&ch_file);
+                svc.read_chunk_in_dir(dir, ch_str, pf_offset, &mut self.prefetch)
+            } else {
+                svc.read_file_chunk(name, pf_offset, &mut self.prefetch)
+            };
+            match pf_result {
                 Ok(n) => {
                     self.prefetch_len = n;
                     self.prefetch_page = self.page + 1;
@@ -662,11 +694,14 @@ impl ReaderApp {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
-        // 1. Get file size
+        // 1. Get file size and compute cache identifiers
         let epub_size = svc.file_size(name)?;
         if epub_size < 22 {
             return Err("epub: file too small");
         }
+        self.epub_file_size = epub_size;
+        self.epub_name_hash = cache::fnv1a(name.as_bytes());
+        self.cache_dir = cache::dir_name_for_hash(self.epub_name_hash);
 
         // 2. Read EOCD from tail of file
         let tail_size = (epub_size as usize).min(EOCD_TAIL);
@@ -748,69 +783,116 @@ impl ReaderApp {
         Ok(())
     }
 
-    fn epub_load_chapter<SPI: embedded_hal::spi::SpiDevice>(
+    // validate or build SD chapter cache for the entire book.
+    // ~47KB temp heap per chapter (freed on return).
+    fn epub_ensure_cache<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> Result<(), &'static str> {
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
 
-        let entry_idx = self.spine.items[self.chapter as usize] as usize;
-
-        log::info!(
-            "epub: loading chapter {}/{} (zip entry {} = {})",
-            self.chapter + 1,
-            self.spine.len(),
-            entry_idx,
-            self.zip.entry_name(entry_idx)
-        );
-
-        // Free the previous chapter's heap allocation *before* we
-        // allocate for the new one.  .clear() keeps the backing
-        // memory; replacing with an empty Vec actually frees it,
-        // giving extract_zip_entry the full heap to work with.
-        let old_cap = self.chapter_text.capacity();
-        self.chapter_text = Vec::new();
-        if old_cap > 0 {
-            log::info!("epub: freed previous chapter buffer ({}KB)", old_cap / 1024);
+        // Try to load and validate existing cache
+        let mut meta_buf = [0u8; cache::META_MAX_SIZE];
+        if let Ok(n) = svc.read_chunk_in_dir(dir, cache::META_FILE, 0, &mut meta_buf)
+            && let Ok(info) = cache::parse_cache_meta(
+                &meta_buf[..n],
+                self.epub_file_size,
+                self.epub_name_hash,
+                self.spine.len(),
+            )
+        {
+            self.chapter_sizes[..info.chapter_count]
+                .copy_from_slice(&info.chapter_sizes[..info.chapter_count]);
+            self.chapters_cached = true;
+            log::info!("epub: cache hit ({} chapters)", info.chapter_count);
+            return Ok(());
         }
 
-        // Decompress into a single buffer, then strip HTML in place.
-        // Peak heap = just this one Vec (the uncompressed XHTML).
-        // No second allocation — the stripped text overwrites the
-        // same buffer since it is always shorter.
-        let mut content = extract_zip_entry(svc, name, &self.zip, entry_idx)?;
-        let raw_len = content.len();
-        html_strip::strip_html_inplace(&mut content);
-        self.chapter_text = content;
+        // Cache miss — stream each chapter to SD
+        log::info!("epub: building cache for {} chapters", self.spine.len());
+        svc.ensure_dir(dir)?;
 
-        log::info!(
-            "epub: chapter {} — {}KB xhtml -> {}KB text",
-            self.chapter + 1,
-            raw_len / 1024,
-            self.chapter_text.len() / 1024
+        let (nb, nl) = self.name_copy();
+        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        let spine_len = self.spine.len();
+        for ch in 0..spine_len {
+            let entry_idx = self.spine.items[ch] as usize;
+            let entry = *self.zip.entry(entry_idx);
+
+            let ch_file = cache::chapter_file_name(ch as u16);
+            let ch_str = cache::chapter_file_str(&ch_file);
+
+            // Create empty file (truncate if stale)
+            svc.write_in_dir(dir, ch_str, &[])?;
+
+            // Stream: decompress → HTML strip → append to cache file.
+            // Temporary heap (~47 KB) is allocated inside stream_strip_entry
+            // and freed when it returns.
+            let svc_ref = &*svc;
+            let text_size = cache::stream_strip_entry(
+                &entry,
+                entry.local_offset,
+                |offset, buf| svc_ref.read_file_chunk(epub_name, offset, buf),
+                |chunk| svc_ref.append_in_dir(dir, ch_str, chunk),
+            )?;
+
+            self.chapter_sizes[ch] = text_size;
+            log::info!("epub: cached ch{} = {} bytes", ch, text_size);
+        }
+
+        // Write META.BIN so subsequent opens skip decompression
+        let meta_len = cache::encode_cache_meta(
+            self.epub_file_size,
+            self.epub_name_hash,
+            &self.chapter_sizes[..spine_len],
+            &mut meta_buf,
         );
+        svc.write_in_dir(dir, cache::META_FILE, &meta_buf[..meta_len])?;
 
-        // Reset paging for this chapter
-        self.reset_paging();
-        self.file_size = self.chapter_text.len() as u32;
-
+        self.chapters_cached = true;
+        log::info!("epub: cache complete");
         Ok(())
     }
 
-    fn scan_to_last_page(&mut self) {
-        // Load pages sequentially until fully indexed
+    // reset paging for current chapter from SD cache; no I/O
+    fn epub_index_chapter(&mut self) {
+        self.reset_paging();
+        let ch = self.chapter as usize;
+        self.file_size = if ch < cache::MAX_CACHE_CHAPTERS {
+            self.chapter_sizes[ch]
+        } else {
+            0
+        };
+        log::info!(
+            "epub: index chapter {}/{} ({} bytes cached text)",
+            self.chapter + 1,
+            self.spine.len(),
+            self.file_size,
+        );
+    }
+
+    fn scan_to_last_page<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<(), &'static str> {
+        // Scan forward, building the page offset table, until the
+        // entire chapter / file is indexed.
         while !self.fully_indexed && self.total_pages < MAX_PAGES {
-            let next_page = self.total_pages - 1;
-            self.page = next_page;
-            self.load_page_from_memory();
+            self.page = self.total_pages - 1;
+            self.load_and_prefetch(svc)?;
+            if self.page + 1 < self.total_pages {
+                self.page += 1;
+            } else {
+                break;
+            }
         }
-        // Now go to the actual last page
         if self.total_pages > 0 {
             self.page = self.total_pages - 1;
         }
-        // Reload the last page into buf for display
-        self.load_page_from_memory();
+        self.prefetch_page = NO_PREFETCH;
+        self.load_and_prefetch(svc)
     }
 
     fn page_forward(&mut self) -> bool {
@@ -830,7 +912,7 @@ impl ReaderApp {
             if (self.chapter as usize + 1) < self.spine.len() {
                 self.chapter += 1;
                 self.goto_last_page = false;
-                self.state = State::NeedChapter;
+                self.state = State::NeedIndex;
                 return true;
             }
         }
@@ -853,7 +935,7 @@ impl ReaderApp {
             // At the start of a chapter — go to last page of prev chapter
             self.chapter -= 1;
             self.goto_last_page = true;
-            self.state = State::NeedChapter;
+            self.state = State::NeedIndex;
             return true;
         }
 
@@ -869,7 +951,7 @@ impl ReaderApp {
             if (self.chapter as usize + 1) < self.spine.len() {
                 self.chapter += 1;
                 self.goto_last_page = false;
-                self.state = State::NeedChapter;
+                self.state = State::NeedIndex;
                 return true;
             }
         } else {
@@ -897,7 +979,7 @@ impl ReaderApp {
             if self.chapter > 0 {
                 self.chapter -= 1;
                 self.goto_last_page = false;
-                self.state = State::NeedChapter;
+                self.state = State::NeedIndex;
                 return true;
             }
         } else {
@@ -931,12 +1013,32 @@ fn wrap_proportional(
     max_width_px: f32,
 ) -> (usize, usize) {
     let max_l = max_lines.min(lines.len());
-    let max_w = max_width_px as u32;
+    let base_max_w = max_width_px as u32;
     let mut lc: usize = 0;
     let mut ls: usize = 0;
     let mut px: u32 = 0;
     let mut sp: usize = 0;
     let mut sp_px: u32 = 0;
+
+    // Style state — carried across lines, updated by markers
+    let mut bold = false;
+    let mut italic = false;
+    let mut heading = false;
+    let mut indent: u8 = 0;
+    let mut max_w = base_max_w;
+
+    #[inline]
+    fn current_style(bold: bool, italic: bool, heading: bool) -> fonts::Style {
+        if heading {
+            fonts::Style::Heading
+        } else if bold {
+            fonts::Style::Bold
+        } else if italic {
+            fonts::Style::Italic
+        } else {
+            fonts::Style::Regular
+        }
+    }
 
     macro_rules! emit {
         ($start:expr, $end:expr) => {
@@ -945,18 +1047,43 @@ fn wrap_proportional(
                 lines[lc] = LineSpan {
                     start: ($start) as u16,
                     len: (e - ($start)) as u16,
+                    flags: LineSpan::pack_flags(bold, italic, heading),
+                    indent,
                 };
                 lc += 1;
             }
         };
     }
 
-    let sty = fonts::Style::Regular;
-
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         let b = buf[i];
 
+        // 2-byte style markers: [MARKER, tag] — zero width, update state
+        if b == MARKER && i + 1 < n {
+            match buf[i + 1] {
+                BOLD_ON => bold = true,
+                BOLD_OFF => bold = false,
+                ITALIC_ON => italic = true,
+                ITALIC_OFF => italic = false,
+                HEADING_ON => heading = true,
+                HEADING_OFF => heading = false,
+                QUOTE_ON => {
+                    indent = indent.saturating_add(1);
+                    max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
+                }
+                QUOTE_OFF => {
+                    indent = indent.saturating_sub(1);
+                    max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
+                }
+                _ => {}
+            }
+            i += 2;
+            continue;
+        }
+
         if b == b'\r' {
+            i += 1;
             continue;
         }
 
@@ -969,16 +1096,17 @@ fn wrap_proportional(
             if lc >= max_l {
                 return (ls, lc);
             }
+            i += 1;
             continue;
         }
 
+        let sty = current_style(bold, italic, heading);
         let adv = fonts.advance_byte(b, sty) as u32;
 
         if b == b' ' {
             px += adv;
             sp = i + 1;
             sp_px = px;
-            // Space itself pushed us over — break before it
             if px > max_w {
                 emit!(ls, i);
                 ls = i + 1;
@@ -989,6 +1117,7 @@ fn wrap_proportional(
                     return (ls, lc);
                 }
             }
+            i += 1;
             continue;
         }
 
@@ -1011,6 +1140,8 @@ fn wrap_proportional(
                 return (ls, lc);
             }
         }
+
+        i += 1;
     }
 
     if ls < n && lc < max_l {
@@ -1019,6 +1150,8 @@ fn wrap_proportional(
             lines[lc] = LineSpan {
                 start: ls as u16,
                 len: (e - ls) as u16,
+                flags: LineSpan::pack_flags(bold, italic, heading),
+                indent,
             };
             lc += 1;
         }
@@ -1097,7 +1230,6 @@ impl App for ReaderApp {
         self.prefetch_len = 0;
 
         if self.is_epub {
-            self.chapter_text = Vec::new();
             self.toc.clear();
             self.toc_source = None;
         }
@@ -1113,7 +1245,15 @@ impl App for ReaderApp {
         self.apply_font_metrics();
         if font_changed {
             self.reset_paging();
-            self.state = State::NeedPage;
+            // Cache files are font-independent (styled text), but page
+            // offsets depend on line height / advance widths.  For EPUB
+            // rebuild the chapter's page index from the cached text;
+            // for TXT just re-page from the file.
+            if self.is_epub && self.chapters_cached {
+                self.state = State::NeedIndex;
+            } else {
+                self.state = State::NeedPage;
+            }
         }
         ctx.request_screen_redraw();
     }
@@ -1124,7 +1264,8 @@ impl App for ReaderApp {
             State::NeedBookmark
                 | State::NeedInit
                 | State::NeedToc
-                | State::NeedChapter
+                | State::NeedCache
+                | State::NeedIndex
                 | State::NeedPage
         )
     }
@@ -1146,7 +1287,7 @@ impl App for ReaderApp {
                         self.zip.clear();
                         self.meta = EpubMeta::new();
                         self.spine = EpubSpine::new();
-                        self.chapter_text.clear();
+                        self.chapters_cached = false;
                         // goto_last_page only when bookmark says page > 0
                         self.goto_last_page = false;
                         self.state = State::NeedInit;
@@ -1211,96 +1352,108 @@ impl App for ReaderApp {
                         }
                     }
                     self.rebuild_quick_actions();
-                    self.state = State::NeedChapter;
+                    self.state = State::NeedCache;
                     continue;
                 }
 
-                State::NeedChapter => {
-                    // epub_load_chapter calls reset_paging() which zeroes
+                State::NeedCache => match self.epub_ensure_cache(svc) {
+                    Ok(()) => {
+                        self.state = State::NeedIndex;
+                        continue;
+                    }
+                    Err(e) => {
+                        log::info!("reader: cache build failed: {}", e);
+                        self.error = Some(e);
+                        self.state = State::Error;
+                        ctx.mark_dirty(PAGE_REGION);
+                    }
+                },
+
+                State::NeedIndex => {
+                    // epub_index_chapter calls reset_paging() which zeroes
                     // self.page.  Save the target values first so bookmark
                     // restore and backward-nav-to-last-page still work.
                     let target_page = self.page;
                     let want_last = self.goto_last_page;
                     self.goto_last_page = false;
 
-                    match self.epub_load_chapter(svc) {
-                        Ok(()) => {
-                            if want_last {
-                                self.scan_to_last_page();
-                                self.state = State::Ready;
-                                ctx.mark_dirty(PAGE_REGION);
-                            } else if target_page > 0 {
-                                // Bookmark requested a non-zero page within this
-                                // chapter. Scan forward until we reach it.
-                                while self.page < target_page {
-                                    self.load_page_from_memory();
-                                    if self.page + 1 < self.total_pages {
-                                        self.page += 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                self.load_page_from_memory();
-                                self.state = State::Ready;
-                                ctx.mark_dirty(PAGE_REGION);
-                            } else {
-                                self.load_page_from_memory();
+                    self.epub_index_chapter();
+
+                    if want_last {
+                        match self.scan_to_last_page(svc) {
+                            Ok(()) => {
                                 self.state = State::Ready;
                                 ctx.mark_dirty(PAGE_REGION);
                             }
+                            Err(e) => {
+                                self.error = Some(e);
+                                self.state = State::Error;
+                                ctx.mark_dirty(PAGE_REGION);
+                            }
                         }
-                        Err(e) => {
-                            log::info!("reader: chapter load failed: {}", e);
-                            self.error = Some(e);
-                            self.state = State::Error;
+                    } else if target_page > 0 {
+                        // Bookmark requested a non-zero page within this
+                        // chapter. Scan forward until we reach it.
+                        loop {
+                            match self.load_and_prefetch(svc) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    self.error = Some(e);
+                                    self.state = State::Error;
+                                    ctx.mark_dirty(PAGE_REGION);
+                                    break;
+                                }
+                            }
+                            if self.page >= target_page || self.page + 1 >= self.total_pages {
+                                break;
+                            }
+                            self.page += 1;
+                        }
+                        if self.state != State::Error {
+                            self.state = State::Ready;
                             ctx.mark_dirty(PAGE_REGION);
                         }
+                    } else {
+                        self.state = State::NeedPage;
+                        continue;
                     }
                 }
 
                 State::NeedPage => {
-                    if self.is_epub {
-                        self.load_page_from_memory();
-                        self.state = State::Ready;
-                        ctx.mark_dirty(PAGE_REGION);
-                    } else {
-                        // If we have a bookmark target page but haven't yet
-                        // walked the offset table that far, scan forward first.
-                        let target_page = self.page;
-                        if target_page > 0 && self.offsets[target_page] == 0 {
-                            // Reset to page 0 and walk forward, building offsets.
-                            self.page = 0;
-                            loop {
-                                match self.load_and_prefetch(svc) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        self.error = Some(e);
-                                        self.state = State::Error;
-                                        ctx.mark_dirty(PAGE_REGION);
-                                        break;
-                                    }
-                                }
-                                if self.page >= target_page || self.page + 1 >= self.total_pages {
-                                    break;
-                                }
-                                self.page += 1;
-                            }
-                            if self.state != State::Error {
-                                self.state = State::Ready;
-                                ctx.mark_dirty(PAGE_REGION);
-                            }
-                        } else {
+                    // Unified for TXT and cached EPUB — both read from SD.
+                    let target_page = self.page;
+                    if target_page > 0 && self.offsets[target_page] == 0 {
+                        self.page = 0;
+                        loop {
                             match self.load_and_prefetch(svc) {
-                                Ok(()) => {
-                                    self.state = State::Ready;
-                                    ctx.mark_dirty(PAGE_REGION);
-                                }
+                                Ok(()) => {}
                                 Err(e) => {
-                                    log::info!("reader: load failed: {}", e);
                                     self.error = Some(e);
                                     self.state = State::Error;
                                     ctx.mark_dirty(PAGE_REGION);
+                                    break;
                                 }
+                            }
+                            if self.page >= target_page || self.page + 1 >= self.total_pages {
+                                break;
+                            }
+                            self.page += 1;
+                        }
+                        if self.state != State::Error {
+                            self.state = State::Ready;
+                            ctx.mark_dirty(PAGE_REGION);
+                        }
+                    } else {
+                        match self.load_and_prefetch(svc) {
+                            Ok(()) => {
+                                self.state = State::Ready;
+                                ctx.mark_dirty(PAGE_REGION);
+                            }
+                            Err(e) => {
+                                log::info!("reader: load failed: {}", e);
+                                self.error = Some(e);
+                                self.state = State::Error;
+                                ctx.mark_dirty(PAGE_REGION);
                             }
                         }
                     }
@@ -1353,7 +1506,7 @@ impl App for ReaderApp {
                         self.chapter = entry.spine_idx;
                         self.page = 0;
                         self.goto_last_page = false;
-                        self.state = State::NeedChapter;
+                        self.state = State::NeedIndex;
                     } else {
                         log::warn!(
                             "toc: entry \"{}\" unresolved (spine_idx=0xFFFF), ignoring",
@@ -1421,14 +1574,14 @@ impl App for ReaderApp {
                 if self.is_epub && self.chapter > 0 {
                     self.chapter -= 1;
                     self.goto_last_page = false;
-                    self.state = State::NeedChapter;
+                    self.state = State::NeedIndex;
                 }
             }
             QA_NEXT_CHAPTER => {
                 if self.is_epub && (self.chapter as usize + 1) < self.spine.len() {
                     self.chapter += 1;
                     self.goto_last_page = false;
-                    self.state = State::NeedChapter;
+                    self.state = State::NeedIndex;
                 }
             }
             QA_TOC => {
@@ -1459,9 +1612,14 @@ impl App for ReaderApp {
         if id == QA_FONT_SIZE {
             self.book_font_size_idx = value;
             self.apply_font_metrics();
-            // Re-wrap the current page with the new font metrics
+            // Cache files are styled text — font-independent.  Only the
+            // page offset table needs rebuilding on font change.
             if self.state == State::Ready {
-                self.state = State::NeedPage;
+                if self.is_epub && self.chapters_cached {
+                    self.state = State::NeedIndex;
+                } else {
+                    self.state = State::NeedPage;
+                }
             }
             self.rebuild_quick_actions();
         }
@@ -1596,13 +1754,36 @@ impl App for ReaderApp {
                 let start = span.start as usize;
                 let end = start + span.len as usize;
                 let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
-                fs.draw_bytes(
-                    strip,
-                    &self.buf[start..end],
-                    fonts::Style::Regular,
-                    MARGIN as i32,
-                    baseline,
-                );
+                let x_indent = INDENT_PX as i32 * span.indent as i32;
+
+                // Style-marker-aware rendering: walk bytes, switch
+                // fonts on [MARKER, tag] pairs, draw everything else.
+                let line = &self.buf[start..end];
+                let mut cx = MARGIN as i32 + x_indent;
+                let mut sty = span.style();
+                let mut j = 0usize;
+                while j < line.len() {
+                    let b = line[j];
+                    if b == MARKER && j + 1 < line.len() {
+                        sty = match line[j + 1] {
+                            BOLD_ON => fonts::Style::Bold,
+                            ITALIC_ON => fonts::Style::Italic,
+                            HEADING_ON => fonts::Style::Heading,
+                            BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
+                            _ => sty,
+                        };
+                        j += 2;
+                        continue;
+                    }
+                    let ch = if (0x20..=0x7E).contains(&b) {
+                        b as char
+                    } else {
+                        j += 1;
+                        continue; // skip non-printable (stray marker bytes, etc.)
+                    };
+                    cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
+                    j += 1;
+                }
             }
         } else {
             let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);

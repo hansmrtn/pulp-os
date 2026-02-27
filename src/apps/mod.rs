@@ -1,19 +1,9 @@
 // Application framework and launcher
 //
-// Apps are stack allocated structs behind the App trait. The Launcher
-// holds a fixed depth navigation stack (max 4) and an AppContext for
-// inter-app messaging and redraw requests. No dyn dispatch, no heap.
-//
-// Lifecycle: on_enter -> on_event* -> on_suspend/on_exit
-//            on_resume -> on_event* -> on_exit
-//
-// Async I/O: apps that need SD access return needs_work() = true.
-// The kernel calls on_work() with a Services handle before rendering.
-// This prevents stale renders (the "render ownership invariant"):
-// if needs_work() is true, PollInput will not enqueue Render.
-//
-// Services is the syscall boundary. Apps never touch SPI or caches
-// directly. Generic over SPI so board types do not leak in.
+// Stack-allocated app structs behind the App trait. Launcher holds a
+// nav stack (max 4) and AppContext for messaging/redraw. No dyn, no heap.
+// Apps needing SD return needs_work()=true; kernel calls on_work() with
+// a Services handle before rendering. Services is the syscall boundary.
 
 pub mod files;
 pub mod home;
@@ -180,6 +170,38 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
     pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
         storage::write_file(self.sd, name, data)
     }
+
+    // ── Subdirectory operations (EPUB chapter cache) ──────────────
+
+    pub fn ensure_dir(&self, name: &str) -> Result<(), &'static str> {
+        storage::ensure_dir(self.sd, name)
+    }
+
+    pub fn write_in_dir(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        storage::write_file_in_dir(self.sd, dir, name, data)
+    }
+
+    pub fn append_in_dir(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        storage::append_file_in_dir(self.sd, dir, name, data)
+    }
+
+    pub fn read_chunk_in_dir(
+        &self,
+        dir: &str,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        storage::read_file_chunk_in_dir(self.sd, dir, name, offset, buf)
+    }
+
+    pub fn file_size_in_dir(&self, dir: &str, name: &str) -> Result<u32, &'static str> {
+        storage::file_size_in_dir(self.sd, dir, name)
+    }
+
+    pub fn delete_in_dir(&self, dir: &str, name: &str) -> Result<(), &'static str> {
+        storage::delete_file_in_dir(self.sd, dir, name)
+    }
 }
 
 pub trait App {
@@ -193,20 +215,20 @@ pub trait App {
     }
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition;
 
-    /// Static help text describing available actions in the current state.
+    // help text for current state
     fn help_text(&self) -> &'static str {
         ""
     }
 
-    /// App-specific items for the quick menu; empty slice = core only.
+    // app items for quick menu; empty = core only
     fn quick_actions(&self) -> &[QuickAction] {
         &[]
     }
 
-    /// App-defined trigger fired from the quick menu; `id` from `QuickAction`.
+    // quick menu trigger fired; id from QuickAction
     fn on_quick_trigger(&mut self, _id: u8, _ctx: &mut AppContext) {}
 
-    /// Cycle value updated in the quick menu; `id` and new `value` index.
+    // quick menu cycle value updated
     fn on_quick_cycle_update(&mut self, _id: u8, _value: u8, _ctx: &mut AppContext) {}
 
     // called once per strip during refresh; widgets clip automatically

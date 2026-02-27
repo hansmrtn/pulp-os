@@ -1,8 +1,7 @@
 // XTEink X4 board support package
 //
-// ESP32C3, SSD1677 800x480 epaper, SD card over shared SPI2 bus.
-// ADC resistance ladders for buttons, GPIO3 power button with interrupt.
-// SPI bus arbitrated via RefCellDevice (single threaded, no ISR access).
+// ESP32C3, SSD1677 800x480 epaper, SD over shared SPI2.
+// RefCellDevice arbitrates bus (single threaded, no ISR access).
 
 pub mod action;
 pub mod button;
@@ -39,14 +38,12 @@ pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, 
 
 static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 
-// power button lives in a static so the ISR can clear its interrupt
-// and InputDriver can read pin level for debounce
+// power button static: ISR clears interrupt, InputDriver reads level
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// shared GPIO ISR: handles power button (GPIO3) and display BUSY (GPIO6)
+// shared GPIO ISR: power button (GPIO3) + display BUSY (GPIO6)
 #[esp_hal::handler]
 fn gpio_handler() {
-    // power button -- pin in static, cleared via esp_hal API
     critical_section::with(|cs| {
         if let Some(btn) = POWER_BTN.borrow_ref_mut(cs).as_mut()
             && btn.is_interrupt_set()
@@ -56,8 +53,7 @@ fn gpio_handler() {
         }
     });
 
-    // display BUSY (GPIO6) -- owned by DisplayDriver, so check/clear
-    // via raw register access since we cannot reach the pin from here
+    // display BUSY (GPIO6) -- raw register, pin owned by DisplayDriver
     const GPIO_STATUS: *const u32 = 0x6000_4044 as *const u32;
     const GPIO_STATUS_W1TC: *mut u32 = 0x6000_404C as *mut u32;
     const GPIO6_MASK: u32 = 1 << 6;
@@ -154,20 +150,18 @@ impl Board {
         }
     }
 
-    // three phase SPI init: 400kHz bus -> SD probe -> speed up to 20MHz
+    // 400kHz -> SD probe -> 20MHz
     fn init_spi_peripherals(p: Peripherals) -> (DisplayHw, StorageHw) {
         let epd_cs = Output::new(p.GPIO21, Level::High, OutputConfig::default());
         let dc = Output::new(p.GPIO4, Level::High, OutputConfig::default());
         let rst = Output::new(p.GPIO5, Level::High, OutputConfig::default());
 
-        // arm BUSY falling edge interrupt before handing pin to DisplayDriver;
-        // the hardware config survives the move, ISR reads GPIO6 via registers
+        // arm BUSY falling edge before handing pin to DisplayDriver
         let mut busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
         busy.listen(Event::FallingEdge);
         info!("display BUSY: GPIO6 interrupt armed (FallingEdge)");
 
-        // GPIO12 (flash SPIHD) is free in DIO mode but esp_hal does not
-        // expose GPIO12-17 on ESP32C3, so we drive CS via raw registers
+        // GPIO12 free in DIO mode; esp_hal has no type, use raw registers
         let sd_cs = unsafe { raw_gpio::RawOutputPin::new(12) };
 
         let slow_cfg = spi::master::Config::default().with_frequency(Rate::from_khz(400));
@@ -178,7 +172,7 @@ impl Board {
             .with_mosi(p.GPIO10)
             .with_miso(p.GPIO7);
 
-        // 10 bytes = 80 clocks with CS high (SD spec init requirement)
+        // 80 clocks with CS high (SD spec init)
         let _ = spi_bus.write(&[0xFF; 10]);
 
         let spi_ref: &'static RefCell<SpiBus> = SPI_BUS.init(RefCell::new(spi_bus));

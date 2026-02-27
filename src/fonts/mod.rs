@@ -1,15 +1,7 @@
-// Build-time rasterised bitmap fonts for e-ink text rendering
+// Build-time rasterised bitmap fonts for e-ink rendering
 //
-// TTF files in src/fonts/ are rasterised by build.rs using fontdue
-// (on the host). The output is compact 1-bit bitmap tables in flash.
-// At runtime: zero heap, zero parsing, just table lookups and blits.
-// FontSet is Copy (four &'static pointers, 32 bytes).
-//
-// Three body sizes are available (indexed 0–2):
-//   0 = Small  (body 14 px, heading 20 px)
-//   1 = Medium (body 21 px, heading 28 px)
-//   2 = Large  (body 30 px, heading 40 px)
-// Use `FontSet::for_size(idx)` to obtain a sized set.
+// TTFs rasterised by build.rs via fontdue into 1-bit tables in flash.
+// Zero heap, zero parsing at runtime. Three sizes (0=Small/1=Med/2=Large).
 
 pub mod bitmap;
 
