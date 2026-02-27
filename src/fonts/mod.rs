@@ -20,6 +20,23 @@ pub mod font_data {
 use crate::drivers::strip::StripBuffer;
 use bitmap::BitmapFont;
 
+// idx: 0 = Small, 1 = Medium, 2 = Large
+pub fn body_font(idx: u8) -> &'static BitmapFont {
+    match idx {
+        1 => &font_data::REGULAR_BODY_MEDIUM,
+        2 => &font_data::REGULAR_BODY_LARGE,
+        _ => &font_data::REGULAR_BODY_SMALL,
+    }
+}
+
+pub fn heading_font(idx: u8) -> &'static BitmapFont {
+    match idx {
+        1 => &font_data::REGULAR_HEADING_MEDIUM,
+        2 => &font_data::REGULAR_HEADING_LARGE,
+        _ => &font_data::REGULAR_HEADING_SMALL,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Style {
     Regular,

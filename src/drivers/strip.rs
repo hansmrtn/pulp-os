@@ -14,9 +14,11 @@ use embedded_graphics_core::{
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
     pixelcolor::BinaryColor,
+    primitives::Rectangle,
 };
 
 use super::ssd1677::{HEIGHT, Rotation, WIDTH};
+use crate::ui::Region;
 
 pub const STRIP_ROWS: u16 = 40; // 800/8 * 40 = 4000B per strip
 pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8;
@@ -85,8 +87,38 @@ impl StripBuffer {
         &self.buf[..total]
     }
 
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        let total = self.row_bytes as usize * self.win_h as usize;
+        &mut self.buf[..total]
+    }
+
     pub fn window(&self) -> (u16, u16, u16, u16) {
         (self.win_x, self.win_y, self.win_w, self.win_h)
+    }
+
+    // physical window converted back to logical coords for widget culling
+    pub fn logical_window(&self) -> Region {
+        match self.rotation {
+            Rotation::Deg0 => Region::new(self.win_x, self.win_y, self.win_w, self.win_h),
+            Rotation::Deg90 => Region::new(
+                self.win_y,
+                WIDTH - self.win_x - self.win_w,
+                self.win_h,
+                self.win_w,
+            ),
+            Rotation::Deg180 => Region::new(
+                WIDTH - self.win_x - self.win_w,
+                HEIGHT - self.win_y - self.win_h,
+                self.win_w,
+                self.win_h,
+            ),
+            Rotation::Deg270 => Region::new(
+                HEIGHT - self.win_y - self.win_h,
+                self.win_x,
+                self.win_h,
+                self.win_w,
+            ),
+        }
     }
 
     pub const fn strip_count() -> u16 {
@@ -131,6 +163,169 @@ impl StripBuffer {
             self.buf[idx] |= 1 << bit;
         }
     }
+
+    // direct 1-bit glyph blit; bypasses DrawTarget per-pixel overhead.
+    // gx, gy: logical top-left. Only ink pixels drawn (transparent bg).
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_1bpp(
+        &mut self,
+        bitmaps: &[u8],
+        offset: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        gx: i32,
+        gy: i32,
+        black: bool,
+    ) {
+        if w == 0 || h == 0 || offset + stride * h > bitmaps.len() {
+            return;
+        }
+        match self.rotation {
+            Rotation::Deg270 => self.blit_1bpp_270(bitmaps, offset, w, h, stride, gx, gy, black),
+            _ => self.blit_1bpp_generic(bitmaps, offset, w, h, stride, gx, gy, black),
+        }
+    }
+
+    // Deg270: logical (lx, ly) → physical (ly, HEIGHT-1-lx).
+    // A glyph row (fixed y) shares one physical-x column in the buffer,
+    // so the inner loop over glyph columns touches consecutive buffer rows.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn blit_1bpp_270(
+        &mut self,
+        bitmaps: &[u8],
+        offset: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        gx: i32,
+        gy: i32,
+        black: bool,
+    ) {
+        let wx = self.win_x as i32;
+        let wy = self.win_y as i32;
+        let wx2 = wx + self.win_w as i32;
+        let wy2 = wy + self.win_h as i32;
+        let rb = self.row_bytes as usize;
+
+        // clip glyph rows (y axis) against physical-x window
+        let y0 = (wx - gy).clamp(0, h as i32) as usize;
+        let y1 = (wx2 - gy).clamp(0, h as i32) as usize;
+        if y0 >= y1 {
+            return;
+        }
+
+        // clip glyph cols (x axis) against physical-y window
+        // phys_y = HEIGHT-1-gx-x, decreasing with x
+        let x0 = (HEIGHT as i32 - gx - wy2).clamp(0, w as i32) as usize;
+        let x1 = (HEIGHT as i32 - gx - wy).clamp(0, w as i32) as usize;
+        if x0 >= x1 {
+            return;
+        }
+
+        // buf_y for x=0: physical row offset into window
+        let base_buf_y = (HEIGHT as i32 - 1 - gx - wy) as usize;
+
+        for y in y0..y1 {
+            let row = offset + y * stride;
+            let buf_x = (gy + y as i32 - wx) as usize;
+            let byte_col = buf_x / 8;
+            let mask = 1u8 << (7 - (buf_x & 7));
+
+            if black {
+                for x in x0..x1 {
+                    if bitmaps[row + x / 8] & (1 << (7 - (x & 7))) != 0 {
+                        self.buf[byte_col + (base_buf_y - x) * rb] &= !mask;
+                    }
+                }
+            } else {
+                for x in x0..x1 {
+                    if bitmaps[row + x / 8] & (1 << (7 - (x & 7))) != 0 {
+                        self.buf[byte_col + (base_buf_y - x) * rb] |= mask;
+                    }
+                }
+            }
+        }
+    }
+
+    // fallback for Deg0/Deg90/Deg180
+    #[allow(clippy::too_many_arguments)]
+    fn blit_1bpp_generic(
+        &mut self,
+        bitmaps: &[u8],
+        offset: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        gx: i32,
+        gy: i32,
+        black: bool,
+    ) {
+        let (lw, lh) = match self.rotation {
+            Rotation::Deg0 | Rotation::Deg180 => (WIDTH as i32, HEIGHT as i32),
+            Rotation::Deg90 | Rotation::Deg270 => (HEIGHT as i32, WIDTH as i32),
+        };
+
+        for y in 0..h {
+            let ly = gy + y as i32;
+            if ly < 0 || ly >= lh {
+                continue;
+            }
+            let row = offset + y * stride;
+            for x in 0..w {
+                let lx = gx + x as i32;
+                if lx < 0 || lx >= lw {
+                    continue;
+                }
+                if bitmaps[row + x / 8] & (1 << (7 - (x & 7))) != 0 {
+                    let (px, py) = self.to_physical(lx as u16, ly as u16);
+                    self.set_pixel_physical(px, py, black);
+                }
+            }
+        }
+    }
+
+    // byte-level rectangle fill in physical coords, clipped to window
+    fn fill_physical_rect(&mut self, px0: u16, py0: u16, px1: u16, py1: u16, black: bool) {
+        let cx0 = px0.max(self.win_x);
+        let cx1 = px1.min(self.win_x + self.win_w);
+        let cy0 = py0.max(self.win_y);
+        let cy1 = py1.min(self.win_y + self.win_h);
+        if cx0 >= cx1 || cy0 >= cy1 {
+            return;
+        }
+
+        let lx0 = (cx0 - self.win_x) as usize;
+        let lx1 = (cx1 - self.win_x) as usize;
+        let ly0 = (cy0 - self.win_y) as usize;
+        let ly1 = (cy1 - self.win_y) as usize;
+        let rb = self.row_bytes as usize;
+
+        let first_byte = lx0 / 8;
+        let last_byte = (lx1 - 1) / 8;
+        let first_mask: u8 = 0xFF >> (lx0 & 7);
+        let last_mask: u8 = 0xFF << (7 - ((lx1 - 1) & 7));
+
+        let (fill, edge_op): (u8, fn(&mut u8, u8)) = if black {
+            (0x00, |b, m| *b &= !m)
+        } else {
+            (0xFF, |b, m| *b |= m)
+        };
+
+        for ly in ly0..ly1 {
+            let row = ly * rb;
+            if first_byte == last_byte {
+                edge_op(&mut self.buf[row + first_byte], first_mask & last_mask);
+            } else {
+                edge_op(&mut self.buf[row + first_byte], first_mask);
+                for b in first_byte + 1..last_byte {
+                    self.buf[row + b] = fill;
+                }
+                edge_op(&mut self.buf[row + last_byte], last_mask);
+            }
+        }
+    }
 }
 
 impl Default for StripBuffer {
@@ -167,6 +362,72 @@ impl DrawTarget for StripBuffer {
 
             let (px, py) = self.to_physical(coord.x as u16, coord.y as u16);
             self.set_pixel_physical(px, py, color == BinaryColor::On);
+        }
+        Ok(())
+    }
+
+    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        let size = self.size();
+        let sw = size.width as u16;
+        let sh = size.height as u16;
+
+        let lx0 = (area.top_left.x.max(0) as u16).min(sw);
+        let ly0 = (area.top_left.y.max(0) as u16).min(sh);
+        let lx1 = ((area.top_left.x.saturating_add(area.size.width as i32)).max(0) as u16).min(sw);
+        let ly1 = ((area.top_left.y.saturating_add(area.size.height as i32)).max(0) as u16).min(sh);
+        if lx0 >= lx1 || ly0 >= ly1 {
+            return Ok(());
+        }
+
+        let black = color == BinaryColor::On;
+
+        match self.rotation {
+            Rotation::Deg270 => {
+                // logical (lx,ly) → physical (ly, HEIGHT-1-lx)
+                self.fill_physical_rect(ly0, HEIGHT - lx1, ly1, HEIGHT - lx0, black);
+            }
+            Rotation::Deg0 => {
+                self.fill_physical_rect(lx0, ly0, lx1, ly1, black);
+            }
+            _ => {
+                for ly in ly0..ly1 {
+                    for lx in lx0..lx1 {
+                        let (px, py) = self.to_physical(lx, ly);
+                        self.set_pixel_physical(px, py, black);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        // 1-bit display: contiguous fills are rare; batch same-colour runs
+        // through fill_solid when possible, fall back to per-pixel otherwise.
+        let w = area.size.width as i32;
+        if w == 0 {
+            return Ok(());
+        }
+        let mut x = area.top_left.x;
+        let mut y = area.top_left.y;
+        let x_end = x + w;
+        let size = self.size();
+        let log_w = size.width as i32;
+        let log_h = size.height as i32;
+
+        for color in colors {
+            if x >= 0 && x < log_w && y >= 0 && y < log_h {
+                let (px, py) = self.to_physical(x as u16, y as u16);
+                self.set_pixel_physical(px, py, color == BinaryColor::On);
+            }
+            x += 1;
+            if x >= x_end {
+                x = area.top_left.x;
+                y += 1;
+            }
         }
         Ok(())
     }

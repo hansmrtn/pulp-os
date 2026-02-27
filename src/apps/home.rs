@@ -3,8 +3,8 @@
 use crate::apps::{App, AppContext, AppId, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
+use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::fonts::font_data;
 use crate::ui::{Alignment, BitmapButton, BitmapButtonStyle, BitmapLabel, CONTENT_TOP, Region};
 
 // Screen is 480 px wide. Center a 280 px column.
@@ -37,22 +37,6 @@ const ITEMS: &[MenuItem] = &[
     },
 ];
 
-fn body_font(idx: u8) -> &'static BitmapFont {
-    match idx {
-        1 => &font_data::REGULAR_BODY_MEDIUM,
-        2 => &font_data::REGULAR_BODY_LARGE,
-        _ => &font_data::REGULAR_BODY_SMALL,
-    }
-}
-
-fn heading_font(idx: u8) -> &'static BitmapFont {
-    match idx {
-        1 => &font_data::REGULAR_HEADING_MEDIUM,
-        2 => &font_data::REGULAR_HEADING_LARGE,
-        _ => &font_data::REGULAR_HEADING_SMALL,
-    }
-}
-
 fn compute_item_regions(heading_line_h: u16) -> [Region; 3] {
     let item_y = CONTENT_TOP + 8 + heading_line_h + TITLE_ITEM_GAP;
     [
@@ -77,18 +61,18 @@ impl Default for HomeApp {
 
 impl HomeApp {
     pub fn new() -> Self {
-        let hf = heading_font(0);
+        let hf = fonts::heading_font(0);
         Self {
             selected: 0,
-            body_font: body_font(0),
+            body_font: fonts::body_font(0),
             heading_font: hf,
             item_regions: compute_item_regions(hf.line_height),
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
-        self.body_font = body_font(idx);
-        self.heading_font = heading_font(idx);
+        self.body_font = fonts::body_font(idx);
+        self.heading_font = fonts::heading_font(idx);
         self.item_regions = compute_item_regions(self.heading_font.line_height);
     }
 

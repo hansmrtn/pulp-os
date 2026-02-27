@@ -13,6 +13,9 @@
 
 use alloc::vec::Vec;
 
+// refuse to extract entries larger than this to avoid OOM
+const MAX_ENTRY_SIZE: u32 = 192 * 1024;
+
 const EOCD_SIG: u32 = 0x0605_4b50;
 const CD_SIG: u32 = 0x0201_4b50;
 const LOCAL_SIG: u32 = 0x0403_4b50;
@@ -236,6 +239,10 @@ where
     read_fn(local_offset, &mut header).map_err(|_| "zip: read local header failed")?;
     let skip = ZipIndex::local_header_data_skip(&header)?;
     let data_offset = local_offset + skip;
+
+    if entry.uncomp_size > MAX_ENTRY_SIZE {
+        return Err("zip: entry too large");
+    }
 
     match entry.method {
         METHOD_STORED => extract_stored(entry, data_offset, &mut read_fn),

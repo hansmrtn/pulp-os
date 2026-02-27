@@ -21,8 +21,8 @@ use core::fmt::Write as _;
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
+use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::fonts::font_data;
 use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 // ── Layout ────────────────────────────────────────────────────────────────────
@@ -95,6 +95,13 @@ impl SystemSettings {
         }
     }
 
+    fn sanitize(&mut self) {
+        self.sleep_timeout = self.sleep_timeout.min(120);
+        self.ghost_clear_every = self.ghost_clear_every.clamp(1, 50);
+        self.book_font_size_idx = self.book_font_size_idx.min(2);
+        self.ui_font_size_idx = self.ui_font_size_idx.min(2);
+    }
+
     // deserialise from raw bytes; returns defaults on short input
     pub fn from_bytes(data: &[u8]) -> Self {
         let size = core::mem::size_of::<Self>();
@@ -103,6 +110,7 @@ impl SystemSettings {
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), &mut s as *mut Self as *mut u8, size);
             }
+            s.sanitize();
             s
         } else {
             Self::defaults()
@@ -130,29 +138,21 @@ pub struct SettingsApp {
 
 impl SettingsApp {
     pub fn new() -> Self {
-        let hf = &font_data::REGULAR_HEADING_SMALL;
+        let hf = fonts::heading_font(0);
         Self {
             settings: SystemSettings::defaults(),
             selected: 0,
             loaded: false,
             save_needed: false,
-            body_font: &font_data::REGULAR_BODY_SMALL,
+            body_font: fonts::body_font(0),
             heading_font: hf,
             items_top: CONTENT_TOP + 4 + hf.line_height + HEADING_ITEMS_GAP,
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
-        self.body_font = match idx {
-            1 => &font_data::REGULAR_BODY_MEDIUM,
-            2 => &font_data::REGULAR_BODY_LARGE,
-            _ => &font_data::REGULAR_BODY_SMALL,
-        };
-        self.heading_font = match idx {
-            1 => &font_data::REGULAR_HEADING_MEDIUM,
-            2 => &font_data::REGULAR_HEADING_LARGE,
-            _ => &font_data::REGULAR_HEADING_SMALL,
-        };
+        self.body_font = fonts::body_font(idx);
+        self.heading_font = fonts::heading_font(idx);
         self.items_top = CONTENT_TOP + 4 + self.heading_font.line_height + HEADING_ITEMS_GAP;
     }
 

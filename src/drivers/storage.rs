@@ -94,6 +94,7 @@ impl DirCache {
         .map_err(|_| "iterate dir failed")?;
 
         self.count = count;
+        sort_entries(&mut self.entries[..count]);
         self.valid = true;
         Ok(())
     }
@@ -113,6 +114,37 @@ impl DirCache {
     pub fn invalidate(&mut self) {
         self.valid = false;
     }
+}
+
+// insertion sort: dirs first, then case-insensitive name
+fn sort_entries(entries: &mut [DirEntry]) {
+    for i in 1..entries.len() {
+        let key = entries[i];
+        let mut j = i;
+        while j > 0 && entry_gt(&entries[j - 1], &key) {
+            entries[j] = entries[j - 1];
+            j -= 1;
+        }
+        entries[j] = key;
+    }
+}
+
+fn entry_gt(a: &DirEntry, b: &DirEntry) -> bool {
+    if a.is_dir != b.is_dir {
+        return !a.is_dir;
+    }
+    let an = &a.name[..a.name_len as usize];
+    let bn = &b.name[..b.name_len as usize];
+    for (&ab, &bb) in an.iter().zip(bn.iter()) {
+        let al = ab.to_ascii_lowercase();
+        let bl = bb.to_ascii_lowercase();
+        match al.cmp(&bl) {
+            core::cmp::Ordering::Less => return false,
+            core::cmp::Ordering::Greater => return true,
+            core::cmp::Ordering::Equal => {}
+        }
+    }
+    an.len() > bn.len()
 }
 
 pub fn file_size<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<u32, &'static str>

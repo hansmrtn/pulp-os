@@ -24,7 +24,7 @@ use crate::fonts;
 use crate::formats::epub::{self, EpubMeta, EpubSpine};
 use crate::formats::html_strip;
 use crate::formats::zip::{self, ZipIndex};
-use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region, Widget};
+use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region};
 
 const MARGIN: u16 = 8;
 const HEADER_Y: u16 = CONTENT_TOP + 2;
@@ -115,6 +115,7 @@ pub struct ReaderApp {
 
     // persisted preference — set by main before on_enter
     book_font_size_idx: u8,
+    applied_font_idx: u8,
 }
 
 impl ReaderApp {
@@ -157,6 +158,7 @@ impl ReaderApp {
             max_lines: LINES_PER_PAGE,
 
             book_font_size_idx: 0,
+            applied_font_idx: 0,
         }
     }
 
@@ -187,6 +189,7 @@ impl ReaderApp {
             );
             self.fonts = Some(fs);
         }
+        self.applied_font_idx = self.book_font_size_idx;
     }
 
     fn name(&self) -> &str {
@@ -201,21 +204,22 @@ impl ReaderApp {
 
     // ── Bookmarks ─────────────────────────────────────────────────────────────
     //
-    // File: "BOOKMARKS" on the SD root — a flat array of BookmarkRecord structs.
-    // Layout (12 bytes each, #[repr(C)]):
-    //   name_hash  u32   FNV-1a hash of the filename bytes
-    //   page       u32   page index within chapter (or global page for .txt)
-    //   chapter    u16   EPUB chapter index; 0 for .txt
-    //   flags      u16   bit 0 = valid
+    // File: "BOOKMARKS" on the SD root — a flat array of 20-byte records.
+    // Layout:
+    //   name_hash  u32     bytes 0–3    FNV-1a of filename
+    //   page       u32     bytes 4–7    page index (within chapter for epub)
+    //   chapter    u16     bytes 8–9    epub chapter; 0 for txt
+    //   flags      u16     bytes 10–11  bit 0 = valid
+    //   name_pfx   [u8;8]  bytes 12–19  filename prefix for collision safety
     //
-    // Up to BOOKMARK_SLOTS records are stored. Lookup by hash; collisions are
-    // resolved by linear scan and a full name compare isn't needed given the
-    // tiny slot count — a hash match is treated as a hit.
+    // Lookup matches on hash AND name prefix to avoid silent wrong-position
+    // restores when two filenames collide in FNV-1a.
 
     const BOOKMARK_FILE: &'static str = "BOOKMARKS";
     const BOOKMARK_SLOTS: usize = 32;
-    const BOOKMARK_RECORD_LEN: usize = 12;
+    const BOOKMARK_RECORD_LEN: usize = 20;
     const BOOKMARK_FILE_LEN: usize = Self::BOOKMARK_SLOTS * Self::BOOKMARK_RECORD_LEN;
+    const NAME_PFX_LEN: usize = 8;
 
     // FNV-1a 32-bit hash of the current filename
     fn bookmark_key(&self) -> u32 {
@@ -227,17 +231,25 @@ impl ReaderApp {
         h
     }
 
-    // encode current position as a 12-byte record
-    fn bookmark_encode(&self) -> [u8; 12] {
+    fn name_prefix(&self) -> [u8; Self::NAME_PFX_LEN] {
+        let mut pfx = [0u8; Self::NAME_PFX_LEN];
+        let n = self.filename_len.min(Self::NAME_PFX_LEN);
+        pfx[..n].copy_from_slice(&self.filename[..n]);
+        pfx
+    }
+
+    fn bookmark_encode(&self) -> [u8; Self::BOOKMARK_RECORD_LEN] {
         let key = self.bookmark_key();
         let page = self.page as u32;
         let chapter = self.chapter;
-        let flags: u16 = 1; // valid
-        let mut rec = [0u8; 12];
+        let flags: u16 = 1;
+        let pfx = self.name_prefix();
+        let mut rec = [0u8; Self::BOOKMARK_RECORD_LEN];
         rec[0..4].copy_from_slice(&key.to_le_bytes());
         rec[4..8].copy_from_slice(&page.to_le_bytes());
         rec[8..10].copy_from_slice(&chapter.to_le_bytes());
         rec[10..12].copy_from_slice(&flags.to_le_bytes());
+        rec[12..20].copy_from_slice(&pfx);
         rec
     }
 
@@ -250,21 +262,19 @@ impl ReaderApp {
 
     fn bookmark_save<SPI: embedded_hal::spi::SpiDevice>(&self, svc: &mut Services<'_, SPI>) {
         let key = self.bookmark_key();
+        let pfx = self.name_prefix();
         let mut file_buf = [0u8; Self::BOOKMARK_FILE_LEN];
         let mut slot_count = 0usize;
 
-        // Load existing records.
         if let Ok((_, n)) = svc.read_file_start(Self::BOOKMARK_FILE, &mut file_buf) {
             slot_count = (n / Self::BOOKMARK_RECORD_LEN).min(Self::BOOKMARK_SLOTS);
         }
 
-        // Find an existing slot for this key, or pick the next free slot.
-        let mut target_slot = slot_count; // default: append
+        let mut target_slot = slot_count;
         for i in 0..slot_count {
             let base = i * Self::BOOKMARK_RECORD_LEN;
             let flags = u16::from_le_bytes([file_buf[base + 10], file_buf[base + 11]]);
             if flags & 1 == 0 {
-                // Free slot — prefer it for appending.
                 if target_slot == slot_count {
                     target_slot = i;
                 }
@@ -276,7 +286,7 @@ impl ReaderApp {
                 file_buf[base + 2],
                 file_buf[base + 3],
             ]);
-            if stored_key == key {
+            if stored_key == key && file_buf[base + 12..base + 20] == pfx {
                 target_slot = i;
                 break;
             }
@@ -310,6 +320,7 @@ impl ReaderApp {
         svc: &mut Services<'_, SPI>,
     ) -> bool {
         let key = self.bookmark_key();
+        let pfx = self.name_prefix();
         let mut file_buf = [0u8; Self::BOOKMARK_FILE_LEN];
 
         let slot_count = match svc.read_file_start(Self::BOOKMARK_FILE, &mut file_buf) {
@@ -329,7 +340,7 @@ impl ReaderApp {
                 file_buf[base + 2],
                 file_buf[base + 3],
             ]);
-            if stored_key != key {
+            if stored_key != key || file_buf[base + 12..base + 20] != pfx {
                 continue;
             }
 
@@ -999,12 +1010,12 @@ impl App for ReaderApp {
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
-        // Re-apply font metrics in case book_font_size_idx was updated via
-        // set_book_font_size() while this app was suspended under Settings.
+        let font_changed = self.book_font_size_idx != self.applied_font_idx;
         self.apply_font_metrics();
-        // A font size change also invalidates the current page layout; force
-        // a full re-wrap so line breaks match the new metrics.
-        self.reset_paging();
+        if font_changed {
+            self.reset_paging();
+            self.state = State::NeedPage;
+        }
         ctx.request_screen_redraw();
     }
 

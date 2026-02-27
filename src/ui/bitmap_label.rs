@@ -127,6 +127,10 @@ fn draw_bitmap_text(
     alignment: Alignment,
     inverted: bool,
 ) -> Result<(), Infallible> {
+    if !region.intersects(strip.logical_window()) {
+        return Ok(());
+    }
+
     let (bg, fg) = if inverted {
         (BinaryColor::On, BinaryColor::Off)
     } else {

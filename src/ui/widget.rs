@@ -69,6 +69,13 @@ impl Region {
         }
     }
 
+    pub fn intersects(self, other: Region) -> bool {
+        self.x < other.x + other.w
+            && self.x + self.w > other.x
+            && self.y < other.y + other.h
+            && self.y + self.h > other.y
+    }
+
     pub fn contains(self, point: Point) -> bool {
         point.x >= self.x as i32
             && point.x < (self.x + self.w) as i32

@@ -15,7 +15,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
-use super::strip::{STRIP_COUNT, StripBuffer}; // sibling in drivers/
+use super::strip::{STRIP_COUNT, StripBuffer};
 
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
@@ -237,31 +237,6 @@ where
 
     // ── Strip data helpers ──────────────────────────────────────
 
-    // send strip data, masking alignment-padding columns to white (0xFF) when needed;
-    // fast path skips masking and sends the raw buffer in a single SPI transaction
-    fn send_strip_data(&mut self, data: &[u8], row_bytes: usize, left_mask: u8, right_mask: u8) {
-        let needs_mask = left_mask != 0 || right_mask != 0;
-
-        if !needs_mask {
-            self.send_data(data);
-            return;
-        }
-
-        // Row-by-row: force padding columns to white (0xFF) so
-        // they don't alter the display outside the logical dirty
-        // region.  row_bytes is at most WIDTH/8 = 100.
-        let mut tmp = [0xFFu8; 100];
-        for row in data.chunks(row_bytes) {
-            let n = row.len();
-            tmp[..n].copy_from_slice(row);
-            tmp[0] |= left_mask;
-            if n > 0 {
-                tmp[n - 1] |= right_mask;
-            }
-            self.send_data(&tmp[..n]);
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips<F>(
         &mut self,
@@ -279,6 +254,7 @@ where
     {
         let max_rows = StripBuffer::max_rows_for_width(pw);
         let row_bytes = (pw / 8) as usize;
+        let needs_mask = left_mask != 0 || right_mask != 0;
 
         self.set_partial_ram_area(px, py, pw, ph);
         self.send_command(ram_cmd);
@@ -288,7 +264,16 @@ where
             let rows = max_rows.min(py + ph - y);
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
-            self.send_strip_data(strip.data(), row_bytes, left_mask, right_mask);
+
+            if needs_mask && row_bytes > 0 {
+                // Mask padding columns in-place; begin_window clears
+                // on next iteration so mutation is harmless.
+                for row in strip.data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+            }
+            self.send_data(strip.data());
             y += rows;
         }
     }

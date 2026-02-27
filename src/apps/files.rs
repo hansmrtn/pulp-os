@@ -14,8 +14,8 @@ use crate::apps::{App, AppContext, AppId, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::storage::DirEntry;
 use crate::drivers::strip::StripBuffer;
+use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::fonts::font_data;
 use crate::ui::{
     Alignment, BitmapButton, BitmapButtonStyle, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region,
 };
@@ -34,22 +34,6 @@ const ROW_H: u16 = 52;
 const ROW_GAP: u16 = 4;
 // Vertical gap between the bottom of the heading and the first list row.
 const HEADER_LIST_GAP: u16 = 8;
-
-fn body_font(idx: u8) -> &'static BitmapFont {
-    match idx {
-        1 => &font_data::REGULAR_BODY_MEDIUM,
-        2 => &font_data::REGULAR_BODY_LARGE,
-        _ => &font_data::REGULAR_BODY_SMALL,
-    }
-}
-
-fn heading_font(idx: u8) -> &'static BitmapFont {
-    match idx {
-        1 => &font_data::REGULAR_HEADING_MEDIUM,
-        2 => &font_data::REGULAR_HEADING_LARGE,
-        _ => &font_data::REGULAR_HEADING_SMALL,
-    }
-}
 
 impl Default for FilesApp {
     fn default() -> Self {
@@ -73,7 +57,7 @@ pub struct FilesApp {
 
 impl FilesApp {
     pub fn new() -> Self {
-        let hf = heading_font(0);
+        let hf = fonts::heading_font(0);
         Self {
             entries: [DirEntry::EMPTY; PAGE_SIZE],
             count: 0,
@@ -83,15 +67,15 @@ impl FilesApp {
             needs_load: false,
             stale_cache: false,
             error: None,
-            body_font: body_font(0),
+            body_font: fonts::body_font(0),
             heading_font: hf,
             list_y: CONTENT_TOP + 8 + hf.line_height + HEADER_LIST_GAP,
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
-        self.body_font = body_font(idx);
-        self.heading_font = heading_font(idx);
+        self.body_font = fonts::body_font(idx);
+        self.heading_font = fonts::heading_font(idx);
         self.list_y = CONTENT_TOP + 8 + self.heading_font.line_height + HEADER_LIST_GAP;
     }
 

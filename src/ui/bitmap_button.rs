@@ -64,6 +64,10 @@ impl<'a> BitmapButton<'a> {
     }
 
     pub fn draw(&self, strip: &mut StripBuffer) -> Result<(), Infallible> {
+        if !self.region.intersects(strip.logical_window()) {
+            return Ok(());
+        }
+
         let (bg, fg) = if self.pressed {
             (BinaryColor::On, BinaryColor::Off)
         } else {

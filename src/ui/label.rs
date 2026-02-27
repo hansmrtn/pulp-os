@@ -2,6 +2,8 @@
 // Label borrows its text; DynamicLabel<N> owns a fixed buffer
 // and implements core::fmt::Write for formatted output.
 
+use core::convert::Infallible;
+
 use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle},
     pixelcolor::BinaryColor,
@@ -11,6 +13,7 @@ use embedded_graphics::{
 };
 
 use super::widget::{Alignment, Region, Widget, WidgetState};
+use crate::drivers::strip::StripBuffer;
 
 pub struct Label<'a> {
     region: Region,
@@ -66,6 +69,15 @@ impl<'a> Label<'a> {
         };
         let height = self.font.character_size.height;
         Size::new(width, height)
+    }
+
+    // inherent method shadows Widget::draw for StripBuffer; skips
+    // work when the region is entirely outside the current strip.
+    pub fn draw(&self, strip: &mut StripBuffer) -> Result<(), Infallible> {
+        if !self.region.intersects(strip.logical_window()) {
+            return Ok(());
+        }
+        <Self as Widget>::draw(self, strip)
     }
 }
 
@@ -179,6 +191,13 @@ impl<const N: usize> DynamicLabel<N> {
         };
         let height = self.font.character_size.height;
         Size::new(width, height)
+    }
+
+    pub fn draw(&self, strip: &mut StripBuffer) -> Result<(), Infallible> {
+        if !self.region.intersects(strip.logical_window()) {
+            return Ok(());
+        }
+        <Self as Widget>::draw(self, strip)
     }
 }
 
