@@ -15,13 +15,14 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::ascii::FONT_6X13;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
-use crate::formats::epub::{self, EpubMeta, EpubSpine};
+use crate::formats::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use crate::formats::html_strip;
 use crate::formats::zip::{self, ZipIndex};
 use crate::ui::quick_menu::QuickAction;
@@ -49,22 +50,30 @@ const TEXT_W: f32 = (480 - 2 * MARGIN) as f32;
 const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
 
+// ── Progress bar ──────────────────────────────────────────────────────
+const PROGRESS_H: u16 = 2;
+const PROGRESS_Y: u16 = 800 - PROGRESS_H - 1;
+const PROGRESS_W: u16 = 480 - 2 * MARGIN;
+
 // ── Quick-action IDs ──────────────────────────────────────────────────────
 const QA_FONT_SIZE: u8 = 1;
 const QA_SAVE_BOOKMARK: u8 = 2;
 const QA_PREV_CHAPTER: u8 = 3;
 const QA_NEXT_CHAPTER: u8 = 4;
+const QA_TOC: u8 = 5;
 
 const QA_FONT_OPTIONS: &[&str] = &["Small", "Medium", "Large"];
-const QA_MAX: usize = 4;
+const QA_MAX: usize = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     NeedBookmark,
     NeedInit,
+    NeedToc,
     NeedChapter,
     NeedPage,
     Ready,
+    ShowToc,
     Error,
 }
 
@@ -117,6 +126,12 @@ pub struct ReaderApp {
     chapter_text: Vec<u8>,
     goto_last_page: bool,
 
+    // table of contents
+    toc: EpubToc,
+    toc_source: Option<TocSource>,
+    toc_selected: usize,
+    toc_scroll: usize,
+
     // fonts (None → FONT_6X13 fallback)
     fonts: Option<fonts::FontSet>,
     font_line_h: u16,
@@ -166,6 +181,11 @@ impl ReaderApp {
             chapter_text: Vec::new(),
             goto_last_page: false,
 
+            toc: EpubToc::new(),
+            toc_source: None,
+            toc_selected: 0,
+            toc_scroll: 0,
+
             fonts: None,
             font_line_h: LINE_H,
             font_ascent: LINE_H,
@@ -205,6 +225,11 @@ impl ReaderApp {
             self.qa_buf[n] = QuickAction::trigger(QA_PREV_CHAPTER, "Prev Ch", "<<<");
             n += 1;
             self.qa_buf[n] = QuickAction::trigger(QA_NEXT_CHAPTER, "Next Ch", ">>>");
+            n += 1;
+        }
+
+        if self.is_epub && !self.toc.is_empty() {
+            self.qa_buf[n] = QuickAction::trigger(QA_TOC, "Contents", "Open");
             n += 1;
         }
 
@@ -419,6 +444,30 @@ impl ReaderApp {
     }
 
     fn progress_pct(&self) -> u8 {
+        if self.is_epub && !self.spine.is_empty() {
+            let spine_len = self.spine.len() as u64;
+            let ch = self.chapter as u64;
+
+            // Last page of the last chapter → 100%
+            if ch + 1 >= spine_len && self.fully_indexed && self.page + 1 >= self.total_pages {
+                return 100;
+            }
+
+            // Within-chapter progress (0–100)
+            let in_ch = if self.file_size == 0 {
+                0u64
+            } else {
+                let pos = self.offsets[self.page] as u64;
+                let size = self.file_size as u64;
+                ((pos * 100) / size).min(100)
+            };
+
+            // Overall: (chapter * 100 + in_chapter_pct) / spine_len
+            let overall = (ch * 100 + in_ch) / spine_len;
+            return overall.min(100) as u8;
+        }
+
+        // TXT path
         if self.file_size == 0 {
             return 100;
         }
@@ -673,6 +722,10 @@ impl ReaderApp {
             &mut self.meta,
             &mut self.spine,
         )?;
+
+        // Discover TOC source while OPF bytes are still available;
+        // actual extraction is deferred to NeedToc to avoid stack overflow.
+        self.toc_source = epub::find_toc_source(&opf_data, opf_dir, &self.zip);
         drop(opf_data);
 
         log::info!(
@@ -690,8 +743,7 @@ impl ReaderApp {
             self.title_len = n;
         }
 
-        self.chapter = 0;
-        self.goto_last_page = false;
+        self.toc.clear();
 
         Ok(())
     }
@@ -1021,6 +1073,7 @@ impl App for ReaderApp {
         self.rebuild_quick_actions();
         self.reset_paging();
         self.file_size = 0;
+        self.chapter = 0;
         self.error = None;
         self.goto_last_page = false;
 
@@ -1045,6 +1098,8 @@ impl App for ReaderApp {
 
         if self.is_epub {
             self.chapter_text = Vec::new();
+            self.toc.clear();
+            self.toc_source = None;
         }
     }
 
@@ -1066,7 +1121,11 @@ impl App for ReaderApp {
     fn needs_work(&self) -> bool {
         matches!(
             self.state,
-            State::NeedBookmark | State::NeedInit | State::NeedChapter | State::NeedPage
+            State::NeedBookmark
+                | State::NeedInit
+                | State::NeedToc
+                | State::NeedChapter
+                | State::NeedPage
         )
     }
 
@@ -1103,7 +1162,7 @@ impl App for ReaderApp {
 
                 State::NeedInit => match self.epub_init(svc) {
                     Ok(()) => {
-                        self.state = State::NeedChapter;
+                        self.state = State::NeedToc;
                         continue;
                     }
                     Err(e) => {
@@ -1114,42 +1173,90 @@ impl App for ReaderApp {
                     }
                 },
 
-                State::NeedChapter => match self.epub_load_chapter(svc) {
-                    Ok(()) => {
-                        if self.goto_last_page {
-                            self.goto_last_page = false;
-                            self.scan_to_last_page();
-                            self.state = State::Ready;
-                            ctx.mark_dirty(PAGE_REGION);
-                        } else if self.page > 0 {
-                            // Bookmark requested a non-zero page within this
-                            // chapter. Scan forward until we reach it.
-                            let target = self.page;
-                            self.page = 0;
-                            while self.page < target {
-                                self.load_page_from_memory();
-                                if self.page + 1 < self.total_pages {
-                                    self.page += 1;
-                                } else {
-                                    break;
-                                }
+                State::NeedToc => {
+                    // Runs in its own on_work cycle so the epub_init
+                    // stack frames are fully unwound before we allocate
+                    // the decompression buffer for the TOC file.
+                    if let Some(source) = self.toc_source.take() {
+                        let (nb, nl) = self.name_copy();
+                        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                        let toc_idx = source.zip_index();
+
+                        let mut toc_dir_buf = [0u8; 256];
+                        let toc_dir_len = {
+                            let toc_path = self.zip.entry_name(toc_idx);
+                            let dir = toc_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                            let n = dir.len().min(toc_dir_buf.len());
+                            toc_dir_buf[..n].copy_from_slice(dir.as_bytes());
+                            n
+                        };
+                        let toc_dir =
+                            core::str::from_utf8(&toc_dir_buf[..toc_dir_len]).unwrap_or("");
+
+                        match extract_zip_entry(svc, name, &self.zip, toc_idx) {
+                            Ok(toc_data) => {
+                                epub::parse_toc(
+                                    source,
+                                    &toc_data,
+                                    toc_dir,
+                                    &self.spine,
+                                    &self.zip,
+                                    &mut self.toc,
+                                );
+                                log::info!("epub: TOC has {} entries", self.toc.len());
                             }
-                            self.load_page_from_memory();
-                            self.state = State::Ready;
-                            ctx.mark_dirty(PAGE_REGION);
-                        } else {
-                            self.load_page_from_memory();
-                            self.state = State::Ready;
+                            Err(e) => {
+                                log::warn!("epub: failed to read TOC: {}", e);
+                            }
+                        }
+                    }
+                    self.rebuild_quick_actions();
+                    self.state = State::NeedChapter;
+                    continue;
+                }
+
+                State::NeedChapter => {
+                    // epub_load_chapter calls reset_paging() which zeroes
+                    // self.page.  Save the target values first so bookmark
+                    // restore and backward-nav-to-last-page still work.
+                    let target_page = self.page;
+                    let want_last = self.goto_last_page;
+                    self.goto_last_page = false;
+
+                    match self.epub_load_chapter(svc) {
+                        Ok(()) => {
+                            if want_last {
+                                self.scan_to_last_page();
+                                self.state = State::Ready;
+                                ctx.mark_dirty(PAGE_REGION);
+                            } else if target_page > 0 {
+                                // Bookmark requested a non-zero page within this
+                                // chapter. Scan forward until we reach it.
+                                while self.page < target_page {
+                                    self.load_page_from_memory();
+                                    if self.page + 1 < self.total_pages {
+                                        self.page += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                self.load_page_from_memory();
+                                self.state = State::Ready;
+                                ctx.mark_dirty(PAGE_REGION);
+                            } else {
+                                self.load_page_from_memory();
+                                self.state = State::Ready;
+                                ctx.mark_dirty(PAGE_REGION);
+                            }
+                        }
+                        Err(e) => {
+                            log::info!("reader: chapter load failed: {}", e);
+                            self.error = Some(e);
+                            self.state = State::Error;
                             ctx.mark_dirty(PAGE_REGION);
                         }
                     }
-                    Err(e) => {
-                        log::info!("reader: chapter load failed: {}", e);
-                        self.error = Some(e);
-                        self.state = State::Error;
-                        ctx.mark_dirty(PAGE_REGION);
-                    }
-                },
+                }
 
                 State::NeedPage => {
                     if self.is_epub {
@@ -1205,7 +1312,63 @@ impl App for ReaderApp {
         }
     }
 
-    fn on_event(&mut self, event: ActionEvent, _ctx: &mut AppContext) -> Transition {
+    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
+        // ── TOC navigation ────────────────────────────────────────
+        if self.state == State::ShowToc {
+            match event {
+                ActionEvent::Press(Action::Back) => {
+                    self.state = State::Ready;
+                    ctx.mark_dirty(PAGE_REGION);
+                    return Transition::None;
+                }
+                ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
+                    if self.toc_selected + 1 < self.toc.len() {
+                        self.toc_selected += 1;
+                        let vis = (TEXT_AREA_H / self.font_line_h) as usize;
+                        if self.toc_selected >= self.toc_scroll + vis {
+                            self.toc_scroll = self.toc_selected + 1 - vis;
+                        }
+                        ctx.mark_dirty(PAGE_REGION);
+                    }
+                    return Transition::None;
+                }
+                ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
+                    if self.toc_selected > 0 {
+                        self.toc_selected -= 1;
+                        if self.toc_selected < self.toc_scroll {
+                            self.toc_scroll = self.toc_selected;
+                        }
+                        ctx.mark_dirty(PAGE_REGION);
+                    }
+                    return Transition::None;
+                }
+                ActionEvent::Press(Action::Select) | ActionEvent::Press(Action::NextJump) => {
+                    let entry = &self.toc.entries[self.toc_selected];
+                    if entry.spine_idx != 0xFFFF {
+                        log::info!(
+                            "toc: jumping to \"{}\" -> spine {}",
+                            entry.title_str(),
+                            entry.spine_idx
+                        );
+                        self.chapter = entry.spine_idx;
+                        self.page = 0;
+                        self.goto_last_page = false;
+                        self.state = State::NeedChapter;
+                    } else {
+                        log::warn!(
+                            "toc: entry \"{}\" unresolved (spine_idx=0xFFFF), ignoring",
+                            entry.title_str()
+                        );
+                        self.state = State::Ready;
+                        ctx.mark_dirty(PAGE_REGION);
+                    }
+                    return Transition::None;
+                }
+                _ => return Transition::None,
+            }
+        }
+
+        // ── Normal reader navigation ──────────────────────────────
         match event {
             ActionEvent::Press(Action::Back) => Transition::Pop,
             ActionEvent::LongPress(Action::Back) => Transition::Home,
@@ -1235,7 +1398,9 @@ impl App for ReaderApp {
     }
 
     fn help_text(&self) -> &'static str {
-        if self.is_epub {
+        if self.state == State::ShowToc {
+            "Prev/Next: move  Jump: select  Back: close"
+        } else if self.is_epub {
             "Prev/Next: page  Jump: chapter  Menu: options"
         } else {
             "Prev/Next: page  Jump: +/-10  Menu: options"
@@ -1246,7 +1411,7 @@ impl App for ReaderApp {
         &self.qa_buf[..self.qa_count]
     }
 
-    fn on_quick_trigger(&mut self, id: u8, _ctx: &mut AppContext) {
+    fn on_quick_trigger(&mut self, id: u8, ctx: &mut AppContext) {
         match id {
             QA_SAVE_BOOKMARK => {
                 // SD flush handled by main.rs via save_position
@@ -1264,6 +1429,26 @@ impl App for ReaderApp {
                     self.chapter += 1;
                     self.goto_last_page = false;
                     self.state = State::NeedChapter;
+                }
+            }
+            QA_TOC => {
+                if self.is_epub && !self.toc.is_empty() {
+                    log::info!("toc: opening ({} entries)", self.toc.len());
+                    self.toc_selected = 0;
+                    self.toc_scroll = 0;
+                    // Pre-select the current chapter in the TOC list
+                    for i in 0..self.toc.len() {
+                        if self.toc.entries[i].spine_idx == self.chapter {
+                            self.toc_selected = i;
+                            let vis = (TEXT_AREA_H / self.font_line_h) as usize;
+                            if self.toc_selected >= vis {
+                                self.toc_scroll = self.toc_selected + 1 - vis;
+                            }
+                            break;
+                        }
+                    }
+                    self.state = State::ShowToc;
+                    ctx.mark_dirty(PAGE_REGION);
                 }
             }
             _ => {}
@@ -1288,7 +1473,12 @@ impl App for ReaderApp {
             .draw(strip)
             .unwrap();
 
-        if self.is_epub && !self.spine.is_empty() {
+        if self.state == State::ShowToc {
+            let mut status = DynamicLabel::<32>::new(STATUS_REGION, &FONT_6X13)
+                .alignment(Alignment::CenterRight);
+            let _ = write!(status, "Contents");
+            status.draw(strip).unwrap();
+        } else if self.is_epub && !self.spine.is_empty() {
             let mut status = DynamicLabel::<32>::new(STATUS_REGION, &FONT_6X13)
                 .alignment(Alignment::CenterRight);
 
@@ -1338,7 +1528,63 @@ impl App for ReaderApp {
             return;
         }
 
-        if self.state != State::Ready && self.state != State::Error {
+        if self.state != State::Ready && self.state != State::Error && self.state != State::ShowToc
+        {
+            return;
+        }
+
+        // ── Table of Contents screen ──────────────────────────────
+        if self.state == State::ShowToc {
+            let toc_len = self.toc.len();
+            if self.fonts.is_some() {
+                let font = fonts::body_font(self.book_font_size_idx);
+                let line_h = font.line_height as i32;
+                let ascent = font.ascent as i32;
+                let vis_max = (TEXT_AREA_H / font.line_height) as usize;
+                let visible = vis_max.min(toc_len.saturating_sub(self.toc_scroll));
+                for i in 0..visible {
+                    let idx = self.toc_scroll + i;
+                    let entry = &self.toc.entries[idx];
+                    let y_top = TEXT_Y as i32 + i as i32 * line_h;
+                    let baseline = y_top + ascent;
+                    let selected = idx == self.toc_selected;
+
+                    if selected {
+                        Rectangle::new(Point::new(0, y_top), Size::new(480, line_h as u32))
+                            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                            .draw(strip)
+                            .unwrap();
+                    }
+
+                    let fg = if selected {
+                        BinaryColor::Off
+                    } else {
+                        BinaryColor::On
+                    };
+                    let mut cx = MARGIN as i32;
+                    if entry.spine_idx != 0xFFFF && entry.spine_idx == self.chapter {
+                        cx += font.draw_char_fg(strip, '>', fg, cx, baseline) as i32;
+                        cx += font.draw_char_fg(strip, ' ', fg, cx, baseline) as i32;
+                    }
+                    font.draw_str_fg(strip, entry.title_str(), fg, cx, baseline);
+                }
+            } else {
+                let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
+                let vis_max = (TEXT_AREA_H / LINE_H) as usize;
+                let visible = vis_max.min(toc_len.saturating_sub(self.toc_scroll));
+                for i in 0..visible {
+                    let idx = self.toc_scroll + i;
+                    let entry = &self.toc.entries[idx];
+                    let y = TEXT_Y as i32 + i as i32 * LINE_H as i32 + LINE_H as i32;
+                    let marker = if idx == self.toc_selected { "> " } else { "  " };
+                    Text::new(marker, Point::new(0, y), style)
+                        .draw(strip)
+                        .unwrap();
+                    Text::new(entry.title_str(), Point::new(MARGIN as i32, y), style)
+                        .draw(strip)
+                        .unwrap();
+                }
+            }
             return;
         }
 
@@ -1369,6 +1615,21 @@ impl App for ReaderApp {
                 Text::new(text, Point::new(MARGIN as i32, y), style)
                     .draw(strip)
                     .unwrap();
+            }
+        }
+
+        // ── Progress bar ──────────────────────────────────────────────
+        if self.state == State::Ready && (self.file_size > 0 || self.is_epub) {
+            let pct = self.progress_pct() as u32;
+            let filled_w = (PROGRESS_W as u32 * pct / 100).min(PROGRESS_W as u32);
+            if filled_w > 0 {
+                Rectangle::new(
+                    Point::new(MARGIN as i32, PROGRESS_Y as i32),
+                    Size::new(filled_w, PROGRESS_H as u32),
+                )
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(strip)
+                .unwrap();
             }
         }
     }

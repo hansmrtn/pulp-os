@@ -11,6 +11,8 @@
 // only the output buffer (uncompressed size) lives on the heap.
 // All allocations use try_reserve for graceful OOM.
 
+use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 
 // refuse to extract entries larger than this to avoid OOM
@@ -296,10 +298,24 @@ where
         .map_err(|_| "zip: chapter too large for memory")?;
     output.resize(uncomp_size, 0);
 
-    let mut decomp = DecompressorOxide::new();
+    // DecompressorOxide is ~11 KB (huffman tables) and rbuf is 4 KB.
+    // Both must live on the heap to avoid stack overflow on ESP32-C3
+    // whose main stack is limited.
+    //
+    // Box::new(DecompressorOxide::new()) would construct the struct on
+    // the stack first (~11 KB) then memcpy to the heap — still
+    // overflows.  Allocate zeroed memory directly instead.
+    // Safety: DecompressorOxide::default() is all-zeros
+    // (State::Start = 0, every other field = 0).
+    let decomp_ptr =
+        unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<DecompressorOxide>()) };
+    if decomp_ptr.is_null() {
+        return Err("zip: out of memory for decompressor");
+    }
+    let mut decomp = unsafe { Box::from_raw(decomp_ptr as *mut DecompressorOxide) };
     let mut out_pos: usize = 0;
 
-    let mut rbuf = [0u8; DEFLATE_READ_BUF];
+    let mut rbuf = vec![0u8; DEFLATE_READ_BUF];
     let mut in_avail: usize = 0;
     let mut file_pos = data_offset;
     let mut comp_left = comp_size;
@@ -334,7 +350,7 @@ where
             };
 
         let (status, consumed, produced) =
-            decompress(&mut decomp, &rbuf[..in_avail], &mut output, out_pos, flags);
+            decompress(&mut *decomp, &rbuf[..in_avail], &mut output, out_pos, flags);
 
         out_pos += produced;
 
