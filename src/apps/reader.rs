@@ -24,6 +24,7 @@ use crate::fonts;
 use crate::formats::epub::{self, EpubMeta, EpubSpine};
 use crate::formats::html_strip;
 use crate::formats::zip::{self, ZipIndex};
+use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region};
 
 const MARGIN: u16 = 8;
@@ -47,6 +48,15 @@ const NO_PREFETCH: usize = usize::MAX;
 const TEXT_W: f32 = (480 - 2 * MARGIN) as f32;
 const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
+
+// ── Quick-action IDs ──────────────────────────────────────────────────────
+const QA_FONT_SIZE: u8 = 1;
+const QA_SAVE_BOOKMARK: u8 = 2;
+const QA_PREV_CHAPTER: u8 = 3;
+const QA_NEXT_CHAPTER: u8 = 4;
+
+const QA_FONT_OPTIONS: &[&str] = &["Small", "Medium", "Large"];
+const QA_MAX: usize = 4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -116,6 +126,10 @@ pub struct ReaderApp {
     // persisted preference — set by main before on_enter
     book_font_size_idx: u8,
     applied_font_idx: u8,
+
+    // quick-action buffer (rebuilt on state changes)
+    qa_buf: [QuickAction; QA_MAX],
+    qa_count: usize,
 }
 
 impl ReaderApp {
@@ -159,6 +173,9 @@ impl ReaderApp {
 
             book_font_size_idx: 0,
             applied_font_idx: 0,
+
+            qa_buf: [QuickAction::trigger(0, "", ""); QA_MAX],
+            qa_count: 0,
         }
     }
 
@@ -166,6 +183,32 @@ impl ReaderApp {
     pub fn set_book_font_size(&mut self, idx: u8) {
         self.book_font_size_idx = idx;
         self.apply_font_metrics();
+        self.rebuild_quick_actions();
+    }
+
+    fn rebuild_quick_actions(&mut self) {
+        let mut n = 0usize;
+
+        self.qa_buf[n] = QuickAction::cycle(
+            QA_FONT_SIZE,
+            "Book Font",
+            self.book_font_size_idx,
+            QA_FONT_OPTIONS,
+        );
+        n += 1;
+
+        self.qa_buf[n] = QuickAction::trigger(QA_SAVE_BOOKMARK, "Bookmark", "Save pos");
+        n += 1;
+
+        // chapter nav only available for multi-chapter epubs
+        if self.is_epub && self.spine.len() > 1 {
+            self.qa_buf[n] = QuickAction::trigger(QA_PREV_CHAPTER, "Prev Ch", "<<<");
+            n += 1;
+            self.qa_buf[n] = QuickAction::trigger(QA_NEXT_CHAPTER, "Next Ch", ">>>");
+            n += 1;
+        }
+
+        self.qa_count = n;
     }
 
     // reinit font metrics from book_font_size_idx
@@ -975,6 +1018,7 @@ impl App for ReaderApp {
         self.title_len = n;
 
         self.is_epub = epub::is_epub_filename(self.name());
+        self.rebuild_quick_actions();
         self.reset_paging();
         self.file_size = 0;
         self.error = None;
@@ -1195,6 +1239,46 @@ impl App for ReaderApp {
             "Prev/Next: page  Jump: chapter  Menu: options"
         } else {
             "Prev/Next: page  Jump: +/-10  Menu: options"
+        }
+    }
+
+    fn quick_actions(&self) -> &[QuickAction] {
+        &self.qa_buf[..self.qa_count]
+    }
+
+    fn on_quick_trigger(&mut self, id: u8, _ctx: &mut AppContext) {
+        match id {
+            QA_SAVE_BOOKMARK => {
+                // SD flush handled by main.rs via save_position
+                log::info!("reader: bookmark save requested via quick menu");
+            }
+            QA_PREV_CHAPTER => {
+                if self.is_epub && self.chapter > 0 {
+                    self.chapter -= 1;
+                    self.goto_last_page = false;
+                    self.state = State::NeedChapter;
+                }
+            }
+            QA_NEXT_CHAPTER => {
+                if self.is_epub && (self.chapter as usize + 1) < self.spine.len() {
+                    self.chapter += 1;
+                    self.goto_last_page = false;
+                    self.state = State::NeedChapter;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_quick_cycle_update(&mut self, id: u8, value: u8, _ctx: &mut AppContext) {
+        if id == QA_FONT_SIZE {
+            self.book_font_size_idx = value;
+            self.apply_font_metrics();
+            // Re-wrap the current page with the new font metrics
+            if self.state == State::Ready {
+                self.state = State::NeedPage;
+            }
+            self.rebuild_quick_actions();
         }
     }
 

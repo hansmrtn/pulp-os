@@ -30,7 +30,7 @@ use pulp_os::apps::files::FilesApp;
 use pulp_os::apps::home::HomeApp;
 use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
-use pulp_os::apps::{App, AppId, Launcher, Redraw, Services, Transition};
+use pulp_os::apps::{App, AppContext, AppId, Launcher, Redraw, Services, Transition};
 use pulp_os::board::Board;
 use pulp_os::board::action::{Action, ActionEvent, ButtonMapper};
 use pulp_os::drivers::battery;
@@ -39,7 +39,7 @@ use pulp_os::drivers::storage::DirCache;
 use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::wake::{self, signal_timer, try_wake};
 use pulp_os::kernel::{Job, Scheduler};
-use pulp_os::ui::quick_menu::{QuickMenuResult, QuickMenuValues};
+use pulp_os::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use pulp_os::ui::{
     BAR_HEIGHT, ButtonFeedback, QuickMenu, StatusBar, SystemStatus, free_stack_bytes,
 };
@@ -243,30 +243,42 @@ fn main() -> ! {
                                     }
                                 }
                                 QuickMenuResult::Close => {
-                                    // Sync changed values back to settings
-                                    apply_quick_menu_values(
+                                    let region = quick_menu.region();
+                                    sync_quick_menu(
                                         &quick_menu,
-                                        &mut settings,
+                                        launcher.active(),
+                                        &mut home,
+                                        &mut files,
                                         &mut reader,
+                                        &mut settings,
+                                        &mut launcher.ctx,
                                     );
                                     // Redraw the area the overlay covered
                                     // to restore the app content beneath
-                                    launcher.ctx.mark_dirty(quick_menu.region());
+                                    launcher.ctx.mark_dirty(region);
                                 }
                                 QuickMenuResult::RefreshScreen => {
-                                    apply_quick_menu_values(
+                                    sync_quick_menu(
                                         &quick_menu,
-                                        &mut settings,
+                                        launcher.active(),
+                                        &mut home,
+                                        &mut files,
                                         &mut reader,
+                                        &mut settings,
+                                        &mut launcher.ctx,
                                     );
                                     // Force a full GC refresh on next render
                                     launcher.ctx.request_full_redraw();
                                 }
                                 QuickMenuResult::GoHome => {
-                                    apply_quick_menu_values(
+                                    sync_quick_menu(
                                         &quick_menu,
-                                        &mut settings,
+                                        launcher.active(),
+                                        &mut home,
+                                        &mut files,
                                         &mut reader,
+                                        &mut settings,
+                                        &mut launcher.ctx,
                                     );
                                     // Navigate home
                                     let transition = Transition::Home;
@@ -303,10 +315,40 @@ fn main() -> ! {
                                         });
                                     }
                                 }
+                                QuickMenuResult::AppTrigger(id) => {
+                                    let active = launcher.active();
+                                    let region = quick_menu.region();
+                                    sync_quick_menu(
+                                        &quick_menu,
+                                        active,
+                                        &mut home,
+                                        &mut files,
+                                        &mut reader,
+                                        &mut settings,
+                                        &mut launcher.ctx,
+                                    );
+                                    with_app!(active, home, files, reader, settings, |app| {
+                                        app.on_quick_trigger(id, &mut launcher.ctx);
+                                    });
+                                    // reader triggers always flush position to SD
+                                    if active == AppId::Reader {
+                                        let mut svc =
+                                            Services::new(&mut dir_cache, &board.storage.sd);
+                                        reader.save_position(&mut svc);
+                                    }
+                                    launcher.ctx.mark_dirty(region);
+                                    let needs =
+                                        with_app!(active, home, files, reader, settings, |app| {
+                                            app.needs_work()
+                                        });
+                                    if needs {
+                                        let _ = sched.push_unique(Job::AppWork);
+                                    }
+                                }
                             }
                         }
 
-                        // Whether consumed, closed, or GoHome —
+                        // Whether consumed, closed, or triggered —
                         // check if we need a render
                         if launcher.ctx.has_redraw() {
                             let _ = sched.push_unique(Job::Render);
@@ -316,10 +358,12 @@ fn main() -> ! {
 
                     // ── Menu toggle (open overlay) ──────────────────
                     if matches!(event, ActionEvent::Press(Action::Menu)) {
-                        let s = settings.system_settings();
-                        quick_menu.show(QuickMenuValues {
-                            book_font_size_idx: s.book_font_size_idx,
-                        });
+                        let active = launcher.active();
+                        let actions: &[_] =
+                            with_app!(active, home, files, reader, settings, |app| {
+                                app.quick_actions()
+                            });
+                        quick_menu.show(actions);
                         launcher.ctx.mark_dirty(quick_menu.region());
                         let _ = sched.push_unique(Job::Render);
                         continue;
@@ -538,14 +582,35 @@ fn update_statusbar(bar: &mut StatusBar, input: &mut InputDriver, sd_ok: bool) {
     });
 }
 
-// sync quick menu values back to settings and reader
-fn apply_quick_menu_values(qm: &QuickMenu, settings: &mut SettingsApp, reader: &mut ReaderApp) {
-    let vals = qm.values;
-    let ss = settings.system_settings_mut();
-    ss.book_font_size_idx = vals.book_font_size_idx;
-    settings.mark_save_needed();
+// sync cycle changes back to the active app; persist settings-owned values
+fn sync_quick_menu(
+    qm: &QuickMenu,
+    active: AppId,
+    home: &mut HomeApp,
+    files: &mut FilesApp,
+    reader: &mut ReaderApp,
+    settings: &mut SettingsApp,
+    ctx: &mut AppContext,
+) {
+    for id in 0..MAX_APP_ACTIONS as u8 {
+        if let Some(value) = qm.app_cycle_value(id) {
+            match active {
+                AppId::Home => home.on_quick_cycle_update(id, value, ctx),
+                AppId::Files => files.on_quick_cycle_update(id, value, ctx),
+                AppId::Reader => reader.on_quick_cycle_update(id, value, ctx),
+                AppId::Settings => settings.on_quick_cycle_update(id, value, ctx),
+            }
+        }
+    }
 
-    // Propagate font change to reader immediately so it takes
-    // effect on the next page render without a Settings detour.
-    reader.set_book_font_size(vals.book_font_size_idx);
+    // persist font size to SystemSettings so it survives across sessions
+    if active == AppId::Reader
+        && let Some(font_idx) = qm.app_cycle_value(1)
+    {
+        let ss = settings.system_settings_mut();
+        if ss.book_font_size_idx != font_idx {
+            ss.book_font_size_idx = font_idx;
+            settings.mark_save_needed();
+        }
+    }
 }

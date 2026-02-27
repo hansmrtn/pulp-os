@@ -1,21 +1,18 @@
 // Quick-action overlay — summoned by Power (Menu action) from any app.
 //
-// Renders over the bottom portion of the current screen using a
-// partial refresh.  Provides instant access to the most common
-// actions without leaving the current app.
+// Dynamic item system: core actions (Refresh, Go Home) are always
+// present at the bottom of the menu.  Each app can inject up to
+// MAX_APP_ACTIONS items that appear above the core section.
 //
-// Items:
-//   Book Font     — cycle Small / Medium / Large
-//   Refresh       — force a full GC display refresh to clear ghosting
-//   Go Home       — dismiss and navigate to HomeApp
+// Item types:
+//   Cycle   — rotates through a set of named options (e.g. font size)
+//   Trigger — fires an immediate action on Select (e.g. save bookmark)
 //
 // Navigation while open:
 //   Prev / Next          — move selection between rows
-//   PrevJump / NextJump  — decrement / increment the selected value
-//   Select               — activate the selected action row
-//   Menu or Back         — dismiss overlay, sync values to settings
-
-use core::fmt::Write as _;
+//   PrevJump / NextJump  — decrement / increment Cycle values
+//   Select               — cycle forward (Cycle) / fire action (Trigger)
+//   Menu or Back         — dismiss overlay; cycle values can be read back
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
@@ -28,7 +25,7 @@ use crate::fonts::font_data;
 // ── Layout constants ──────────────────────────────────────────────
 
 const OVERLAY_W: u16 = 400;
-const OVERLAY_X: u16 = (480 - OVERLAY_W) / 2; // centered horizontally
+const OVERLAY_X: u16 = (480 - OVERLAY_W) / 2;
 const OVERLAY_BOTTOM: u16 = 790; // 10px from screen bottom
 const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;
@@ -41,47 +38,110 @@ const LABEL_W: u16 = 150;
 const VALUE_X: u16 = LABEL_X + LABEL_W + 8;
 const VALUE_W: u16 = OVERLAY_W - 16 - LABEL_W - 8 - 16;
 const HELP_H: u16 = 20;
+const SEPARATOR_GAP: u16 = 8; // gap between app and core sections
 
-/// Items shown in the quick menu.
-const NUM_ITEMS: usize = 3;
+/// Maximum number of app-provided quick actions.
+pub const MAX_APP_ACTIONS: usize = 6;
 
-/// Indices into the item list.
-const IDX_FONT_SIZE: usize = 0;
-const IDX_REFRESH: usize = 1;
-const IDX_HOME: usize = 2;
+const NUM_CORE: usize = 2; // Refresh + Go Home
+const MAX_ITEMS: usize = MAX_APP_ACTIONS + NUM_CORE;
 
-/// Height of the full overlay including border and padding.
-const CONTENT_H: u16 = PAD_TOP + (ITEM_STRIDE * NUM_ITEMS as u16) + HELP_H + PAD_BOTTOM;
-const OVERLAY_H: u16 = CONTENT_H + BORDER * 2;
-const OVERLAY_Y: u16 = OVERLAY_BOTTOM - OVERLAY_H;
+// ── Public types ──────────────────────────────────────────────────
 
-/// The region the overlay covers — used for dirty marking.
-pub const OVERLAY_REGION: Region = Region::new(OVERLAY_X, OVERLAY_Y, OVERLAY_W, OVERLAY_H);
-
-/// Snapshot of the settings values the overlay can modify.
-#[derive(Clone, Copy)]
-pub struct QuickMenuValues {
-    pub book_font_size_idx: u8,
+#[derive(Debug, Clone, Copy)]
+pub enum QuickActionKind {
+    // rotates through named options; value is the current index
+    Cycle {
+        value: u8,
+        options: &'static [&'static str],
+    },
+    // fires immediately on Select; display is the right-column label
+    Trigger {
+        display: &'static str,
+    },
 }
 
-/// Result of quick menu interaction.
+/// App-provided quick action descriptor.  `id` is echoed back in
+/// `QuickMenuResult::AppTrigger` and keyed in `app_cycle_value`.
+#[derive(Debug, Clone, Copy)]
+pub struct QuickAction {
+    pub id: u8,
+    pub label: &'static str,
+    pub kind: QuickActionKind,
+}
+
+impl QuickAction {
+    pub const fn cycle(
+        id: u8,
+        label: &'static str,
+        value: u8,
+        options: &'static [&'static str],
+    ) -> Self {
+        Self {
+            id,
+            label,
+            kind: QuickActionKind::Cycle { value, options },
+        }
+    }
+
+    pub const fn trigger(id: u8, label: &'static str, display: &'static str) -> Self {
+        Self {
+            id,
+            label,
+            kind: QuickActionKind::Trigger { display },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuickMenuResult {
-    /// Overlay consumed the event, stay open.
     Consumed,
-    /// User dismissed the overlay; values may have changed.
     Close,
-    /// User chose "Refresh" — force a full GC display refresh.
     RefreshScreen,
-    /// User chose "Go Home" — navigate to home screen.
     GoHome,
+    AppTrigger(u8),
 }
+
+// ── Internal item representation ──────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum MenuItemKind {
+    AppCycle {
+        id: u8,
+        value: u8,
+        options: &'static [&'static str],
+    },
+    AppTrigger {
+        id: u8,
+        display: &'static str,
+    },
+    CoreRefresh,
+    CoreHome,
+}
+
+#[derive(Clone, Copy)]
+struct MenuItem {
+    label: &'static str,
+    kind: MenuItemKind,
+}
+
+impl MenuItem {
+    const EMPTY: Self = Self {
+        label: "",
+        kind: MenuItemKind::CoreRefresh,
+    };
+}
+
+// ── QuickMenu ─────────────────────────────────────────────────────
 
 pub struct QuickMenu {
     pub open: bool,
+    items: [MenuItem; MAX_ITEMS],
+    count: usize,
+    app_count: usize,
     selected: usize,
-    pub values: QuickMenuValues,
     pub dirty: bool,
+    overlay_region: Region,
 }
 
 impl Default for QuickMenu {
@@ -94,20 +154,52 @@ impl QuickMenu {
     pub const fn new() -> Self {
         Self {
             open: false,
+            items: [MenuItem::EMPTY; MAX_ITEMS],
+            count: 0,
+            app_count: 0,
             selected: 0,
-            values: QuickMenuValues {
-                book_font_size_idx: 0,
-            },
             dirty: false,
+            overlay_region: Region::new(0, 0, 0, 0),
         }
     }
 
-    /// Populate with current settings values and mark visible.
-    pub fn show(&mut self, vals: QuickMenuValues) {
-        self.values = vals;
+    // ── Lifecycle ─────────────────────────────────────────────────
+
+    // open overlay with app-provided items; core items appended automatically
+    pub fn show(&mut self, app_actions: &[QuickAction]) {
+        let n_app = app_actions.len().min(MAX_APP_ACTIONS);
+        self.app_count = n_app;
+
+        for (i, a) in app_actions.iter().enumerate().take(n_app) {
+            self.items[i] = MenuItem {
+                label: a.label,
+                kind: match a.kind {
+                    QuickActionKind::Cycle { value, options } => MenuItemKind::AppCycle {
+                        id: a.id,
+                        value,
+                        options,
+                    },
+                    QuickActionKind::Trigger { display } => {
+                        MenuItemKind::AppTrigger { id: a.id, display }
+                    }
+                },
+            };
+        }
+
+        self.items[n_app] = MenuItem {
+            label: "Refresh",
+            kind: MenuItemKind::CoreRefresh,
+        };
+        self.items[n_app + 1] = MenuItem {
+            label: "Go Home",
+            kind: MenuItemKind::CoreHome,
+        };
+
+        self.count = n_app + NUM_CORE;
         self.selected = 0;
         self.open = true;
         self.dirty = true;
+        self.overlay_region = Self::compute_region(self.count, n_app > 0);
     }
 
     pub fn hide(&mut self) {
@@ -115,91 +207,42 @@ impl QuickMenu {
         self.dirty = true;
     }
 
-    /// The screen region occupied by the overlay (for dirty marking).
+    /// Screen region the overlay occupies; used for dirty marking.
     pub fn region(&self) -> Region {
-        OVERLAY_REGION
+        self.overlay_region
     }
 
-    fn item_y(i: usize) -> u16 {
-        OVERLAY_Y + BORDER + PAD_TOP + i as u16 * ITEM_STRIDE
-    }
-
-    fn item_label_region(i: usize) -> Region {
-        Region::new(LABEL_X, Self::item_y(i), LABEL_W, ITEM_H)
-    }
-
-    fn item_value_region(i: usize) -> Region {
-        Region::new(VALUE_X, Self::item_y(i), VALUE_W, ITEM_H)
-    }
-
-    fn help_region() -> Region {
-        Region::new(
-            OVERLAY_X + 12,
-            OVERLAY_Y + BORDER + PAD_TOP + NUM_ITEMS as u16 * ITEM_STRIDE + 2,
-            OVERLAY_W - 24,
-            HELP_H,
-        )
-    }
-
-    fn item_label(i: usize) -> &'static str {
-        match i {
-            IDX_FONT_SIZE => "Book Font",
-            IDX_REFRESH => "Refresh",
-            IDX_HOME => "Go Home",
-            _ => "",
-        }
-    }
-
-    fn format_value(&self, i: usize, buf: &mut BitmapDynLabel<16>) {
-        buf.clear_text();
-        match i {
-            IDX_FONT_SIZE => {
-                let s = match self.values.book_font_size_idx {
-                    1 => "Medium",
-                    2 => "Large",
-                    _ => "Small",
-                };
-                let _ = write!(buf, "{}", s);
+    /// Current value of an app Cycle item by id; None if absent or not a Cycle.
+    pub fn app_cycle_value(&self, id: u8) -> Option<u8> {
+        for i in 0..self.app_count {
+            if let MenuItemKind::AppCycle {
+                id: item_id, value, ..
+            } = self.items[i].kind
+                && item_id == id
+            {
+                return Some(value);
             }
-            IDX_REFRESH => {
-                let _ = write!(buf, "Clear ghost");
-            }
-            IDX_HOME => {
-                let _ = write!(buf, ">>>");
-            }
-            _ => {}
         }
+        None
     }
 
-    fn increment_font(&mut self) {
-        if self.values.book_font_size_idx < 2 {
-            self.values.book_font_size_idx += 1;
-            self.dirty = true;
-        }
-    }
+    // ── Input handling ────────────────────────────────────────────
 
-    fn decrement_font(&mut self) {
-        if self.values.book_font_size_idx > 0 {
-            self.values.book_font_size_idx -= 1;
-            self.dirty = true;
-        }
-    }
-
-    /// Handle an action while the overlay is open.
-    /// Returns what the main loop should do.
     pub fn on_action(&mut self, action: Action) -> QuickMenuResult {
         match action {
             Action::Menu | Action::Back => {
                 self.hide();
                 QuickMenuResult::Close
             }
+
             Action::Next => {
-                if self.selected + 1 < NUM_ITEMS {
+                if self.selected + 1 < self.count {
                     self.selected += 1;
                     self.dirty = true;
                 }
                 QuickMenuResult::Consumed
             }
+
             Action::Prev => {
                 if self.selected > 0 {
                     self.selected -= 1;
@@ -207,89 +250,184 @@ impl QuickMenu {
                 }
                 QuickMenuResult::Consumed
             }
+
             Action::NextJump => {
-                if self.selected == IDX_FONT_SIZE {
-                    self.increment_font();
-                }
+                self.adjust_selected(1);
                 QuickMenuResult::Consumed
             }
+
             Action::PrevJump => {
-                if self.selected == IDX_FONT_SIZE {
-                    self.decrement_font();
-                }
+                self.adjust_selected(-1);
                 QuickMenuResult::Consumed
             }
-            Action::Select => match self.selected {
-                IDX_REFRESH => {
-                    self.hide();
-                    QuickMenuResult::RefreshScreen
-                }
-                IDX_HOME => {
-                    self.hide();
-                    QuickMenuResult::GoHome
-                }
-                IDX_FONT_SIZE => {
-                    // Cycle forward on Select for convenience
-                    self.values.book_font_size_idx = (self.values.book_font_size_idx + 1) % 3;
-                    self.dirty = true;
-                    QuickMenuResult::Consumed
-                }
-                _ => QuickMenuResult::Consumed,
-            },
+
+            Action::Select => self.activate_selected(),
         }
     }
 
-    /// Draw the overlay into a strip buffer.  Should be called during
-    /// any render pass (full or partial) that intersects OVERLAY_REGION
-    /// while the menu is open.  Widgets outside the strip window are
-    /// clipped automatically by StripBuffer.
+    // no-op on Trigger / core items
+    fn adjust_selected(&mut self, delta: i8) {
+        let item = &mut self.items[self.selected];
+        if let MenuItemKind::AppCycle {
+            ref mut value,
+            options,
+            ..
+        } = item.kind
+        {
+            let max = options.len().saturating_sub(1) as u8;
+            if delta > 0 && *value < max {
+                *value += 1;
+                self.dirty = true;
+            } else if delta < 0 && *value > 0 {
+                *value -= 1;
+                self.dirty = true;
+            }
+        }
+    }
+
+    // Cycle: advance value; Trigger/core: fire and close
+    fn activate_selected(&mut self) -> QuickMenuResult {
+        match &mut self.items[self.selected].kind {
+            MenuItemKind::AppCycle { value, options, .. } => {
+                let len = options.len() as u8;
+                if len > 0 {
+                    *value = (*value + 1) % len;
+                    self.dirty = true;
+                }
+                QuickMenuResult::Consumed
+            }
+            MenuItemKind::AppTrigger { id, .. } => {
+                let id = *id;
+                self.hide();
+                QuickMenuResult::AppTrigger(id)
+            }
+            MenuItemKind::CoreRefresh => {
+                self.hide();
+                QuickMenuResult::RefreshScreen
+            }
+            MenuItemKind::CoreHome => {
+                self.hide();
+                QuickMenuResult::GoHome
+            }
+        }
+    }
+
+    // ── Layout helpers ────────────────────────────────────────────
+
+    fn compute_region(total_items: usize, has_app_items: bool) -> Region {
+        let sep = if has_app_items { SEPARATOR_GAP } else { 0 };
+        let content_h = PAD_TOP + (ITEM_STRIDE * total_items as u16) + sep + HELP_H + PAD_BOTTOM;
+        let h = content_h + BORDER * 2;
+        let y = OVERLAY_BOTTOM - h;
+        Region::new(OVERLAY_X, y, OVERLAY_W, h)
+    }
+
+    // extra SEPARATOR_GAP offset once we cross into the core section
+    fn item_y(&self, i: usize) -> u16 {
+        let sep = if self.app_count > 0 && i >= self.app_count {
+            SEPARATOR_GAP
+        } else {
+            0
+        };
+        self.overlay_region.y + BORDER + PAD_TOP + i as u16 * ITEM_STRIDE + sep
+    }
+
+    fn item_label_region(&self, i: usize) -> Region {
+        Region::new(LABEL_X, self.item_y(i), LABEL_W, ITEM_H)
+    }
+
+    fn item_value_region(&self, i: usize) -> Region {
+        Region::new(VALUE_X, self.item_y(i), VALUE_W, ITEM_H)
+    }
+
+    fn help_region(&self) -> Region {
+        let last = self.count.saturating_sub(1);
+        let below_last = self.item_y(last) + ITEM_STRIDE + 2;
+        Region::new(OVERLAY_X + 12, below_last, OVERLAY_W - 24, HELP_H)
+    }
+
+    fn format_value(&self, i: usize, buf: &mut BitmapDynLabel<20>) {
+        buf.clear_text();
+        match &self.items[i].kind {
+            MenuItemKind::AppCycle { value, options, .. } => {
+                let idx = *value as usize;
+                let text = if idx < options.len() {
+                    options[idx]
+                } else {
+                    "?"
+                };
+                let _ = core::fmt::Write::write_str(buf, text);
+            }
+            MenuItemKind::AppTrigger { display, .. } => {
+                let _ = core::fmt::Write::write_str(buf, display);
+            }
+            MenuItemKind::CoreRefresh => {
+                let _ = core::fmt::Write::write_str(buf, "Clear ghost");
+            }
+            MenuItemKind::CoreHome => {
+                let _ = core::fmt::Write::write_str(buf, ">>>");
+            }
+        }
+    }
+
+    // ── Drawing ───────────────────────────────────────────────────
+
     pub fn draw(&self, strip: &mut StripBuffer) {
         if !self.open {
             return;
         }
 
-        // Always use the small body font for the overlay to keep it compact.
         let font = &font_data::REGULAR_BODY_SMALL;
+        let outer = self.overlay_region.to_rect();
 
-        let outer = OVERLAY_REGION.to_rect();
-
-        // White fill
         outer
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
             .draw(strip)
             .unwrap();
-        // Black border
         outer
             .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, BORDER as u32))
             .draw(strip)
             .unwrap();
 
-        let mut val_buf = BitmapDynLabel::<16>::new(Region::new(0, 0, 1, 1), font);
+        // separator between app and core sections
+        if self.app_count > 0 {
+            let sep_y = self.item_y(self.app_count) - SEPARATOR_GAP / 2;
+            embedded_graphics::primitives::Rectangle::new(
+                Point::new((OVERLAY_X + 20) as i32, sep_y as i32),
+                Size::new((OVERLAY_W - 40) as u32, 1),
+            )
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(strip)
+            .unwrap();
+        }
 
-        for i in 0..NUM_ITEMS {
+        let mut val_buf = BitmapDynLabel::<20>::new(Region::new(0, 0, 1, 1), font);
+
+        for i in 0..self.count {
             let selected = i == self.selected;
 
-            BitmapLabel::new(Self::item_label_region(i), Self::item_label(i), font)
+            BitmapLabel::new(self.item_label_region(i), self.items[i].label, font)
                 .alignment(Alignment::CenterLeft)
                 .inverted(selected)
                 .draw(strip)
                 .unwrap();
 
             self.format_value(i, &mut val_buf);
-            BitmapLabel::new(Self::item_value_region(i), val_buf.text(), font)
+            BitmapLabel::new(self.item_value_region(i), val_buf.text(), font)
                 .alignment(Alignment::Center)
                 .inverted(selected)
                 .draw(strip)
                 .unwrap();
         }
 
-        BitmapLabel::new(
-            Self::help_region(),
-            "Prev/Next  Jump: adjust  Sel: act  Menu: close",
-            font,
-        )
-        .alignment(Alignment::Center)
-        .draw(strip)
-        .unwrap();
+        let help = match &self.items[self.selected].kind {
+            MenuItemKind::AppCycle { .. } => "Up/Down: move  Jump: adjust  Sel: cycle  Menu: close",
+            _ => "Up/Down: move  Sel: activate  Menu: close",
+        };
+
+        BitmapLabel::new(self.help_region(), help, font)
+            .alignment(Alignment::Center)
+            .draw(strip)
+            .unwrap();
     }
 }

@@ -25,6 +25,7 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{self, DirCache, DirEntry, DirPage};
 use crate::drivers::strip::StripBuffer;
 use crate::ui::Region;
+use crate::ui::quick_menu::QuickAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
@@ -196,6 +197,17 @@ pub trait App {
     fn help_text(&self) -> &'static str {
         ""
     }
+
+    /// App-specific items for the quick menu; empty slice = core only.
+    fn quick_actions(&self) -> &[QuickAction] {
+        &[]
+    }
+
+    /// App-defined trigger fired from the quick menu; `id` from `QuickAction`.
+    fn on_quick_trigger(&mut self, _id: u8, _ctx: &mut AppContext) {}
+
+    /// Cycle value updated in the quick menu; `id` and new `value` index.
+    fn on_quick_cycle_update(&mut self, _id: u8, _value: u8, _ctx: &mut AppContext) {}
 
     // called once per strip during refresh; widgets clip automatically
     fn draw(&self, strip: &mut StripBuffer);
