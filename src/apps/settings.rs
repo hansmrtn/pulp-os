@@ -112,6 +112,12 @@ impl SystemSettings {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+impl Default for SettingsApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct SettingsApp {
     settings: SystemSettings,
     selected: usize,

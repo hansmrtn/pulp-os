@@ -63,6 +63,12 @@ pub struct AppContext {
     redraw: Redraw,
 }
 
+impl Default for AppContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppContext {
     pub const fn new() -> Self {
         Self {
@@ -219,6 +225,12 @@ pub struct Launcher {
     stack: [AppId; MAX_STACK_DEPTH],
     depth: usize,
     pub ctx: AppContext,
+}
+
+impl Default for Launcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Launcher {

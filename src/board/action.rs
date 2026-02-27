@@ -20,7 +20,6 @@ pub enum Action {
     PrevJump,
     Select,
     Back,
-    /// Toggle the quick-action overlay.
     Menu,
 }
 
@@ -56,6 +55,12 @@ impl ActionEvent {
 /// Translates physical `Event` into semantic `ActionEvent`.
 pub struct ButtonMapper {
     _private: (),
+}
+
+impl Default for ButtonMapper {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ButtonMapper {

@@ -34,7 +34,7 @@ impl BitmapFont {
     #[inline]
     pub fn glyph(&self, ch: char) -> &BitmapGlyph {
         let code = ch as u32;
-        if code >= FIRST_CHAR as u32 && code <= LAST_CHAR as u32 {
+        if (FIRST_CHAR as u32..=LAST_CHAR as u32).contains(&code) {
             &self.glyphs[(code - FIRST_CHAR as u32) as usize]
         } else {
             &self.glyphs[0] // space
@@ -57,7 +57,7 @@ impl BitmapFont {
     pub fn measure_bytes(&self, text: &[u8]) -> u16 {
         text.iter()
             .map(|&b| {
-                let ch = if b >= 0x20 && b <= 0x7E {
+                let ch = if (0x20..=0x7E).contains(&b) {
                     b as char
                 } else {
                     '?'
@@ -114,7 +114,7 @@ impl BitmapFont {
     pub fn draw_bytes(&self, strip: &mut StripBuffer, text: &[u8], cx: i32, baseline: i32) -> i32 {
         let mut x = cx;
         for &b in text {
-            let ch = if b >= 0x20 && b <= 0x7E {
+            let ch = if (0x20..=0x7E).contains(&b) {
                 b as char
             } else {
                 '?'
@@ -137,7 +137,7 @@ fn blit_glyph(
     let gy = baseline + g.offset_y as i32;
     let w = g.width as usize;
     let h = g.height as usize;
-    let stride = (w + 7) / 8;
+    let stride = w.div_ceil(8);
     let base = g.bitmap_offset as usize;
 
     if base + stride * h > bitmaps.len() {

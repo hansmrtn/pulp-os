@@ -101,10 +101,10 @@ impl<const N: usize> JobQueue<N> {
         }
         let mut i = self.head;
         for _ in 0..self.len {
-            if let Some(ref j) = self.buf[i] {
-                if j == job {
-                    return true;
-                }
+            if let Some(ref j) = self.buf[i]
+                && j == job
+            {
+                return true;
             }
             i = (i + 1) % N;
         }
@@ -128,12 +128,12 @@ impl Scheduler {
     }
 
     pub fn push(&mut self, job: Job) -> Result<(), PushError> {
-        let result = match job.priority() {
+        match job.priority() {
             Priority::High => self.high.push(job),
             Priority::Normal => self.normal.push(job),
             Priority::Low => self.low.push(job),
-        };
-        result.map_err(PushError::Full)
+        }
+        .map_err(PushError::Full)
     }
 
     pub fn push_unique(&mut self, job: Job) -> Result<(), PushError> {

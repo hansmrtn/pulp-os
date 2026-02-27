@@ -236,7 +236,7 @@ fn find_ttf(dir: &Path, keywords: &[&str]) -> Option<PathBuf> {
         .map(|e| e.path())
         .filter(|p| {
             p.extension()
-                .map(|e| e.to_ascii_lowercase() == "ttf")
+                .map(|e| e.eq_ignore_ascii_case("ttf"))
                 .unwrap_or(false)
         })
         .collect();
@@ -298,7 +298,7 @@ fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
         let (metrics, coverage) = font.rasterize(ch, px);
         let w = metrics.width;
         let h = metrics.height;
-        let row_bytes = (w + 7) / 8;
+        let row_bytes = w.div_ceil(8);
 
         // Pack coverage to 1-bit MSB-first
         let mut bits = Vec::with_capacity(row_bytes * h);
@@ -319,7 +319,7 @@ fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
         // fontdue ymin is the distance from the baseline to the bottom edge of
         // the bounding box (positive = above baseline), so the top row sits at
         // ymin + h above the baseline.  Negating gives the screen-space offset.
-        let offset_y = -(metrics.ymin as i32) - (h as i32);
+        let offset_y = -metrics.ymin - (h as i32);
 
         total_bits += bits.len();
         glyphs.push(Glyph {
@@ -379,7 +379,7 @@ fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
     writeln!(out).unwrap();
 }
 
-/// Emit a stub `Option<&BitmapFont>` = None for a missing font.
+/// Emit a zero-width stub BitmapFont for a missing font file.
 fn emit_stub(out: &mut fs::File, name: &str) {
     writeln!(
         out,

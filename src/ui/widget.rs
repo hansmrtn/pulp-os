@@ -51,7 +51,7 @@ impl Region {
         Self {
             x: aligned_x,
             y: self.y,
-            w: ((self.w + extra + 7) / 8) * 8,
+            w: (self.w + extra).div_ceil(8) * 8,
             h: self.h,
         }
     }

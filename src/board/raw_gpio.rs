@@ -15,7 +15,8 @@ pub struct RawOutputPin {
 }
 
 impl RawOutputPin {
-    // Pin must not be in active use by flash or another driver.
+    /// # Safety
+    /// Pin must not be in active use by flash or another driver.
     pub unsafe fn new(pin: u8) -> Self {
         let mask = 1u32 << pin;
 

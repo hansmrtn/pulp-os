@@ -84,6 +84,12 @@ pub struct QuickMenu {
     pub dirty: bool,
 }
 
+impl Default for QuickMenu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QuickMenu {
     pub const fn new() -> Self {
         Self {

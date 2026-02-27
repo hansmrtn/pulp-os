@@ -144,6 +144,7 @@ where
     // Step 3 ensures both planes are perfectly synced so the next
     // DU refresh has the correct "old frame" in RED RAM.
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_partial<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -261,6 +262,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_region_strips<F>(
         &mut self,
         strip: &mut StripBuffer,

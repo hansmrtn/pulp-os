@@ -22,6 +22,12 @@ pub struct EpubMeta {
     pub author_len: u8,
 }
 
+impl Default for EpubMeta {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EpubMeta {
     pub const fn new() -> Self {
         Self {
@@ -56,6 +62,12 @@ impl EpubMeta {
 pub struct EpubSpine {
     pub items: [u16; MAX_SPINE],
     pub count: u16,
+}
+
+impl Default for EpubSpine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EpubSpine {
@@ -151,11 +163,11 @@ pub fn parse_opf(
         let full_len = resolve_path(opf_dir, href_str, &mut path_buf);
         let full_path = core::str::from_utf8(&path_buf[..full_len]).unwrap_or("");
 
-        if let Some(idx) = zip.find(full_path).or_else(|| zip.find_icase(full_path)) {
-            if (spine.count as usize) < MAX_SPINE {
-                spine.items[spine.count as usize] = idx as u16;
-                spine.count += 1;
-            }
+        if let Some(idx) = zip.find(full_path).or_else(|| zip.find_icase(full_path))
+            && (spine.count as usize) < MAX_SPINE
+        {
+            spine.items[spine.count as usize] = idx as u16;
+            spine.count += 1;
         }
     }
 
@@ -276,23 +288,13 @@ fn hex_nibble(b: u8) -> Option<u8> {
 pub fn is_epub_filename(name: &str) -> bool {
     let b = name.as_bytes();
 
-    if b.len() >= 5 {
-        let e = &b[b.len() - 5..];
-        if e[0] == b'.'
-            && (e[1] | 0x20) == b'e'
-            && (e[2] | 0x20) == b'p'
-            && (e[3] | 0x20) == b'u'
-            && (e[4] | 0x20) == b'b'
-        {
-            return true;
-        }
+    // ".epub"
+    if b.len() >= 5 && b[b.len() - 5] == b'.' {
+        return b[b.len() - 4..].eq_ignore_ascii_case(b"epub");
     }
-
-    if b.len() >= 4 {
-        let e = &b[b.len() - 4..];
-        if e[0] == b'.' && (e[1] | 0x20) == b'e' && (e[2] | 0x20) == b'p' && (e[3] | 0x20) == b'u' {
-            return true;
-        }
+    // FAT 8.3 truncation: ".epu"
+    if b.len() >= 4 && b[b.len() - 4] == b'.' {
+        return b[b.len() - 3..].eq_ignore_ascii_case(b"epu");
     }
 
     false

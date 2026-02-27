@@ -16,16 +16,24 @@ use crate::drivers::storage::DirEntry;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
-use crate::ui::{Alignment, BitmapButton, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
+use crate::ui::{
+    Alignment, BitmapButton, BitmapButtonStyle, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region,
+};
 
 const PAGE_SIZE: usize = 7;
 
-// STATUS_REGION is fixed next to the header; its y matches CONTENT_TOP + 4.
-const STATUS_REGION: Region = Region::new(320, CONTENT_TOP + 4, 140, 28);
+// Centered list column: 448 px wide with 16 px margins each side.
+const LIST_X: u16 = 16;
+const LIST_W: u16 = 448;
+
+// STATUS_REGION is fixed next to the header; its y matches CONTENT_TOP + 8.
+const STATUS_REGION: Region = Region::new(320, CONTENT_TOP + 8, 144, 28);
 
 const ROW_H: u16 = 52;
+// Vertical gap between rows (border-to-border).
+const ROW_GAP: u16 = 4;
 // Vertical gap between the bottom of the heading and the first list row.
-const HEADER_LIST_GAP: u16 = 4;
+const HEADER_LIST_GAP: u16 = 8;
 
 fn body_font(idx: u8) -> &'static BitmapFont {
     match idx {
@@ -40,6 +48,12 @@ fn heading_font(idx: u8) -> &'static BitmapFont {
         1 => &font_data::REGULAR_HEADING_MEDIUM,
         2 => &font_data::REGULAR_HEADING_LARGE,
         _ => &font_data::REGULAR_HEADING_SMALL,
+    }
+}
+
+impl Default for FilesApp {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -71,14 +85,14 @@ impl FilesApp {
             error: None,
             body_font: body_font(0),
             heading_font: hf,
-            list_y: CONTENT_TOP + 4 + hf.line_height + HEADER_LIST_GAP,
+            list_y: CONTENT_TOP + 8 + hf.line_height + HEADER_LIST_GAP,
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.body_font = body_font(idx);
         self.heading_font = heading_font(idx);
-        self.list_y = CONTENT_TOP + 4 + self.heading_font.line_height + HEADER_LIST_GAP;
+        self.list_y = CONTENT_TOP + 8 + self.heading_font.line_height + HEADER_LIST_GAP;
     }
 
     pub fn selected_entry(&self) -> Option<&DirEntry> {
@@ -108,11 +122,21 @@ impl FilesApp {
     }
 
     fn row_region(&self, index: usize) -> Region {
-        Region::new(16, self.list_y + index as u16 * ROW_H, 448, ROW_H - 4)
+        Region::new(
+            LIST_X,
+            self.list_y + index as u16 * (ROW_H + ROW_GAP),
+            LIST_W,
+            ROW_H,
+        )
     }
 
     fn list_region(&self) -> Region {
-        Region::new(8, self.list_y, 464, ROW_H * PAGE_SIZE as u16)
+        Region::new(
+            LIST_X,
+            self.list_y,
+            LIST_W,
+            (ROW_H + ROW_GAP) * PAGE_SIZE as u16,
+        )
     }
 
     fn move_up(&mut self, ctx: &mut AppContext) {
@@ -139,7 +163,7 @@ impl FilesApp {
         }
     }
 
-    /// Jump backward by a full page in the file list.
+    // jump backward by a full page
     fn jump_up(&mut self) {
         if self.scroll > 0 {
             self.scroll = self.scroll.saturating_sub(PAGE_SIZE);
@@ -151,7 +175,7 @@ impl FilesApp {
         }
     }
 
-    /// Jump forward by a full page in the file list.
+    // jump forward by a full page
     fn jump_down(&mut self) {
         let remaining = self.total.saturating_sub(self.scroll + self.count);
         if remaining > 0 {
@@ -275,7 +299,8 @@ impl App for FilesApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        let header_region = Region::new(16, CONTENT_TOP + 4, 300, self.heading_font.line_height);
+        let header_region =
+            Region::new(LIST_X, CONTENT_TOP + 8, 300, self.heading_font.line_height);
         BitmapLabel::new(header_region, "Files", self.heading_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
@@ -311,7 +336,8 @@ impl App for FilesApp {
                 let entry = &self.entries[i];
                 let name = entry.name_str();
 
-                let mut btn = BitmapButton::new(region, name, self.body_font);
+                let mut btn = BitmapButton::new(region, name, self.body_font)
+                    .style(BitmapButtonStyle::Rounded(10));
                 if i == self.selected {
                     btn.set_pressed(true);
                 }

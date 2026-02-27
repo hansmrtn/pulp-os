@@ -275,6 +275,12 @@ fn main() -> ! {
                                             "app: {:?} -> {:?} (quick menu GoHome)",
                                             nav.from, nav.to
                                         );
+                                        // Save reader position before exit
+                                        if nav.from == AppId::Reader {
+                                            let mut svc =
+                                                Services::new(&mut dir_cache, &board.storage.sd);
+                                            reader.save_position(&mut svc);
+                                        }
                                         with_app!(nav.from, home, files, reader, settings, |app| {
                                             app.on_exit();
                                         });
@@ -327,6 +333,13 @@ fn main() -> ! {
 
                     if let Some(nav) = launcher.apply(transition) {
                         info!("app: {:?} -> {:?}", nav.from, nav.to);
+
+                        // Save reader position before suspending or exiting so
+                        // we can restore it on the next open.
+                        if nav.from == AppId::Reader {
+                            let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
+                            reader.save_position(&mut svc);
+                        }
 
                         if nav.suspend {
                             with_app!(nav.from, home, files, reader, settings, |app| {
@@ -525,8 +538,7 @@ fn update_statusbar(bar: &mut StatusBar, input: &mut InputDriver, sd_ok: bool) {
     });
 }
 
-/// Push values that were changed in the quick menu overlay back
-/// into SystemSettings and mark the settings file for save.
+// sync quick menu values back to settings and reader
 fn apply_quick_menu_values(qm: &QuickMenu, settings: &mut SettingsApp, reader: &mut ReaderApp) {
     let vals = qm.values;
     let ss = settings.system_settings_mut();

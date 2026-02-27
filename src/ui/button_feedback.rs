@@ -144,6 +144,12 @@ pub struct ButtonFeedback {
     mapper: ButtonMapper,
 }
 
+impl Default for ButtonFeedback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ButtonFeedback {
     pub const fn new() -> Self {
         Self {
@@ -159,10 +165,10 @@ impl ButtonFeedback {
         }
         let idx = BUMPS.iter().position(|d| d.button == button)?;
         let mut region = bump_region(&BUMPS[idx]);
-        if let Some(old) = self.active {
-            if old != idx {
-                region = region.union(bump_region(&BUMPS[old]));
-            }
+        if let Some(old) = self.active
+            && old != idx
+        {
+            region = region.union(bump_region(&BUMPS[old]));
         }
         self.active = Some(idx);
         Some(region)

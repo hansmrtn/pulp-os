@@ -59,6 +59,12 @@ pub struct ZipIndex {
     names: Vec<u8>,
 }
 
+impl Default for ZipIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZipIndex {
     pub const fn new() -> Self {
         Self {
@@ -195,12 +201,7 @@ impl ZipIndex {
             let start = e.name_start as usize;
             let end = start + e.name_len as usize;
             let entry_name = &self.names[start..end];
-            if entry_name.len() == target.len()
-                && entry_name
-                    .iter()
-                    .zip(target.iter())
-                    .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
-            {
+            if entry_name.eq_ignore_ascii_case(target) {
                 return Some(i);
             }
         }

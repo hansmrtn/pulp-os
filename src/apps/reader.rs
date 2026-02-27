@@ -50,6 +50,7 @@ const EOCD_TAIL: usize = 512;
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
+    NeedBookmark,
     NeedInit,
     NeedChapter,
     NeedPage,
@@ -65,6 +66,12 @@ struct LineSpan {
 
 impl LineSpan {
     const EMPTY: Self = Self { start: 0, len: 0 };
+}
+
+impl Default for ReaderApp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct ReaderApp {
@@ -159,10 +166,7 @@ impl ReaderApp {
         self.apply_font_metrics();
     }
 
-    /// (Re-)initialise all font-derived metrics from `book_font_size_idx`.
-    /// Call whenever the index changes *or* on resume so the reader always
-    /// uses the currently selected size, even if it was changed in Settings
-    /// while the reader was suspended in the nav stack.
+    // reinit font metrics from book_font_size_idx
     fn apply_font_metrics(&mut self) {
         self.fonts = None;
         self.font_line_h = LINE_H;
@@ -195,6 +199,163 @@ impl ReaderApp {
         (buf, self.filename_len)
     }
 
+    // ── Bookmarks ─────────────────────────────────────────────────────────────
+    //
+    // File: "BOOKMARKS" on the SD root — a flat array of BookmarkRecord structs.
+    // Layout (12 bytes each, #[repr(C)]):
+    //   name_hash  u32   FNV-1a hash of the filename bytes
+    //   page       u32   page index within chapter (or global page for .txt)
+    //   chapter    u16   EPUB chapter index; 0 for .txt
+    //   flags      u16   bit 0 = valid
+    //
+    // Up to BOOKMARK_SLOTS records are stored. Lookup by hash; collisions are
+    // resolved by linear scan and a full name compare isn't needed given the
+    // tiny slot count — a hash match is treated as a hit.
+
+    const BOOKMARK_FILE: &'static str = "BOOKMARKS";
+    const BOOKMARK_SLOTS: usize = 32;
+    const BOOKMARK_RECORD_LEN: usize = 12;
+    const BOOKMARK_FILE_LEN: usize = Self::BOOKMARK_SLOTS * Self::BOOKMARK_RECORD_LEN;
+
+    // FNV-1a 32-bit hash of the current filename
+    fn bookmark_key(&self) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        for &b in &self.filename[..self.filename_len] {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        h
+    }
+
+    // encode current position as a 12-byte record
+    fn bookmark_encode(&self) -> [u8; 12] {
+        let key = self.bookmark_key();
+        let page = self.page as u32;
+        let chapter = self.chapter;
+        let flags: u16 = 1; // valid
+        let mut rec = [0u8; 12];
+        rec[0..4].copy_from_slice(&key.to_le_bytes());
+        rec[4..8].copy_from_slice(&page.to_le_bytes());
+        rec[8..10].copy_from_slice(&chapter.to_le_bytes());
+        rec[10..12].copy_from_slice(&flags.to_le_bytes());
+        rec
+    }
+
+    // save bookmark; called synchronously by main on nav events
+    pub fn save_position<SPI: embedded_hal::spi::SpiDevice>(&self, svc: &mut Services<'_, SPI>) {
+        if self.state == State::Ready {
+            self.bookmark_save(svc);
+        }
+    }
+
+    fn bookmark_save<SPI: embedded_hal::spi::SpiDevice>(&self, svc: &mut Services<'_, SPI>) {
+        let key = self.bookmark_key();
+        let mut file_buf = [0u8; Self::BOOKMARK_FILE_LEN];
+        let mut slot_count = 0usize;
+
+        // Load existing records.
+        if let Ok((_, n)) = svc.read_file_start(Self::BOOKMARK_FILE, &mut file_buf) {
+            slot_count = (n / Self::BOOKMARK_RECORD_LEN).min(Self::BOOKMARK_SLOTS);
+        }
+
+        // Find an existing slot for this key, or pick the next free slot.
+        let mut target_slot = slot_count; // default: append
+        for i in 0..slot_count {
+            let base = i * Self::BOOKMARK_RECORD_LEN;
+            let flags = u16::from_le_bytes([file_buf[base + 10], file_buf[base + 11]]);
+            if flags & 1 == 0 {
+                // Free slot — prefer it for appending.
+                if target_slot == slot_count {
+                    target_slot = i;
+                }
+                continue;
+            }
+            let stored_key = u32::from_le_bytes([
+                file_buf[base],
+                file_buf[base + 1],
+                file_buf[base + 2],
+                file_buf[base + 3],
+            ]);
+            if stored_key == key {
+                target_slot = i;
+                break;
+            }
+        }
+
+        if target_slot >= Self::BOOKMARK_SLOTS {
+            // All slots full; overwrite slot 0 (LRU would be nicer but costly).
+            target_slot = 0;
+        }
+
+        let base = target_slot * Self::BOOKMARK_RECORD_LEN;
+        let rec = self.bookmark_encode();
+        file_buf[base..base + Self::BOOKMARK_RECORD_LEN].copy_from_slice(&rec);
+
+        let new_len = ((target_slot + 1).max(slot_count)) * Self::BOOKMARK_RECORD_LEN;
+
+        match svc.write_file(Self::BOOKMARK_FILE, &file_buf[..new_len]) {
+            Ok(_) => log::info!(
+                "bookmark: saved page={} ch={} for key={:#010x}",
+                self.page,
+                self.chapter,
+                key
+            ),
+            Err(e) => log::warn!("bookmark: save failed: {}", e),
+        }
+    }
+
+    // restore a saved bookmark; returns true if found
+    fn bookmark_load<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> bool {
+        let key = self.bookmark_key();
+        let mut file_buf = [0u8; Self::BOOKMARK_FILE_LEN];
+
+        let slot_count = match svc.read_file_start(Self::BOOKMARK_FILE, &mut file_buf) {
+            Ok((_, n)) => (n / Self::BOOKMARK_RECORD_LEN).min(Self::BOOKMARK_SLOTS),
+            Err(_) => return false,
+        };
+
+        for i in 0..slot_count {
+            let base = i * Self::BOOKMARK_RECORD_LEN;
+            let flags = u16::from_le_bytes([file_buf[base + 10], file_buf[base + 11]]);
+            if flags & 1 == 0 {
+                continue;
+            }
+            let stored_key = u32::from_le_bytes([
+                file_buf[base],
+                file_buf[base + 1],
+                file_buf[base + 2],
+                file_buf[base + 3],
+            ]);
+            if stored_key != key {
+                continue;
+            }
+
+            let page = u32::from_le_bytes([
+                file_buf[base + 4],
+                file_buf[base + 5],
+                file_buf[base + 6],
+                file_buf[base + 7],
+            ]) as usize;
+            let chapter = u16::from_le_bytes([file_buf[base + 8], file_buf[base + 9]]);
+
+            log::info!(
+                "bookmark: restoring page={} ch={} for key={:#010x}",
+                page,
+                chapter,
+                key
+            );
+
+            self.page = page;
+            self.chapter = chapter;
+            return true;
+        }
+
+        false
+    }
+
     fn display_name(&self) -> &str {
         if self.title_len > 0 {
             core::str::from_utf8(&self.title[..self.title_len]).unwrap_or(self.name())
@@ -218,16 +379,14 @@ impl ReaderApp {
     fn wrap_lines_counted(&mut self, n: usize) -> usize {
         let fonts_copy = self.fonts;
 
-        let consumed = if let Some(fs) = fonts_copy {
+        if let Some(fs) = fonts_copy {
             let (c, count) =
                 wrap_proportional(&self.buf, n, &fs, &mut self.lines, self.max_lines, TEXT_W);
             self.line_count = count;
             c
         } else {
             self.wrap_monospace(n)
-        };
-
-        consumed
+        }
     }
 
     fn wrap_monospace(&mut self, n: usize) -> usize {
@@ -595,7 +754,7 @@ impl ReaderApp {
         false
     }
 
-    /// Jump to next chapter (epub) or forward 10 pages (txt).
+    // next chapter (epub) or +10 pages (txt)
     fn jump_forward(&mut self) -> bool {
         if self.state != State::Ready {
             return false;
@@ -623,7 +782,7 @@ impl ReaderApp {
         false
     }
 
-    /// Jump to previous chapter (epub) or back 10 pages (txt).
+    // prev chapter (epub) or -10 pages (txt)
     fn jump_backward(&mut self) -> bool {
         if self.state != State::Ready {
             return false;
@@ -812,18 +971,11 @@ impl App for ReaderApp {
 
         self.apply_font_metrics();
 
-        if self.is_epub {
-            self.zip.clear();
-            self.meta = EpubMeta::new();
-            self.spine = EpubSpine::new();
-            self.chapter = 0;
-            self.chapter_text.clear();
-            self.state = State::NeedInit;
-            log::info!("reader: opening epub {}", self.name());
-        } else {
-            self.state = State::NeedPage;
-            log::info!("reader: opening txt {}", self.name());
-        }
+        // Load the bookmark first; the actual book init follows in on_work
+        // after we know the saved position.
+        self.state = State::NeedBookmark;
+
+        log::info!("reader: opening {}", self.name());
 
         // Full GC refresh for the initial screen transition.
         // Subsequent page turns in on_work use mark_dirty (DU partial).
@@ -841,7 +993,10 @@ impl App for ReaderApp {
         }
     }
 
-    fn on_suspend(&mut self) {}
+    fn on_suspend(&mut self) {
+        // Position is saved synchronously by main.rs via save_position()
+        // before this is called, so nothing extra is needed here.
+    }
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
         // Re-apply font metrics in case book_font_size_idx was updated via
@@ -856,7 +1011,7 @@ impl App for ReaderApp {
     fn needs_work(&self) -> bool {
         matches!(
             self.state,
-            State::NeedInit | State::NeedChapter | State::NeedPage
+            State::NeedBookmark | State::NeedInit | State::NeedChapter | State::NeedPage
         )
     }
 
@@ -867,6 +1022,30 @@ impl App for ReaderApp {
     ) {
         loop {
             match self.state {
+                State::NeedBookmark => {
+                    let found = self.bookmark_load(svc);
+                    if self.is_epub {
+                        if found {
+                            // chapter was restored; NeedInit will load that chapter
+                            // and page_forward will position within it.
+                        }
+                        self.zip.clear();
+                        self.meta = EpubMeta::new();
+                        self.spine = EpubSpine::new();
+                        self.chapter_text.clear();
+                        // goto_last_page only when bookmark says page > 0
+                        self.goto_last_page = false;
+                        self.state = State::NeedInit;
+                    } else {
+                        // For TXT, page index maps directly to offsets[].
+                        // We'll seek to offsets[page] once NeedPage runs and
+                        // the offset table is populated. If page == 0 nothing
+                        // special is needed.
+                        self.state = State::NeedPage;
+                    }
+                    continue;
+                }
+
                 State::NeedInit => match self.epub_init(svc) {
                     Ok(()) => {
                         self.state = State::NeedChapter;
@@ -885,6 +1064,22 @@ impl App for ReaderApp {
                         if self.goto_last_page {
                             self.goto_last_page = false;
                             self.scan_to_last_page();
+                            self.state = State::Ready;
+                            ctx.mark_dirty(PAGE_REGION);
+                        } else if self.page > 0 {
+                            // Bookmark requested a non-zero page within this
+                            // chapter. Scan forward until we reach it.
+                            let target = self.page;
+                            self.page = 0;
+                            while self.page < target {
+                                self.load_page_from_memory();
+                                if self.page + 1 < self.total_pages {
+                                    self.page += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.load_page_from_memory();
                             self.state = State::Ready;
                             ctx.mark_dirty(PAGE_REGION);
                         } else {
@@ -907,16 +1102,43 @@ impl App for ReaderApp {
                         self.state = State::Ready;
                         ctx.mark_dirty(PAGE_REGION);
                     } else {
-                        match self.load_and_prefetch(svc) {
-                            Ok(()) => {
+                        // If we have a bookmark target page but haven't yet
+                        // walked the offset table that far, scan forward first.
+                        let target_page = self.page;
+                        if target_page > 0 && self.offsets[target_page] == 0 {
+                            // Reset to page 0 and walk forward, building offsets.
+                            self.page = 0;
+                            loop {
+                                match self.load_and_prefetch(svc) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        self.error = Some(e);
+                                        self.state = State::Error;
+                                        ctx.mark_dirty(PAGE_REGION);
+                                        break;
+                                    }
+                                }
+                                if self.page >= target_page || self.page + 1 >= self.total_pages {
+                                    break;
+                                }
+                                self.page += 1;
+                            }
+                            if self.state != State::Error {
                                 self.state = State::Ready;
                                 ctx.mark_dirty(PAGE_REGION);
                             }
-                            Err(e) => {
-                                log::info!("reader: load failed: {}", e);
-                                self.error = Some(e);
-                                self.state = State::Error;
-                                ctx.mark_dirty(PAGE_REGION);
+                        } else {
+                            match self.load_and_prefetch(svc) {
+                                Ok(()) => {
+                                    self.state = State::Ready;
+                                    ctx.mark_dirty(PAGE_REGION);
+                                }
+                                Err(e) => {
+                                    log::info!("reader: load failed: {}", e);
+                                    self.error = Some(e);
+                                    self.state = State::Error;
+                                    ctx.mark_dirty(PAGE_REGION);
+                                }
                             }
                         }
                     }
@@ -971,7 +1193,7 @@ impl App for ReaderApp {
             .draw(strip)
             .unwrap();
 
-        if self.is_epub && self.spine.len() > 0 {
+        if self.is_epub && !self.spine.is_empty() {
             let mut status = DynamicLabel::<32>::new(STATUS_REGION, &FONT_6X13)
                 .alignment(Alignment::CenterRight);
 

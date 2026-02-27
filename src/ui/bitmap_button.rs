@@ -12,12 +12,23 @@ use super::widget::{Alignment, Region};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Default corner radius for the Rounded style.
+pub const DEFAULT_RADIUS: u32 = 8;
+
+/// Inner horizontal padding (px each side) so text doesn't hug the border.
+const TEXT_PAD_X: u16 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BitmapButtonStyle {
-    #[default]
     Outlined,
     Filled,
     Rounded(u32),
+}
+
+impl Default for BitmapButtonStyle {
+    fn default() -> Self {
+        BitmapButtonStyle::Rounded(DEFAULT_RADIUS)
+    }
 }
 
 pub struct BitmapButton<'a> {
@@ -34,7 +45,7 @@ impl<'a> BitmapButton<'a> {
             region,
             label,
             font,
-            style: BitmapButtonStyle::Outlined,
+            style: BitmapButtonStyle::default(),
             pressed: false,
         }
     }
@@ -94,9 +105,21 @@ impl<'a> BitmapButton<'a> {
             _ => fg,
         };
 
-        let text_w = self.font.measure_str(self.label) as u32;
+        // Constrain text measurement to the padded inner width so long labels
+        // don't visually collide with the rounded border corners.
+        let inner_w = self.region.w.saturating_sub(TEXT_PAD_X * 2) as u32;
+        let text_w = (self.font.measure_str(self.label) as u32).min(inner_w);
         let text_h = self.font.line_height as u32;
-        let top_left = Alignment::Center.position(self.region, Size::new(text_w, text_h));
+
+        // Centre text within the full region; the min() above nudges it inward
+        // if it would otherwise overflow.
+        let inner_region = Region::new(
+            self.region.x + TEXT_PAD_X,
+            self.region.y,
+            self.region.w.saturating_sub(TEXT_PAD_X * 2),
+            self.region.h,
+        );
+        let top_left = Alignment::Center.position(inner_region, Size::new(text_w, text_h));
         let baseline = top_left.y + self.font.ascent as i32;
 
         self.font

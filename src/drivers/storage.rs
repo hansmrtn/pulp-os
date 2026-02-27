@@ -45,6 +45,12 @@ pub struct DirCache {
     valid: bool,
 }
 
+impl Default for DirCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirCache {
     pub const fn new() -> Self {
         Self {

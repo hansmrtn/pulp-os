@@ -33,6 +33,12 @@ pub struct StatusBar {
     len: usize,
 }
 
+impl Default for StatusBar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StatusBar {
     pub const fn new() -> Self {
         Self {
@@ -121,7 +127,7 @@ pub fn free_stack_bytes() -> usize {
 
     // ESP32-C3 DRAM: 0x3FC80000..0x3FCE0000 (400KB)
     const DRAM_BASE: usize = 0x3FC8_0000;
-    if sp > DRAM_BASE { sp - DRAM_BASE } else { 0 }
+    sp.saturating_sub(DRAM_BASE)
 }
 
 struct BufWriter<'a> {

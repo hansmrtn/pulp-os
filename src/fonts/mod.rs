@@ -36,6 +36,12 @@ pub struct FontSet {
     heading: &'static BitmapFont,
 }
 
+impl Default for FontSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FontSet {
     pub fn small() -> Self {
         let regular = &font_data::REGULAR_BODY_SMALL;
@@ -114,7 +120,6 @@ impl FontSet {
         }
     }
 
-    // alias for FontSet::small(); kept for existing call-sites
     pub fn new() -> Self {
         Self::small()
     }
@@ -146,7 +151,7 @@ impl FontSet {
 
     #[inline]
     pub fn advance_byte(&self, b: u8, style: Style) -> u8 {
-        let ch = if b >= 0x20 && b <= 0x7E {
+        let ch = if (0x20..=0x7E).contains(&b) {
             b as char
         } else {
             '?'

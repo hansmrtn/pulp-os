@@ -65,10 +65,8 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
             }
             let tag = &tn[..tn_len];
 
-            if !is_close {
-                if let Some(sk) = SkipTag::from_name(tag) {
-                    skip_until = Some(sk);
-                }
+            if !is_close && let Some(sk) = SkipTag::from_name(tag) {
+                skip_until = Some(sk);
             }
 
             if is_block_element(tag) {
@@ -101,7 +99,7 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
             r += advance;
 
             match decoded {
-                DecodedChar::Byte(c) if c == b'\n' => {
+                DecodedChar::Byte(b'\n') => {
                     buf[w] = b'\n';
                     w += 1;
                     trailing_nl = trailing_nl.saturating_add(1);
@@ -341,8 +339,8 @@ fn codepoint_to_decoded(cp: u32) -> DecodedChar {
         0x00A0 => DecodedChar::Byte(b' '),
         0x00AD => DecodedChar::Byte(b'-'),
         0x2013 | 0x2014 => DecodedChar::Byte(b'-'),
-        0x2018 | 0x2019 | 0x201A => DecodedChar::Byte(b'\''),
-        0x201C | 0x201D | 0x201E => DecodedChar::Byte(b'"'),
+        0x2018..=0x201A => DecodedChar::Byte(b'\''),
+        0x201C..=0x201E => DecodedChar::Byte(b'"'),
         0x2022 => DecodedChar::Byte(b'*'),
         0x2026 => DecodedChar::Byte(b'.'),
         _ => DecodedChar::Unicode(()),

@@ -5,15 +5,17 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
-use crate::ui::{Alignment, BitmapButton, BitmapLabel, CONTENT_TOP, Region};
+use crate::ui::{Alignment, BitmapButton, BitmapButtonStyle, BitmapLabel, CONTENT_TOP, Region};
 
-const ITEM_H: u16 = 48;
-const ITEM_GAP: u16 = 16;
+// Screen is 480 px wide. Center a 280 px column.
+const ITEM_W: u16 = 280;
+const ITEM_H: u16 = 52;
+const ITEM_GAP: u16 = 14;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
-const ITEM_X: u16 = 16;
-const ITEM_W: u16 = 200;
+const ITEM_X: u16 = (480 - ITEM_W) / 2; // 100
+
 // Gap between the bottom of the title and the first menu item.
-const TITLE_ITEM_GAP: u16 = 16;
+const TITLE_ITEM_GAP: u16 = 24;
 
 struct MenuItem {
     name: &'static str,
@@ -52,7 +54,7 @@ fn heading_font(idx: u8) -> &'static BitmapFont {
 }
 
 fn compute_item_regions(heading_line_h: u16) -> [Region; 3] {
-    let item_y = CONTENT_TOP + heading_line_h + TITLE_ITEM_GAP;
+    let item_y = CONTENT_TOP + 8 + heading_line_h + TITLE_ITEM_GAP;
     [
         Region::new(ITEM_X, item_y, ITEM_W, ITEM_H),
         Region::new(ITEM_X, item_y + ITEM_STRIDE, ITEM_W, ITEM_H),
@@ -65,6 +67,12 @@ pub struct HomeApp {
     body_font: &'static BitmapFont,
     heading_font: &'static BitmapFont,
     item_regions: [Region; 3],
+}
+
+impl Default for HomeApp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HomeApp {
@@ -121,14 +129,21 @@ impl App for HomeApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        let title_region = Region::new(16, CONTENT_TOP, 448, self.heading_font.line_height);
+        // Title centred across the full content width.
+        let title_region = Region::new(
+            ITEM_X,
+            CONTENT_TOP + 8,
+            ITEM_W,
+            self.heading_font.line_height,
+        );
         BitmapLabel::new(title_region, "pulp-os", self.heading_font)
-            .alignment(Alignment::CenterLeft)
+            .alignment(Alignment::Center)
             .draw(strip)
             .unwrap();
 
         for (i, item) in ITEMS.iter().enumerate() {
-            let mut btn = BitmapButton::new(self.item_regions[i], item.name, self.body_font);
+            let mut btn = BitmapButton::new(self.item_regions[i], item.name, self.body_font)
+                .style(BitmapButtonStyle::Rounded(10));
             if i == self.selected {
                 btn.set_pressed(true);
             }

@@ -48,11 +48,11 @@ static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::n
 fn gpio_handler() {
     // power button -- pin in static, cleared via esp_hal API
     critical_section::with(|cs| {
-        if let Some(btn) = POWER_BTN.borrow_ref_mut(cs).as_mut() {
-            if btn.is_interrupt_set() {
-                btn.clear_interrupt();
-                wake::signal_button();
-            }
+        if let Some(btn) = POWER_BTN.borrow_ref_mut(cs).as_mut()
+            && btn.is_interrupt_set()
+        {
+            btn.clear_interrupt();
+            wake::signal_button();
         }
     });
 
