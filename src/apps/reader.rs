@@ -30,6 +30,9 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::formats::cache;
 use crate::formats::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
+use crate::formats::html_strip::{
+    BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF, QUOTE_ON,
+};
 use crate::formats::zip::{self, ZipIndex};
 use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region};
@@ -55,6 +58,7 @@ const NO_PREFETCH: usize = usize::MAX;
 const TEXT_W: f32 = (480 - 2 * MARGIN) as f32;
 const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
+const INDENT_PX: u32 = 24; // pixels per blockquote indent level
 
 // ── Progress bar ──────────────────────────────────────────────────────
 const PROGRESS_H: u16 = 2;
@@ -88,10 +92,41 @@ enum State {
 struct LineSpan {
     start: u16,
     len: u16,
+    /// Style flags at the start of this line (carried from wrap state).
+    /// bit 0: bold, bit 1: italic, bit 2: heading
+    flags: u8,
+    /// Blockquote indent depth (0 = none, 1+ = nested quotes).
+    /// Each level indents the line further.
+    indent: u8,
 }
 
 impl LineSpan {
-    const EMPTY: Self = Self { start: 0, len: 0 };
+    const EMPTY: Self = Self {
+        start: 0,
+        len: 0,
+        flags: 0,
+        indent: 0,
+    };
+
+    const FLAG_BOLD: u8 = 1 << 0;
+    const FLAG_ITALIC: u8 = 1 << 1;
+    const FLAG_HEADING: u8 = 1 << 2;
+
+    fn style(&self) -> fonts::Style {
+        if self.flags & Self::FLAG_HEADING != 0 {
+            fonts::Style::Heading
+        } else if self.flags & Self::FLAG_BOLD != 0 {
+            fonts::Style::Bold
+        } else if self.flags & Self::FLAG_ITALIC != 0 {
+            fonts::Style::Italic
+        } else {
+            fonts::Style::Regular
+        }
+    }
+
+    fn pack_flags(bold: bool, italic: bool, heading: bool) -> u8 {
+        (bold as u8) | ((italic as u8) << 1) | ((heading as u8) << 2)
+    }
 }
 
 impl Default for ReaderApp {
@@ -556,6 +591,8 @@ impl ReaderApp {
             self.lines[self.line_count] = LineSpan {
                 start: start as u16,
                 len: (end - start) as u16,
+                flags: 0,
+                indent: 0,
             };
             self.line_count += 1;
         }
@@ -995,12 +1032,32 @@ fn wrap_proportional(
     max_width_px: f32,
 ) -> (usize, usize) {
     let max_l = max_lines.min(lines.len());
-    let max_w = max_width_px as u32;
+    let base_max_w = max_width_px as u32;
     let mut lc: usize = 0;
     let mut ls: usize = 0;
     let mut px: u32 = 0;
     let mut sp: usize = 0;
     let mut sp_px: u32 = 0;
+
+    // Style state — carried across lines, updated by markers
+    let mut bold = false;
+    let mut italic = false;
+    let mut heading = false;
+    let mut indent: u8 = 0;
+    let mut max_w = base_max_w;
+
+    #[inline]
+    fn current_style(bold: bool, italic: bool, heading: bool) -> fonts::Style {
+        if heading {
+            fonts::Style::Heading
+        } else if bold {
+            fonts::Style::Bold
+        } else if italic {
+            fonts::Style::Italic
+        } else {
+            fonts::Style::Regular
+        }
+    }
 
     macro_rules! emit {
         ($start:expr, $end:expr) => {
@@ -1009,18 +1066,43 @@ fn wrap_proportional(
                 lines[lc] = LineSpan {
                     start: ($start) as u16,
                     len: (e - ($start)) as u16,
+                    flags: LineSpan::pack_flags(bold, italic, heading),
+                    indent,
                 };
                 lc += 1;
             }
         };
     }
 
-    let sty = fonts::Style::Regular;
-
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         let b = buf[i];
 
+        // 2-byte style markers: [MARKER, tag] — zero width, update state
+        if b == MARKER && i + 1 < n {
+            match buf[i + 1] {
+                BOLD_ON => bold = true,
+                BOLD_OFF => bold = false,
+                ITALIC_ON => italic = true,
+                ITALIC_OFF => italic = false,
+                HEADING_ON => heading = true,
+                HEADING_OFF => heading = false,
+                QUOTE_ON => {
+                    indent = indent.saturating_add(1);
+                    max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
+                }
+                QUOTE_OFF => {
+                    indent = indent.saturating_sub(1);
+                    max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
+                }
+                _ => {}
+            }
+            i += 2;
+            continue;
+        }
+
         if b == b'\r' {
+            i += 1;
             continue;
         }
 
@@ -1033,16 +1115,17 @@ fn wrap_proportional(
             if lc >= max_l {
                 return (ls, lc);
             }
+            i += 1;
             continue;
         }
 
+        let sty = current_style(bold, italic, heading);
         let adv = fonts.advance_byte(b, sty) as u32;
 
         if b == b' ' {
             px += adv;
             sp = i + 1;
             sp_px = px;
-            // Space itself pushed us over — break before it
             if px > max_w {
                 emit!(ls, i);
                 ls = i + 1;
@@ -1053,6 +1136,7 @@ fn wrap_proportional(
                     return (ls, lc);
                 }
             }
+            i += 1;
             continue;
         }
 
@@ -1075,6 +1159,8 @@ fn wrap_proportional(
                 return (ls, lc);
             }
         }
+
+        i += 1;
     }
 
     if ls < n && lc < max_l {
@@ -1083,6 +1169,8 @@ fn wrap_proportional(
             lines[lc] = LineSpan {
                 start: ls as u16,
                 len: (e - ls) as u16,
+                flags: LineSpan::pack_flags(bold, italic, heading),
+                indent,
             };
             lc += 1;
         }
@@ -1685,13 +1773,36 @@ impl App for ReaderApp {
                 let start = span.start as usize;
                 let end = start + span.len as usize;
                 let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
-                fs.draw_bytes(
-                    strip,
-                    &self.buf[start..end],
-                    fonts::Style::Regular,
-                    MARGIN as i32,
-                    baseline,
-                );
+                let x_indent = INDENT_PX as i32 * span.indent as i32;
+
+                // Style-marker-aware rendering: walk bytes, switch
+                // fonts on [MARKER, tag] pairs, draw everything else.
+                let line = &self.buf[start..end];
+                let mut cx = MARGIN as i32 + x_indent;
+                let mut sty = span.style();
+                let mut j = 0usize;
+                while j < line.len() {
+                    let b = line[j];
+                    if b == MARKER && j + 1 < line.len() {
+                        sty = match line[j + 1] {
+                            BOLD_ON => fonts::Style::Bold,
+                            ITALIC_ON => fonts::Style::Italic,
+                            HEADING_ON => fonts::Style::Heading,
+                            BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
+                            _ => sty,
+                        };
+                        j += 2;
+                        continue;
+                    }
+                    let ch = if (0x20..=0x7E).contains(&b) {
+                        b as char
+                    } else {
+                        j += 1;
+                        continue; // skip non-printable (stray marker bytes, etc.)
+                    };
+                    cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
+                    j += 1;
+                }
             }
         } else {
             let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
