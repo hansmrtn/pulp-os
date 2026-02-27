@@ -98,7 +98,7 @@ pub const TOC_TITLE_CAP: usize = 48;
 pub struct TocEntry {
     pub title: [u8; TOC_TITLE_CAP],
     pub title_len: u8,
-    /// Index into `EpubSpine::items`; `0xFFFF` = unresolved / not in spine.
+    // index into EpubSpine::items; 0xFFFF = unresolved
     pub spine_idx: u16,
 }
 
@@ -161,13 +161,11 @@ impl EpubToc {
     }
 }
 
-/// Where the TOC data lives inside the EPUB ZIP.
+// where the TOC data lives inside the EPUB ZIP
 #[derive(Clone, Copy, Debug)]
 pub enum TocSource {
-    /// EPUB 2 NCX file (zip entry index).
-    Ncx(usize),
-    /// EPUB 3 navigation document (zip entry index).
-    Nav(usize),
+    Ncx(usize), // EPUB 2 NCX
+    Nav(usize), // EPUB 3 nav document
 }
 
 impl TocSource {
@@ -302,10 +300,7 @@ pub fn parse_opf(
 
 // ── TOC discovery and parsing ─────────────────────────────────────────────
 
-/// Scan the OPF to locate the TOC file in the ZIP.
-///
-/// Checks EPUB 3 first (`<item properties="nav">`), then falls back to
-/// EPUB 2 (`<spine toc="ncx_id">` → manifest lookup).
+// locate TOC in ZIP: EPUB 3 nav first, then EPUB 2 NCX fallback
 pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocSource> {
     let mut path_buf = [0u8; 512];
 
@@ -425,10 +420,7 @@ pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocS
     None
 }
 
-/// Convenience dispatcher — parses TOC data using the correct format.
-///
-/// `data` is the decompressed TOC file content; `toc_dir` is the
-/// directory containing the TOC file (for resolving relative hrefs).
+// dispatch TOC parse by format (NCX vs nav)
 pub fn parse_toc(
     source: TocSource,
     data: &[u8],
@@ -443,11 +435,7 @@ pub fn parse_toc(
     }
 }
 
-/// Parse an EPUB 2 NCX file (`toc.ncx`) into flat TOC entries.
-///
-/// Linear scan: tracks the most-recent `<text>` content and pairs it
-/// with the next `<content src="...">` to produce each entry.  Nested
-/// `<navPoint>` elements are flattened automatically.
+// parse EPUB 2 NCX into flat TOC entries (nested navPoints flattened)
 pub fn parse_ncx_toc(
     ncx: &[u8],
     ncx_dir: &str,
@@ -529,11 +517,7 @@ pub fn parse_ncx_toc(
     }
 }
 
-/// Parse an EPUB 3 navigation document (XHTML with `<nav epub:type="toc">`).
-///
-/// Locates the `<nav>` element with `epub:type="toc"`, then extracts
-/// `<a href="...">Title</a>` entries from within it.  Nested `<ol>`
-/// lists (sub-chapters) are flattened.
+// parse EPUB 3 nav document; extract <a> entries, flatten nested <ol>
 pub fn parse_nav_toc(
     nav: &[u8],
     nav_dir: &str,

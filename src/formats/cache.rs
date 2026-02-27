@@ -1,40 +1,8 @@
 // EPUB chapter cache — streaming decompress + HTML strip
 //
-// Streams ZIP entry data through a DEFLATE decompressor and an HTML
-// stripper, producing plain text chunks via a caller-provided callback.
-// No persistent heap allocation — the decompressor and its 32 KB
-// dictionary window are temporary and freed when the function returns.
-//
-// Cache layout (per book, in a subdirectory of root):
-//
-//   _XXXXXXX/          8.3 dir name: '_' + 7 hex chars of FNV-1a hash
-//     META.BIN          validation header + per-chapter text sizes
-//     CH000.TXT         stripped plain text, chapter 0
-//     CH001.TXT         stripped plain text, chapter 1
-//     ...
-//
-// META.BIN format (little-endian):
-//
-//   [0..4)   magic:   0x504C5043 ("PLPC")
-//   [4)      version: 1
-//   [5)      chapter_count: 0–255
-//   [6..8)   reserved: 0
-//   [8..12)  epub_file_size: u32
-//   [12..16) epub_name_hash: u32
-//   [16..)   chapter_sizes: [u32; chapter_count]
-//
-// Memory during cache building (per chapter):
-//
-//   ~11 KB heap  DecompressorOxide   (freed on return)
-//    32 KB heap  DEFLATE window       (freed on return)
-//     4 KB heap  compressed read buf  (freed on return)
-//     4 KB stack strip output buf
-//    ~64 B stack HtmlStripStream state
-//   ─────────
-//   ~51 KB total (temporary)
-//
-// After caching: 0 bytes of heap.  Pages are read directly from the
-// cached plain-text files on SD.
+// Stream ZIP entries through DEFLATE + HTML stripper to plain text
+// on SD. No persistent heap; ~51KB temporary per chapter (freed on
+// return). Cache dir: _XXXXXXX/ with META.BIN + CHnnn.TXT files.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -42,48 +10,23 @@ use alloc::vec::Vec;
 use crate::formats::html_strip::HtmlStripStream;
 use crate::formats::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
 
-// ── Cache metadata constants ──────────────────────────────────────────────
-
 const CACHE_MAGIC: u32 = 0x504C_5043; // "PLPC"
 const CACHE_VERSION: u8 = 1;
 const META_HEADER: usize = 16;
 
-/// Maximum chapters in a single cached EPUB.
 pub const MAX_CACHE_CHAPTERS: usize = 256;
-
-/// Maximum encoded size of a META.BIN file.
 pub const META_MAX_SIZE: usize = META_HEADER + 4 * MAX_CACHE_CHAPTERS;
 
-// ── Streaming decompression constants ─────────────────────────────────────
-
-/// DEFLATE sliding window — must be a power of two and ≥ 32 768.
-///
-/// miniz_oxide in wrapping mode uses this as a circular dictionary.
-/// The decompressor returns `HasMoreOutput` when `out_pos` reaches
-/// `WINDOW_SIZE`, at which point the caller processes the output and
-/// resets `out_pos` to 0.  Back-references are resolved through the
-/// window via bitmasking, so old data remains valid.
-const WINDOW_SIZE: usize = 32768;
-
-/// Compressed data read chunk size (from SD card).
-const READ_BUF_SIZE: usize = 4096;
-
-/// HTML stripper output accumulator.  Flushed to the output callback
-/// when it reaches `FLUSH_THRESHOLD` bytes.
-const STRIP_BUF_SIZE: usize = 4096;
+const WINDOW_SIZE: usize = 32768; // DEFLATE sliding window
+const READ_BUF_SIZE: usize = 4096; // compressed read chunk
+const STRIP_BUF_SIZE: usize = 4096; // strip output accumulator
 const FLUSH_THRESHOLD: usize = STRIP_BUF_SIZE - 128;
 
-// ── Public types ──────────────────────────────────────────────────────────
-
-/// Validated cache metadata read from META.BIN.
 pub struct CacheInfo {
     pub chapter_count: usize,
     pub chapter_sizes: [u32; MAX_CACHE_CHAPTERS],
 }
 
-// ── Hash function ─────────────────────────────────────────────────────────
-
-/// FNV-1a 32-bit hash (same algorithm as the bookmark hash in reader.rs).
 #[inline]
 pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -94,12 +37,7 @@ pub fn fnv1a(data: &[u8]) -> u32 {
     h
 }
 
-// ── Naming helpers ────────────────────────────────────────────────────────
-
-/// Compute the 8.3 cache directory name from a filename hash.
-///
-/// Returns an 8-byte ASCII array: `_` + 7 uppercase hex digits of
-/// the lower 28 bits of `name_hash`.  Example: `_A1B2C3D`.
+// 8.3 cache dir name: '_' + 7 hex digits of lower 28 bits
 pub fn dir_name_for_hash(name_hash: u32) -> [u8; 8] {
     let h = name_hash & 0x0FFF_FFFF;
     let mut buf = [0u8; 8];
@@ -115,19 +53,12 @@ pub fn dir_name_for_hash(name_hash: u32) -> [u8; 8] {
     buf
 }
 
-/// Convert an 8-byte directory name to a `&str`.
-///
-/// Always succeeds because `dir_name_for_hash` produces valid ASCII.
 #[inline]
 pub fn dir_name_str(buf: &[u8; 8]) -> &str {
-    // Safety: dir_name_for_hash only produces ASCII bytes.
     core::str::from_utf8(buf).unwrap_or("_0000000")
 }
 
-/// Compute the 8.3 filename for a cached chapter.
-///
-/// Returns a 9-byte ASCII array like `CH000.TXT`.  Valid for indices
-/// 0–255 (three decimal digits suffice for MAX_CACHE_CHAPTERS = 256).
+// 8.3 chapter filename: CH000.TXT .. CH255.TXT
 pub fn chapter_file_name(idx: u16) -> [u8; 9] {
     let mut n = *b"CH000.TXT";
     n[2] = b'0' + ((idx / 100) % 10) as u8;
@@ -136,22 +67,14 @@ pub fn chapter_file_name(idx: u16) -> [u8; 9] {
     n
 }
 
-/// Convert a 9-byte chapter filename to a `&str`.
 #[inline]
 pub fn chapter_file_str(buf: &[u8; 9]) -> &str {
     core::str::from_utf8(buf).unwrap_or("CH000.TXT")
 }
 
-/// META.BIN filename constant.
 pub const META_FILE: &str = "META.BIN";
 
-// ── Meta encoding / parsing ───────────────────────────────────────────────
-
-/// Encode cache metadata into `buf`.
-///
-/// Returns the number of bytes written.  The caller should provide a
-/// buffer of at least `META_HEADER + 4 * chapter_sizes.len()` bytes
-/// (or use `META_MAX_SIZE` for the upper bound).
+// encode cache metadata into buf; returns bytes written
 pub fn encode_cache_meta(
     epub_size: u32,
     name_hash: u32,
@@ -183,15 +106,7 @@ pub fn encode_cache_meta(
     total
 }
 
-/// Parse and validate a META.BIN file.
-///
-/// `data` is the raw bytes of META.BIN (at least `META_HEADER` bytes).
-/// `epub_size` and `name_hash` are checked against the stored values.
-/// `expected_chapters` is the spine length from the current OPF parse;
-/// a mismatch means the cache is stale.
-///
-/// Returns `CacheInfo` with chapter count and per-chapter text sizes
-/// on success, or a diagnostic error string on failure.
+// parse and validate META.BIN; returns CacheInfo or Err if stale
 pub fn parse_cache_meta(
     data: &[u8],
     epub_size: u32,
@@ -244,28 +159,15 @@ pub fn parse_cache_meta(
     Ok(info)
 }
 
-// ── Streaming entry extraction ────────────────────────────────────────────
-
-/// Stream-decompress a ZIP entry, strip HTML, and emit plain-text chunks.
-///
-/// Reads compressed data from the EPUB via `read_fn(file_offset, buf)`,
-/// decompresses it, runs the HTML stripper, and delivers stripped text
-/// to `output_fn(chunk)` in roughly 4 KB pieces.
-///
-/// Returns the total number of stripped text bytes produced.
-///
-/// # Memory
-///
-/// DEFLATE entries use ~47 KB of temporary heap (DecompressorOxide +
-/// 32 KB window + 4 KB read buffer).  STORED entries use only ~4 KB
-/// of stack.  All heap allocations are freed before this returns.
+// stream-decompress ZIP entry, strip HTML, emit plain-text chunks.
+// ~47KB temp heap for DEFLATE; freed on return. Returns total text bytes.
 pub fn stream_strip_entry<E>(
     entry: &ZipEntry,
     local_offset: u32,
     mut read_fn: impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
     mut output_fn: impl FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<u32, &'static str> {
-    // Read local file header to determine where entry data begins.
+    // skip past local file header to entry data
     let mut header = [0u8; 30];
     read_fn(local_offset, &mut header).map_err(|_| "cache: read local header failed")?;
     let skip = ZipIndex::local_header_data_skip(&header)?;
@@ -278,12 +180,7 @@ pub fn stream_strip_entry<E>(
     }
 }
 
-// ── STORED entries ────────────────────────────────────────────────────────
-
-/// Stream a STORED (uncompressed) ZIP entry through the HTML stripper.
-///
-/// No decompression needed — reads raw bytes from SD, strips HTML,
-/// writes stripped text via the output callback.  Stack only, no heap.
+// stored entry: read raw, strip HTML, write via callback. Stack only.
 fn stream_stored<E>(
     entry: &ZipEntry,
     data_offset: u32,
@@ -335,16 +232,8 @@ fn stream_stored<E>(
 
 // ── DEFLATE entries ───────────────────────────────────────────────────────
 
-/// Stream a DEFLATE-compressed ZIP entry through the HTML stripper.
-///
-/// Uses miniz_oxide in circular-buffer (wrapping) mode with a 32 KB
-/// dictionary window.  The decompressor returns `HasMoreOutput` when
-/// `out_pos` reaches `WINDOW_SIZE`; the caller processes the output
-/// and resets `out_pos` to 0.  Back-references remain valid because
-/// the window data is never cleared — only overwritten naturally as
-/// the circular position advances.
-///
-/// Temporary heap: ~47 KB (DecompressorOxide + window + read buffer).
+// deflate entry: decompress in 32KB circular window, strip HTML.
+// ~47KB temp heap (DecompressorOxide + window + read buffer).
 fn stream_deflate<E>(
     entry: &ZipEntry,
     data_offset: u32,
@@ -517,13 +406,7 @@ fn stream_deflate<E>(
 
 // ── Stripper feed + flush helper ──────────────────────────────────────────
 
-/// Feed `input` bytes through the HTML stripper, accumulating output in
-/// `strip_buf`.  When the buffer reaches `FLUSH_THRESHOLD`, it is flushed
-/// to `output_fn` and reset.
-///
-/// This drives the stripper to completion for the given input: it loops
-/// until all bytes are consumed, flushing as needed when the output
-/// buffer fills up.
+// feed input through stripper; flush to output_fn at FLUSH_THRESHOLD
 fn feed_and_flush(
     stripper: &mut HtmlStripStream,
     input: &[u8],

@@ -1,14 +1,7 @@
 // SD card file operations and directory cache
 //
-// FAT directory iteration has no seek; every listing scans from entry 0.
-// DirCache reads all entries once into RAM and serves pages from there.
-// 128 entries * 20 bytes = 2.5KB of SRAM.
-//
-// read_file_start: single open, returns (file_size, bytes_read) from offset 0.
-// Avoids the separate file_size + read_file_chunk round-trip on first access.
-//
-// Subdirectory operations (ensure_dir, *_in_dir) support the EPUB cache
-// pipeline which stores stripped chapter text under a cache directory.
+// DirCache reads all entries once into RAM, serves pages from there.
+// Subdirectory ops support the EPUB chapter cache pipeline.
 
 use embedded_sdmmc::{Mode, VolumeIdx};
 
@@ -119,7 +112,7 @@ impl DirCache {
     }
 }
 
-// insertion sort: dirs first, then case-insensitive name
+// insertion sort: dirs first, then case-insensitive
 fn sort_entries(entries: &mut [DirEntry]) {
     for i in 1..entries.len() {
         let key = entries[i];
@@ -267,9 +260,7 @@ where
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
 
-    // Create the file if it doesn't exist, or truncate it if it does.
-    // ReadWriteCreate fails with FileAlreadyExists on subsequent saves;
-    // ReadWriteCreateOrTruncate handles both the first write and updates.
+    // ReadWriteCreateOrTruncate handles both first write and updates
     let file = root
         .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| "open file for write failed")?;
@@ -280,12 +271,9 @@ where
     Ok(())
 }
 
-// ── Subdirectory operations ───────────────────────────────────────────────
-//
-// These mirror the root-level functions but operate on files inside a
-// single subdirectory of the SD root.  Used by the EPUB chapter cache.
+// ── Subdirectory operations (EPUB chapter cache) ──────────────────────────
 
-/// Create a directory in the root if it doesn't already exist.
+// create dir in root if it doesn't already exist
 pub fn ensure_dir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
 where
     SPI: embedded_hal::spi::SpiDevice,
@@ -296,18 +284,18 @@ where
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
 
-    // Try to open it first — if it exists, we're done.
+    // already exists → done
     if root.open_dir(name).is_ok() {
         return Ok(());
     }
 
-    // Doesn't exist (or other error) — try to create it.
+    // create it
     root.make_dir_in_dir(name).map_err(|_| "make dir failed")?;
 
     Ok(())
 }
 
-/// Write (create-or-truncate) a file inside a subdirectory of root.
+// write (create-or-truncate) a file inside a subdirectory of root
 pub fn write_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -336,10 +324,7 @@ where
     Ok(())
 }
 
-/// Append data to an existing file (or create it) inside a subdirectory.
-///
-/// Uses ReadWriteCreateOrAppend which seeks to end-of-file on open,
-/// so successive calls build the file incrementally.
+// append to file (or create) inside a subdirectory
 pub fn append_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -368,7 +353,7 @@ where
     Ok(())
 }
 
-/// Read a chunk from a file inside a subdirectory, starting at `offset`.
+// read chunk from file in subdir at `offset`
 pub fn read_file_chunk_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -407,7 +392,7 @@ where
     Ok(total)
 }
 
-/// Get the size of a file inside a subdirectory, or Err if not found.
+// file size in subdir, or Err if not found
 pub fn file_size_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -430,8 +415,7 @@ where
     Ok(file.length())
 }
 
-/// Delete a file inside a subdirectory if it exists.  Silently succeeds
-/// if the file is already absent.
+// delete file in subdir; no-op if absent
 pub fn delete_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -447,8 +431,7 @@ where
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
     let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
 
-    // delete_file_in_dir returns an error if the file doesn't exist;
-    // we treat that as success (idempotent delete).
+    // idempotent: ignore "not found"
     let _ = sub.delete_file_in_dir(name);
 
     Ok(())

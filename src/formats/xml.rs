@@ -1,8 +1,7 @@
 // Minimal XML tag/attribute scanner for EPUB metadata
 //
-// Not a general-purpose parser. Handles the two XML dialects we need:
-// container.xml (find rootfile full-path) and OPF (metadata, manifest,
-// spine). Single-pass, forward-only, namespace-aware, lenient.
+// Not a general parser. Handles container.xml and OPF only.
+// Single-pass, forward-only, namespace-aware, lenient.
 
 pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
@@ -72,7 +71,7 @@ pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-// text content of the first element matching tag_name; namespace-aware ("title" matches "dc:title")
+// text of first element matching tag_name; namespace-aware
 pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
 
@@ -124,7 +123,7 @@ pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-// call cb for every opening tag matching tag_name; callback receives raw bytes between < and >
+// invoke cb for every opening tag matching tag_name
 pub fn for_each_tag<'a>(data: &'a [u8], tag_name: &[u8], mut cb: impl FnMut(&'a [u8])) {
     let mut pos = 0;
 
@@ -168,7 +167,7 @@ pub fn for_each_tag<'a>(data: &'a [u8], tag_name: &[u8], mut cb: impl FnMut(&'a 
     }
 }
 
-// "dc:title" matches target "title"; "item" matches "item"
+// "dc:title" matches "title"; "item" matches "item"
 fn tag_name_matches(full_name: &[u8], target: &[u8]) -> bool {
     if full_name == target {
         return true;

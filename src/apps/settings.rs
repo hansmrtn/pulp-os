@@ -1,20 +1,7 @@
 // System settings with persistent storage
 //
-// Only settings with a real hardware or kernel target live here.
-//
-// Wiring status:
-//
-//   sleep_timeout      — stored; kernel still uses a compile-time constant.
-//   contrast           — SSD1677 VCOM register 0x2C; stored, not yet sent.
-//   ghost_clear_every  — replaces FULL_REFRESH_INTERVAL once main loop reads it.
-//   book_font_size_idx — fully wired; ReaderApp consults on on_enter().
-//   ui_font_size_idx   — fully wired; propagated to all shell apps on nav.
-//
-// Persistence: #[repr(C)] struct written as raw bytes to "settings.bin".
-// Never reorder or remove fields; see SystemSettings layout comment.
-//
-// I/O: load and save are deferred to on_work() so the render path is
-// never blocked by SD card access.
+// #[repr(C)] struct written as raw bytes to settings.bin.
+// Load/save deferred to on_work() so render is never blocked.
 
 use core::fmt::Write as _;
 

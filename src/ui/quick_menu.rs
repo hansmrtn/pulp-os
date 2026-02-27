@@ -1,18 +1,8 @@
-// Quick-action overlay — summoned by Power (Menu action) from any app.
+// Quick-action overlay — summoned by Power (Menu) from any app
 //
-// Dynamic item system: core actions (Refresh, Go Home) are always
-// present at the bottom of the menu.  Each app can inject up to
-// MAX_APP_ACTIONS items that appear above the core section.
-//
-// Item types:
-//   Cycle   — rotates through a set of named options (e.g. font size)
-//   Trigger — fires an immediate action on Select (e.g. save bookmark)
-//
-// Navigation while open:
-//   Prev / Next          — move selection between rows
-//   PrevJump / NextJump  — decrement / increment Cycle values
-//   Select               — cycle forward (Cycle) / fire action (Trigger)
-//   Menu or Back         — dismiss overlay; cycle values can be read back
+// Core actions (Refresh, Go Home) always present; apps inject up to
+// MAX_APP_ACTIONS items above. Two kinds: Cycle (rotate options)
+// and Trigger (fire on Select). Menu/Back dismisses.
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
@@ -40,7 +30,6 @@ const VALUE_W: u16 = OVERLAY_W - 16 - LABEL_W - 8 - 16;
 const HELP_H: u16 = 20;
 const SEPARATOR_GAP: u16 = 8; // gap between app and core sections
 
-/// Maximum number of app-provided quick actions.
 pub const MAX_APP_ACTIONS: usize = 6;
 
 const NUM_CORE: usize = 2; // Refresh + Go Home
@@ -61,8 +50,7 @@ pub enum QuickActionKind {
     },
 }
 
-/// App-provided quick action descriptor.  `id` is echoed back in
-/// `QuickMenuResult::AppTrigger` and keyed in `app_cycle_value`.
+// app-provided quick action descriptor; id echoed in AppTrigger
 #[derive(Debug, Clone, Copy)]
 pub struct QuickAction {
     pub id: u8,
@@ -207,12 +195,10 @@ impl QuickMenu {
         self.dirty = true;
     }
 
-    /// Screen region the overlay occupies; used for dirty marking.
     pub fn region(&self) -> Region {
         self.overlay_region
     }
 
-    /// Current value of an app Cycle item by id; None if absent or not a Cycle.
     pub fn app_cycle_value(&self, id: u8) -> Option<u8> {
         for i in 0..self.app_count {
             if let MenuItemKind::AppCycle {

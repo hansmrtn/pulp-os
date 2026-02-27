@@ -1,15 +1,9 @@
 // Plain text and EPUB reader
 //
-// TXT: lazy indexed with prefetch; page 1 after a single SD read.
-//
-// EPUB: ZIP/OPF parsed once; chapters are stream-decompressed, HTML-
-// stripped, and written to an SD-card cache as styled text files.
-// After caching, EPUB pages are read from SD identically to TXT —
-// the chapter_text heap Vec is gone and the reading path is unified.
-// Cache is validated by file size + filename hash so re-opening a
-// previously read book skips decompression entirely.
-//
-// Proportional fonts via build-time rasterised bitmaps in flash.
+// TXT: lazy page-indexed with prefetch. EPUB: ZIP/OPF parsed once,
+// chapters stream-decompressed + HTML-stripped to SD cache; after
+// caching both formats read identically. Cache keyed on file size +
+// name hash. Proportional fonts via build-time rasterised bitmaps.
 
 extern crate alloc;
 
@@ -92,11 +86,9 @@ enum State {
 struct LineSpan {
     start: u16,
     len: u16,
-    /// Style flags at the start of this line (carried from wrap state).
-    /// bit 0: bold, bit 1: italic, bit 2: heading
+    // style flags: bit 0 = bold, bit 1 = italic, bit 2 = heading
     flags: u8,
-    /// Blockquote indent depth (0 = none, 1+ = nested quotes).
-    /// Each level indents the line further.
+    // blockquote indent depth (0 = none, 1+ = nested)
     indent: u8,
 }
 
@@ -791,16 +783,8 @@ impl ReaderApp {
         Ok(())
     }
 
-    /// Validate or build the SD chapter cache for the entire book.
-    ///
-    /// On first open, each chapter is stream-decompressed, HTML-stripped
-    /// (with style markers), and written to a cache file under
-    /// `_XXXXXXX/CHXXX.TXT`.  A `META.BIN` header records epub size,
-    /// name hash, and per-chapter text sizes for fast validation on
-    /// subsequent opens.
-    ///
-    /// Temporary heap: ~47 KB (decompressor + window + read buffer),
-    /// freed after each chapter.  No persistent heap allocation.
+    // validate or build SD chapter cache for the entire book.
+    // ~47KB temp heap per chapter (freed on return).
     fn epub_ensure_cache<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -872,10 +856,7 @@ impl ReaderApp {
         Ok(())
     }
 
-    /// Set up paging state for the current chapter from the SD cache.
-    ///
-    /// Resets the page offset table and sets `file_size` to the cached
-    /// chapter's text size.  No SD I/O — just index bookkeeping.
+    // reset paging for current chapter from SD cache; no I/O
     fn epub_index_chapter(&mut self) {
         self.reset_paging();
         let ch = self.chapter as usize;

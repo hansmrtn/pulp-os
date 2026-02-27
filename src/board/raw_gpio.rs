@@ -1,8 +1,7 @@
 // Direct register GPIO for pins esp-hal does not expose
 //
-// ESP32-C3 in DIO flash mode frees GPIO12 (SPIHD) and GPIO13 (SPIWP).
-// esp-hal 1.0 has no peripheral types for GPIO12..17 on this chip,
-// so we bang the registers ourselves. Only OutputPin is implemented.
+// DIO flash mode frees GPIO12/13; esp-hal 1.0 has no peripheral
+// types for GPIO12..17 on ESP32-C3. Only OutputPin is implemented.
 
 const GPIO_OUT_W1TS: u32 = 0x6000_4008; // write 1 to set output high
 const GPIO_OUT_W1TC: u32 = 0x6000_400C; // write 1 to set output low
@@ -15,8 +14,7 @@ pub struct RawOutputPin {
 }
 
 impl RawOutputPin {
-    /// # Safety
-    /// Pin must not be in active use by flash or another driver.
+    // Safety: pin must not be in use by flash or another driver.
     pub unsafe fn new(pin: u8) -> Self {
         let mask = 1u32 << pin;
 

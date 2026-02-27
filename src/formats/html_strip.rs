@@ -1,64 +1,20 @@
 // Single-pass HTML to styled-text converter for EPUB chapter XHTML
 //
-// Two APIs:
+// HtmlStripStream: stateful streaming converter (feed/finish), emits
+// 2-byte [0x01, tag] markers for bold/italic/heading/blockquote.
+// strip_html_inplace(): in-place converter for container.xml/OPF/TOC.
 //
-// 1. HtmlStripStream  — stateful streaming converter that processes
-//    arbitrary chunks via feed() / finish().  Emits styled text with
-//    inline 2-byte escape markers for bold, italic, heading, etc.
-//    Designed for the chunked decompress→strip→SD-write cache pipeline
-//    where the full chapter never lives in RAM.
-//
-// 2. strip_html_inplace() — legacy in-place converter that operates
-//    on a complete buffer.  Produces plain text without style markers.
-//    Used by the existing reader for container.xml / OPF / TOC parsing
-//    where streaming is unnecessary.
-//
-// ── Marker protocol ───────────────────────────────────────────────────
-//
-// The streaming stripper emits 2-byte escape sequences for formatting:
-//
-//   [MARKER, tag]     where MARKER = 0x01 (SOH)
-//
-// 0x01 never appears in normal ASCII text, so detection is unambiguous.
-// The word-wrap algorithm skips markers when measuring line widths;
-// the renderer interprets them to switch fonts mid-line.
-//
-// Inline markers (toggle within a paragraph):
-//   [0x01, 'B']  bold on       [0x01, 'b']  bold off
-//   [0x01, 'I']  italic on     [0x01, 'i']  italic off
-//
-// Block style markers (bracket block-level elements):
-//   [0x01, 'H']  heading on    [0x01, 'h']  heading off
-//   [0x01, 'Q']  blockquote on [0x01, 'q']  blockquote off
-//   [0x01, 'S']  scene break   (standalone, from <hr>)
-//
-// Marker ordering relative to paragraph-break newlines:
-//   close markers → \n\n → open markers → text
-//
-// This keeps style spans tightly around visible text:
-//   ...previous\n\n[H]Chapter Title[h]\n\nnext...
-//
-// The w ≤ r invariant of in-place stripping is N/A for the streaming
-// API (separate input/output buffers), but the approach is the same:
-// tags are consumed, entities decoded, whitespace collapsed, and the
-// output is always shorter than the input.
+// Marker protocol: [MARKER=0x01, tag]. Inline: B/b I/i. Block: H/h
+// Q/q S(hr). Ordering: close -> \n\n -> open -> text.
 
 use alloc::vec::Vec;
 
-// ── Public marker constants ───────────────────────────────────────────
-//
-// Consumed by the word-wrap and rendering code in reader.rs.
+pub const MARKER: u8 = 0x01; // escape byte for 2-byte style markers
 
-/// Escape byte that begins every 2-byte style marker.
-pub const MARKER: u8 = 0x01;
-
-// Inline style toggles
 pub const BOLD_ON: u8 = b'B';
 pub const BOLD_OFF: u8 = b'b';
 pub const ITALIC_ON: u8 = b'I';
 pub const ITALIC_OFF: u8 = b'i';
-
-// Block style brackets
 pub const HEADING_ON: u8 = b'H';
 pub const HEADING_OFF: u8 = b'h';
 pub const QUOTE_ON: u8 = b'Q';

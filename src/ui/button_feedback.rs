@@ -1,9 +1,7 @@
-// Button feedback — always-visible edge labels with press inversion.
+// Button feedback — edge labels with press inversion
 //
-// Bottom-edge buttons are drawn as small labelled tabs showing the
-// mapped semantic action.  Side-edge buttons are slim labelless ridges.
-// On press the fill inverts (black↔white); shape and size stay fixed
-// so dirty regions stay minimal.
+// Bottom tabs show the mapped action; side ridges are labelless.
+// On press the fill inverts; shape stays fixed for minimal dirty regions.
 
 use embedded_graphics::{
     pixelcolor::BinaryColor,
@@ -158,7 +156,7 @@ impl ButtonFeedback {
         }
     }
 
-    /// Returns the dirty region for the pressed button, or `None` for Power.
+    // returns dirty region for pressed button, or None for Power
     pub fn on_press(&mut self, button: Button) -> Option<Region> {
         if button == Button::Power {
             return None;
@@ -174,13 +172,13 @@ impl ButtonFeedback {
         Some(region)
     }
 
-    /// Returns the dirty region so the bump reverts to normal appearance.
+    // returns dirty region so bump reverts to normal appearance
     pub fn on_release(&mut self) -> Option<Region> {
         let idx = self.active.take()?;
         Some(bump_region(&BUMPS[idx]))
     }
 
-    /// Draw all bumps.  Call after app and overlay so bumps layer on top.
+    // draw all bumps; call after app and overlay so bumps layer on top
     pub fn draw(&self, strip: &mut StripBuffer) {
         let font = &font_data::REGULAR_BODY_SMALL;
 
@@ -221,8 +219,7 @@ fn draw_tab(
             .unwrap();
     }
 
-    // Use BitmapFont directly to avoid BitmapLabel's rectangular background
-    // overwriting the rounded corners.
+    // use BitmapFont directly to avoid BitmapLabel bg overwriting rounded corners
     let action = mapper.map_button(def.button);
     let label = action_label(action);
     if label.is_empty() {

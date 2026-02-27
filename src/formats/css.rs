@@ -18,7 +18,6 @@
 // Resolution: `CssRules::resolve(tag, class)` returns merged `StyleProps`
 // from all matching rules, cascaded by specificity (tag < class < tag+class).
 
-/// Maximum rules in the table.  Excess rules are silently dropped.
 pub const MAX_CSS_RULES: usize = 128;
 
 // ── Property flag bits (which fields in StyleProps are explicitly set) ─
@@ -97,8 +96,7 @@ impl StyleProps {
         text_decoration: TD_NONE,
     };
 
-    /// Merge another rule's properties into `self`, only overriding if
-    /// the other rule's specificity is ≥ the best seen for each property.
+    // merge other's properties; only override if specificity >= best seen
     fn apply(&mut self, other: &Self, spec: u8, best: &mut [u8; 16]) {
         macro_rules! merge {
             ($field:ident, $bit:expr) => {
@@ -175,7 +173,7 @@ impl CssRule {
     };
 }
 
-/// Parsed CSS rule table.  Stack-allocated, ~2 KB.
+// parsed CSS rule table, stack-allocated (~2 KB)
 pub struct CssRules {
     rules: [CssRule; MAX_CSS_RULES],
     count: usize,
@@ -209,11 +207,7 @@ impl CssRules {
         self.count == 0
     }
 
-    /// Parse a CSS stylesheet and append rules to the table.
-    ///
-    /// Call multiple times for multiple stylesheets; rules accumulate
-    /// and later rules override earlier ones at the same specificity
-    /// (correct CSS cascade by source order).
+    // parse stylesheet; call multiple times to accumulate rules
     pub fn parse(&mut self, css: &[u8]) {
         let mut pos: usize = 0;
 
@@ -264,11 +258,7 @@ impl CssRules {
         }
     }
 
-    /// Resolve the effective style for an element with the given tag
-    /// name and class attribute.  Pass empty slices if unknown.
-    ///
-    /// Returns merged properties from all matching rules, cascaded
-    /// by specificity.
+    // resolve effective style for tag + class; merged by specificity
     pub fn resolve(&self, tag_name: &[u8], class_name: &[u8]) -> StyleProps {
         let tid = tag_id(tag_name);
         let chash = if class_name.is_empty() {
@@ -289,7 +279,7 @@ impl CssRules {
         result
     }
 
-    /// Resolve by pre-computed tag ID and class hash (avoids rehashing).
+    // resolve by pre-computed tag ID and class hash
     pub fn resolve_by_id(&self, tid: u8, chash: u16) -> StyleProps {
         let mut result = StyleProps::EMPTY;
         let mut best = [0u8; 16];
@@ -306,7 +296,7 @@ impl CssRules {
 
 // ── CSS parser internals ──────────────────────────────────────────────
 
-/// Parse a single (possibly compound) selector from trimmed bytes.
+// parse a single (possibly compound) selector
 fn parse_selector(raw: &[u8]) -> Selector {
     let raw = trim_css(raw);
     if raw.is_empty() {
@@ -389,7 +379,7 @@ fn parse_selector(raw: &[u8]) -> Selector {
     }
 }
 
-/// Parse the declaration block (bytes between { and }).
+// parse declaration block (between { and })
 fn parse_declarations(block: &[u8]) -> StyleProps {
     let mut props = StyleProps::EMPTY;
 
@@ -417,7 +407,7 @@ fn parse_declarations(block: &[u8]) -> StyleProps {
     props
 }
 
-/// Map a CSS property name + value to fields in StyleProps.
+// map CSS property name + value to StyleProps fields
 fn parse_property(name: &[u8], value: &[u8], props: &mut StyleProps) {
     match name {
         b"font-weight" => {
@@ -503,12 +493,7 @@ fn parse_property(name: &[u8], value: &[u8], props: &mut StyleProps) {
     }
 }
 
-/// Parse the `margin` shorthand into individual margin-* properties.
-///
-/// - 1 value:  all four sides
-/// - 2 values: top/bottom, left/right
-/// - 3 values: top, left/right, bottom
-/// - 4 values: top, right, bottom, left
+// parse margin shorthand (1–4 values)
 fn parse_margin_shorthand(value: &[u8], props: &mut StyleProps) {
     let mut vals = [0i8; 4];
     let mut count = 0usize;
@@ -640,10 +625,7 @@ pub fn class_hash(name: &[u8]) -> u16 {
 
 // ── CSS length parsing ────────────────────────────────────────────────
 
-/// Parse a CSS length value to quarter-em units (i8).
-///
-/// Handles `em`, `rem`, `px`, `pt`, and bare `0`.
-/// Unknown units are treated as `em`.  Returns 0 for unparseable values.
+// parse CSS length to quarter-em units; handles em/rem/px/pt/0
 fn parse_length_qem(val: &[u8]) -> i8 {
     let val = trim_css(val);
     if val.is_empty() || val == b"0" || val == b"auto" || val == b"normal" {
@@ -723,7 +705,6 @@ fn is_css_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
 }
 
-/// Skip whitespace and CSS comments (/* ... */).
 fn skip_ws_comments(css: &[u8], mut pos: usize) -> usize {
     loop {
         while pos < css.len() && is_css_ws(css[pos]) {
@@ -745,7 +726,7 @@ fn skip_ws_comments(css: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-/// Skip an @-rule.  Handles nested brace blocks (@media { ... { } ... }).
+// skip @-rule including nested brace blocks
 fn skip_at_rule(css: &[u8], pos: usize) -> usize {
     let mut p = pos + 1; // skip '@'
     while p < css.len() {
@@ -772,7 +753,6 @@ fn skip_at_rule(css: &[u8], pos: usize) -> usize {
     css.len()
 }
 
-/// Find the next occurrence of `needle` starting from `pos`.
 fn scan_to_byte(css: &[u8], pos: usize, needle: u8) -> Option<usize> {
     css[pos..]
         .iter()
