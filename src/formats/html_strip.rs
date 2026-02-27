@@ -1,14 +1,721 @@
-// Single-pass HTML to plain text converter for EPUB chapter XHTML
+// Single-pass HTML to styled-text converter for EPUB chapter XHTML
 //
-// Strips tags, decodes entities, collapses whitespace. Block elements
-// emit paragraph breaks; <script>/<style>/<head> content is discarded.
-// Non-ASCII entities map to '?' (ASCII-only font for now).
+// Two APIs:
 //
-// strip_html_inplace() overwrites the buffer (w <= r always holds).
+// 1. HtmlStripStream  — stateful streaming converter that processes
+//    arbitrary chunks via feed() / finish().  Emits styled text with
+//    inline 2-byte escape markers for bold, italic, heading, etc.
+//    Designed for the chunked decompress→strip→SD-write cache pipeline
+//    where the full chapter never lives in RAM.
+//
+// 2. strip_html_inplace() — legacy in-place converter that operates
+//    on a complete buffer.  Produces plain text without style markers.
+//    Used by the existing reader for container.xml / OPF / TOC parsing
+//    where streaming is unnecessary.
+//
+// ── Marker protocol ───────────────────────────────────────────────────
+//
+// The streaming stripper emits 2-byte escape sequences for formatting:
+//
+//   [MARKER, tag]     where MARKER = 0x01 (SOH)
+//
+// 0x01 never appears in normal ASCII text, so detection is unambiguous.
+// The word-wrap algorithm skips markers when measuring line widths;
+// the renderer interprets them to switch fonts mid-line.
+//
+// Inline markers (toggle within a paragraph):
+//   [0x01, 'B']  bold on       [0x01, 'b']  bold off
+//   [0x01, 'I']  italic on     [0x01, 'i']  italic off
+//
+// Block style markers (bracket block-level elements):
+//   [0x01, 'H']  heading on    [0x01, 'h']  heading off
+//   [0x01, 'Q']  blockquote on [0x01, 'q']  blockquote off
+//   [0x01, 'S']  scene break   (standalone, from <hr>)
+//
+// Marker ordering relative to paragraph-break newlines:
+//   close markers → \n\n → open markers → text
+//
+// This keeps style spans tightly around visible text:
+//   ...previous\n\n[H]Chapter Title[h]\n\nnext...
+//
+// The w ≤ r invariant of in-place stripping is N/A for the streaming
+// API (separate input/output buffers), but the approach is the same:
+// tags are consumed, entities decoded, whitespace collapsed, and the
+// output is always shorter than the input.
 
 use alloc::vec::Vec;
 
-// write cursor never passes read cursor; stripping only removes or shortens content
+// ── Public marker constants ───────────────────────────────────────────
+//
+// Consumed by the word-wrap and rendering code in reader.rs.
+
+/// Escape byte that begins every 2-byte style marker.
+pub const MARKER: u8 = 0x01;
+
+// Inline style toggles
+pub const BOLD_ON: u8 = b'B';
+pub const BOLD_OFF: u8 = b'b';
+pub const ITALIC_ON: u8 = b'I';
+pub const ITALIC_OFF: u8 = b'i';
+
+// Block style brackets
+pub const HEADING_ON: u8 = b'H';
+pub const HEADING_OFF: u8 = b'h';
+pub const QUOTE_ON: u8 = b'Q';
+pub const QUOTE_OFF: u8 = b'q';
+
+// Standalone
+pub const BREAK: u8 = b'S';
+
+/// True if `b` is the escape byte that starts a 2-byte style marker.
+#[inline]
+pub const fn is_marker(b: u8) -> bool {
+    b == MARKER
+}
+
+// ── Streaming stripper ────────────────────────────────────────────────
+
+const TAG_BUF_CAP: usize = 16;
+const ENTITY_BUF_CAP: usize = 12;
+const BANG_BUF_CAP: usize = 8;
+const PENDING_CAP: usize = 16;
+const DEFERRED_CAP: usize = 8;
+
+/// Processing phase for the streaming state machine.
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum Phase {
+    /// Normal text — emit stripped content.
+    Text,
+    /// Saw `<`, need one more byte to determine tag type.
+    AfterLt,
+    /// Reading the tag name into `tag_buf`.
+    TagName,
+    /// Past the tag name, skipping attributes until `>`.
+    TagBody,
+    /// After `&`, accumulating entity name into `entity_buf`.
+    Entity,
+    /// Inside a skip element (script/style/head).
+    SkipContent,
+    /// In skip content, saw `<`; check for `/`.
+    SkipLt,
+    /// In skip content, saw `</`; reading close tag name.
+    SkipCloseName,
+    /// In skip content, skipping to `>`.
+    SkipToGt,
+    /// After `<!`, probing for comment/CDATA/other.
+    BangProbe,
+    /// Inside `<!-- ... -->`, scanning for `-->`.
+    Comment,
+    /// Inside `<![CDATA[ ... ]]>`, scanning for `]]>`.
+    Cdata,
+    /// Inside `<? ... ?>`, scanning for `?>`.
+    Pi,
+    /// Inside `<! ... >` (not comment/CDATA), scanning for `>`.
+    BangOther,
+}
+
+impl Default for HtmlStripStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stateful streaming HTML-to-styled-text converter.
+///
+/// Processes arbitrary chunks of HTML input via `feed()`, emitting
+/// styled plain text with inline escape markers.  Carries all state
+/// across calls in ~80 bytes of struct.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut s = HtmlStripStream::new();
+/// loop {
+///     let (consumed, written) = s.feed(&input[ip..], &mut output[op..]);
+///     ip += consumed; op += written;
+///     if consumed == 0 && written == 0 { break; }
+/// }
+/// let trailing = s.finish(&mut output[op..]);
+/// op += trailing;
+/// ```
+pub struct HtmlStripStream {
+    phase: Phase,
+
+    // ── Tag name accumulation ──────────────────────────────────
+    tag_buf: [u8; TAG_BUF_CAP],
+    tag_len: u8,
+    is_close_tag: bool,
+    /// Tag was identified as skip-content; enter SkipContent on `>`.
+    enter_skip: bool,
+
+    // ── Entity accumulation ────────────────────────────────────
+    entity_buf: [u8; ENTITY_BUF_CAP],
+    entity_len: u8,
+
+    // ── Skip content ───────────────────────────────────────────
+    skip_target: Option<SkipTag>,
+    /// In SkipToGt: did the close tag name match?
+    skip_match: bool,
+
+    // ── Bang construct probing ─────────────────────────────────
+    bang_buf: [u8; BANG_BUF_CAP],
+    bang_len: u8,
+
+    // ── Terminator matching (comment / CDATA / PI) ─────────────
+    match_pos: u8,
+
+    // ── Output state ───────────────────────────────────────────
+    last_was_space: bool,
+    /// Deferred newlines.  Block elements increment this; newlines
+    /// are only written to output when a non-whitespace byte follows
+    /// (via `queue_text`).  Capped at 2 (one blank line).
+    trailing_nl: u8,
+    /// True once any visible character has been emitted.  Suppresses
+    /// leading whitespace and controls whether `finish()` adds `\n`.
+    has_output: bool,
+
+    // ── Deferred open-style markers ────────────────────────────
+    //
+    // Open-tag markers (bold on, heading on, etc.) are deferred so
+    // they appear AFTER paragraph-break newlines and BEFORE text.
+    // Close-tag markers go to `pending` immediately so they appear
+    // BEFORE paragraph-break newlines.
+    deferred: [u8; DEFERRED_CAP],
+    deferred_len: u8,
+
+    // ── Pending output buffer ──────────────────────────────────
+    //
+    // Bytes queued by classify_tag (close markers) or queue_text
+    // (newlines + deferred markers + text byte) that haven't yet
+    // been drained to the caller's output slice.
+    pending: [u8; PENDING_CAP],
+    pend_w: u8,
+    pend_r: u8,
+}
+
+impl HtmlStripStream {
+    pub const fn new() -> Self {
+        Self {
+            phase: Phase::Text,
+            tag_buf: [0u8; TAG_BUF_CAP],
+            tag_len: 0,
+            is_close_tag: false,
+            enter_skip: false,
+            entity_buf: [0u8; ENTITY_BUF_CAP],
+            entity_len: 0,
+            skip_target: None,
+            skip_match: false,
+            bang_buf: [0u8; BANG_BUF_CAP],
+            bang_len: 0,
+            match_pos: 0,
+            last_was_space: true,
+            trailing_nl: 0,
+            has_output: false,
+            deferred: [0u8; DEFERRED_CAP],
+            deferred_len: 0,
+            pending: [0u8; PENDING_CAP],
+            pend_w: 0,
+            pend_r: 0,
+        }
+    }
+
+    /// Process a chunk of HTML input, writing styled text to `output`.
+    ///
+    /// Returns `(input_bytes_consumed, output_bytes_written)`.  Call
+    /// again with remaining input if not all was consumed (happens
+    /// when `output` fills up).
+    pub fn feed(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize) {
+        let ilen = input.len();
+        let olen = output.len();
+        let mut ip: usize = 0;
+        let mut op: usize = 0;
+
+        loop {
+            // ── Step 1: drain pending bytes to output ──────────
+            while self.pend_r < self.pend_w {
+                if op >= olen {
+                    return (ip, op);
+                }
+                output[op] = self.pending[self.pend_r as usize];
+                op += 1;
+                self.pend_r += 1;
+            }
+            self.pend_r = 0;
+            self.pend_w = 0;
+
+            // ── Step 2: check for end of input ─────────────────
+            if ip >= ilen {
+                return (ip, op);
+            }
+
+            // ── Step 3: process one input byte ─────────────────
+            let b = input[ip];
+            let mut advance = true;
+
+            match self.phase {
+                // ──────────────────────────────────────────────
+                //  Normal text
+                // ──────────────────────────────────────────────
+                Phase::Text => {
+                    if b == MARKER {
+                        // Escape a literal 0x01 in source text (very rare).
+                        // Emit nothing — drop it silently.  Real EPUBs
+                        // never contain SOH bytes.
+                    } else if b == b'<' {
+                        self.phase = Phase::AfterLt;
+                    } else if b == b'&' {
+                        self.entity_len = 0;
+                        self.phase = Phase::Entity;
+                    } else if is_html_ws(b) {
+                        self.queue_ws();
+                    } else {
+                        self.queue_text(b);
+                    }
+                }
+
+                // ──────────────────────────────────────────────
+                //  After '<'
+                // ──────────────────────────────────────────────
+                Phase::AfterLt => match b {
+                    b'!' => {
+                        self.bang_len = 0;
+                        self.phase = Phase::BangProbe;
+                    }
+                    b'?' => {
+                        self.match_pos = 0;
+                        self.phase = Phase::Pi;
+                    }
+                    b'/' => {
+                        self.is_close_tag = true;
+                        self.tag_len = 0;
+                        self.enter_skip = false;
+                        self.phase = Phase::TagName;
+                    }
+                    b'>' => {
+                        // Empty `<>` — ignore.
+                        self.phase = Phase::Text;
+                    }
+                    _ => {
+                        self.is_close_tag = false;
+                        self.tag_len = 0;
+                        self.enter_skip = false;
+                        self.phase = Phase::TagName;
+                        advance = false; // TagName handles this byte
+                    }
+                },
+
+                // ──────────────────────────────────────────────
+                //  Accumulating tag name
+                // ──────────────────────────────────────────────
+                Phase::TagName => {
+                    if is_tag_delim(b) {
+                        self.classify_tag();
+
+                        if b == b'>' {
+                            self.finish_tag();
+                        } else {
+                            self.phase = Phase::TagBody;
+                        }
+                    } else if (self.tag_len as usize) < TAG_BUF_CAP {
+                        self.tag_buf[self.tag_len as usize] = b.to_ascii_lowercase();
+                        self.tag_len += 1;
+                    }
+                    // Overflow: stop accumulating, keep scanning for delimiter.
+                }
+
+                // ──────────────────────────────────────────────
+                //  Past tag name, skip attributes to '>'
+                // ──────────────────────────────────────────────
+                Phase::TagBody => {
+                    if b == b'>' {
+                        self.finish_tag();
+                    }
+                    // else: consume and stay in TagBody
+                }
+
+                // ──────────────────────────────────────────────
+                //  Entity accumulation
+                // ──────────────────────────────────────────────
+                Phase::Entity => {
+                    if b == b';' {
+                        let name = &self.entity_buf[..self.entity_len as usize];
+                        match resolve_entity(name) {
+                            Some(b'\n') => {
+                                self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
+                                self.last_was_space = true;
+                            }
+                            Some(c) if is_html_ws(c) => {
+                                self.queue_ws();
+                            }
+                            Some(c) => {
+                                self.queue_text(c);
+                            }
+                            None => {
+                                // Unrecognised entity → literal '&'
+                                self.queue_text(b'&');
+                            }
+                        }
+                        self.phase = Phase::Text;
+                    } else if is_entity_char(b) && (self.entity_len as usize) < ENTITY_BUF_CAP {
+                        self.entity_buf[self.entity_len as usize] = b;
+                        self.entity_len += 1;
+                    } else {
+                        // Invalid char or buffer overflow → literal '&'
+                        self.queue_text(b'&');
+                        self.phase = Phase::Text;
+                        advance = false; // reprocess this byte as text
+                    }
+                }
+
+                // ──────────────────────────────────────────────
+                //  Skip content (script / style / head)
+                // ──────────────────────────────────────────────
+                Phase::SkipContent => {
+                    if b == b'<' {
+                        self.phase = Phase::SkipLt;
+                    }
+                }
+
+                Phase::SkipLt => {
+                    if b == b'/' {
+                        self.tag_len = 0;
+                        self.phase = Phase::SkipCloseName;
+                    } else {
+                        self.phase = Phase::SkipContent;
+                    }
+                }
+
+                Phase::SkipCloseName => {
+                    if is_tag_delim(b) || b == b'>' {
+                        let matched = if let Some(target) = self.skip_target {
+                            let tgt = target.name();
+                            let name = &self.tag_buf[..self.tag_len as usize];
+                            name.len() == tgt.len()
+                                && name.iter().zip(tgt.iter()).all(|(a, t)| *a == *t)
+                        } else {
+                            false
+                        };
+
+                        if b == b'>' {
+                            if matched {
+                                self.skip_target = None;
+                                self.phase = Phase::Text;
+                            } else {
+                                self.phase = Phase::SkipContent;
+                            }
+                        } else {
+                            self.skip_match = matched;
+                            self.phase = Phase::SkipToGt;
+                        }
+                    } else if (self.tag_len as usize) < TAG_BUF_CAP {
+                        self.tag_buf[self.tag_len as usize] = b.to_ascii_lowercase();
+                        self.tag_len += 1;
+                    }
+                }
+
+                Phase::SkipToGt => {
+                    if b == b'>' {
+                        if self.skip_match {
+                            self.skip_target = None;
+                            self.phase = Phase::Text;
+                        } else {
+                            self.phase = Phase::SkipContent;
+                        }
+                    }
+                }
+
+                // ──────────────────────────────────────────────
+                //  Bang construct probing (after '<!')
+                // ──────────────────────────────────────────────
+                Phase::BangProbe => {
+                    if b == b'>' {
+                        self.phase = Phase::Text;
+                    } else {
+                        let pos = self.bang_len as usize;
+                        if pos < BANG_BUF_CAP {
+                            self.bang_buf[pos] = b;
+                            self.bang_len += 1;
+                        }
+                        let n = self.bang_len as usize;
+
+                        if n == 1 {
+                            match b {
+                                b'-' | b'[' => {}
+                                _ => self.phase = Phase::BangOther,
+                            }
+                        } else if self.bang_buf[0] == b'-' {
+                            if n == 2 && b == b'-' {
+                                self.match_pos = 0;
+                                self.phase = Phase::Comment;
+                            } else {
+                                self.phase = Phase::BangOther;
+                            }
+                        } else {
+                            // bang_buf[0] == '[', check against "[CDATA["
+                            const CDATA: &[u8] = b"[CDATA[";
+                            if n <= CDATA.len() && b == CDATA[n - 1] {
+                                if n == CDATA.len() {
+                                    self.match_pos = 0;
+                                    self.phase = Phase::Cdata;
+                                }
+                            } else {
+                                self.phase = Phase::BangOther;
+                            }
+                        }
+                    }
+                }
+
+                // ──────────────────────────────────────────────
+                //  Comment: scanning for '-->'
+                // ──────────────────────────────────────────────
+                Phase::Comment => match self.match_pos {
+                    0 => {
+                        if b == b'-' {
+                            self.match_pos = 1;
+                        }
+                    }
+                    1 => {
+                        if b == b'-' {
+                            self.match_pos = 2;
+                        } else {
+                            self.match_pos = 0;
+                        }
+                    }
+                    _ => {
+                        if b == b'>' {
+                            self.phase = Phase::Text;
+                        } else if b != b'-' {
+                            self.match_pos = 0;
+                        }
+                    }
+                },
+
+                // ──────────────────────────────────────────────
+                //  CDATA: scanning for ']]>'
+                // ──────────────────────────────────────────────
+                Phase::Cdata => match self.match_pos {
+                    0 => {
+                        if b == b']' {
+                            self.match_pos = 1;
+                        }
+                    }
+                    1 => {
+                        if b == b']' {
+                            self.match_pos = 2;
+                        } else {
+                            self.match_pos = 0;
+                        }
+                    }
+                    _ => {
+                        if b == b'>' {
+                            self.phase = Phase::Text;
+                        } else if b != b']' {
+                            self.match_pos = 0;
+                        }
+                    }
+                },
+
+                // ──────────────────────────────────────────────
+                //  Processing instruction: scanning for '?>'
+                // ──────────────────────────────────────────────
+                Phase::Pi => match self.match_pos {
+                    0 => {
+                        if b == b'?' {
+                            self.match_pos = 1;
+                        }
+                    }
+                    _ => {
+                        if b == b'>' {
+                            self.phase = Phase::Text;
+                        } else if b != b'?' {
+                            self.match_pos = 0;
+                        }
+                    }
+                },
+
+                // ──────────────────────────────────────────────
+                //  Other bang construct: scanning for '>'
+                // ──────────────────────────────────────────────
+                Phase::BangOther => {
+                    if b == b'>' {
+                        self.phase = Phase::Text;
+                    }
+                }
+            }
+
+            if advance {
+                ip += 1;
+            }
+        }
+    }
+
+    /// Signal end of input.  Flushes pending state and appends a
+    /// terminal newline if any content was produced.
+    ///
+    /// Returns the number of bytes written to `output`.  Caller
+    /// should provide at least `PENDING_CAP + 1` bytes of space.
+    pub fn finish(&mut self, output: &mut [u8]) -> usize {
+        let mut op: usize = 0;
+
+        // Drain remaining pending bytes
+        while self.pend_r < self.pend_w && op < output.len() {
+            output[op] = self.pending[self.pend_r as usize];
+            op += 1;
+            self.pend_r += 1;
+        }
+        self.pend_r = 0;
+        self.pend_w = 0;
+
+        // Terminal newline
+        if self.has_output && op < output.len() {
+            output[op] = b'\n';
+            op += 1;
+        }
+
+        self.phase = Phase::Text;
+        op
+    }
+
+    // ── Internal: pending buffer ──────────────────────────────────
+
+    #[inline]
+    fn push_pending(&mut self, byte: u8) {
+        let w = self.pend_w as usize;
+        if w < PENDING_CAP {
+            self.pending[w] = byte;
+            self.pend_w += 1;
+        }
+    }
+
+    // ── Internal: deferred marker buffer ──────────────────────────
+
+    fn push_deferred_marker(&mut self, tag: u8) {
+        let n = self.deferred_len as usize;
+        if n + 2 <= DEFERRED_CAP {
+            self.deferred[n] = MARKER;
+            self.deferred[n + 1] = tag;
+            self.deferred_len += 2;
+        }
+    }
+
+    // ── Internal: output helpers ──────────────────────────────────
+
+    /// Queue a visible text byte for output.
+    ///
+    /// Flushes deferred newlines (only after first output) and any
+    /// deferred style markers, then queues the text byte itself.
+    fn queue_text(&mut self, b: u8) {
+        // Deferred newlines
+        if self.has_output && self.trailing_nl > 0 {
+            let nl = self.trailing_nl;
+            for _ in 0..nl {
+                self.push_pending(b'\n');
+            }
+        }
+        self.trailing_nl = 0;
+
+        // Deferred open-style markers
+        let dlen = self.deferred_len as usize;
+        for i in 0..dlen {
+            self.push_pending(self.deferred[i]);
+        }
+        self.deferred_len = 0;
+
+        // The text byte
+        self.push_pending(b);
+        self.last_was_space = false;
+        self.has_output = true;
+    }
+
+    /// Handle a whitespace byte — collapse runs to a single space.
+    fn queue_ws(&mut self) {
+        if self.last_was_space || !self.has_output {
+            return;
+        }
+        self.last_was_space = true;
+
+        // Pending newlines already act as word separators.
+        if self.trailing_nl > 0 {
+            return;
+        }
+
+        self.push_pending(b' ');
+    }
+
+    // ── Internal: tag classification ──────────────────────────────
+
+    /// Classify the accumulated tag name and update output state.
+    ///
+    /// Called once per tag from TagName when the name is complete
+    /// (hit a delimiter).  May push close markers to `pending`
+    /// (immediate) and open markers to `deferred`.
+    fn classify_tag(&mut self) {
+        // Copy tag name to a local to avoid borrowing self.tag_buf
+        // while we mutate self through push_pending / push_deferred.
+        let mut tn = [0u8; TAG_BUF_CAP];
+        let tn_len = self.tag_len as usize;
+        tn[..tn_len].copy_from_slice(&self.tag_buf[..tn_len]);
+        let name = &tn[..tn_len];
+        let is_close = self.is_close_tag;
+
+        // Skip-content tags (script / style / head) — open only
+        if !is_close && let Some(sk) = SkipTag::from_name(name) {
+            self.skip_target = Some(sk);
+            self.enter_skip = true;
+        }
+
+        // Close-tag style markers go out IMMEDIATELY (before any
+        // deferred newlines from the block-element check below).
+        if is_close && let Some(m) = close_style_tag(name) {
+            self.push_pending(MARKER);
+            self.push_pending(m);
+        }
+
+        // Block elements set deferred paragraph breaks.
+        if is_block_element(name) {
+            self.trailing_nl = self.trailing_nl.max(2);
+            self.last_was_space = true;
+        }
+
+        // Open-tag style markers are DEFERRED (after newlines,
+        // before text).  This applies to both block-style (heading,
+        // blockquote) and inline-style (bold, italic) tags.
+        //
+        // Deferring inline markers too is correct: `<p><b>text`
+        // should produce `\n\n[B]text`, not `[B]\n\ntext`.
+        if !is_close && let Some(m) = open_style_tag(name) {
+            self.push_deferred_marker(m);
+        }
+
+        // <br> — line break
+        if name == b"br" {
+            self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
+            self.last_was_space = true;
+        }
+
+        // <hr> — scene break marker (deferred, like open markers)
+        if name == b"hr" && !is_close {
+            self.push_deferred_marker(BREAK);
+        }
+    }
+
+    /// Transition out of TagName/TagBody on '>'.
+    fn finish_tag(&mut self) {
+        if self.enter_skip {
+            self.enter_skip = false;
+            self.phase = Phase::SkipContent;
+        } else {
+            self.phase = Phase::Text;
+        }
+    }
+}
+
+// ── In-place stripper (legacy) ────────────────────────────────────────
+//
+// Operates on a complete buffer.  Produces plain text WITHOUT style
+// markers.  Write cursor never passes read cursor (w ≤ r always).
+
 pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     let len = buf.len();
     if len == 0 {
@@ -95,17 +802,17 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
         }
 
         if b == b'&' {
-            let (decoded, advance) = decode_entity(buf, r);
+            let (decoded, advance) = decode_entity_inplace(buf, r);
             r += advance;
 
             match decoded {
-                DecodedChar::Byte(b'\n') => {
+                DecodedInplace::Byte(b'\n') => {
                     buf[w] = b'\n';
                     w += 1;
                     trailing_nl = trailing_nl.saturating_add(1);
                     last_was_space = true;
                 }
-                DecodedChar::Byte(c) if is_html_ws(c) => {
+                DecodedInplace::Byte(c) if is_html_ws(c) => {
                     if !last_was_space {
                         buf[w] = b' ';
                         w += 1;
@@ -113,19 +820,19 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
                         trailing_nl = 0;
                     }
                 }
-                DecodedChar::Byte(c) => {
+                DecodedInplace::Byte(c) => {
                     buf[w] = c;
                     w += 1;
                     last_was_space = false;
                     trailing_nl = 0;
                 }
-                DecodedChar::Unicode(_) => {
+                DecodedInplace::Unicode => {
                     buf[w] = b'?';
                     w += 1;
                     last_was_space = false;
                     trailing_nl = 0;
                 }
-                DecodedChar::None => {
+                DecodedInplace::None => {
                     buf[w] = b'&';
                     w += 1;
                     last_was_space = false;
@@ -163,6 +870,8 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     buf.truncate(w);
 }
 
+// ── Shared: block element classification ──────────────────────────────
+
 fn is_block_element(name: &[u8]) -> bool {
     matches!(
         name,
@@ -195,7 +904,32 @@ fn is_block_element(name: &[u8]) -> bool {
     )
 }
 
-// -- skip-content tags --
+// ── Shared: style tag classification ──────────────────────────────────
+//
+// Returns the marker tag byte for tags that carry formatting.
+// Used by HtmlStripStream::classify_tag.
+
+fn open_style_tag(tag: &[u8]) -> Option<u8> {
+    match tag {
+        b"b" | b"strong" => Some(BOLD_ON),
+        b"i" | b"em" | b"cite" => Some(ITALIC_ON),
+        b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" => Some(HEADING_ON),
+        b"blockquote" => Some(QUOTE_ON),
+        _ => None,
+    }
+}
+
+fn close_style_tag(tag: &[u8]) -> Option<u8> {
+    match tag {
+        b"b" | b"strong" => Some(BOLD_OFF),
+        b"i" | b"em" | b"cite" => Some(ITALIC_OFF),
+        b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" => Some(HEADING_OFF),
+        b"blockquote" => Some(QUOTE_OFF),
+        _ => None,
+    }
+}
+
+// ── Shared: skip-content tags ─────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 enum SkipTag {
@@ -250,15 +984,73 @@ fn find_close_tag(data: &[u8], name: &[u8]) -> Option<usize> {
     None
 }
 
-// -- entity decoding --
+// ── Shared: entity resolution (streaming stripper) ────────────────────
 
-enum DecodedChar {
+/// Resolve an entity name (bytes between `&` and `;`) to an output byte.
+///
+/// Returns `Some(byte)` for recognised entities (including Unicode
+/// codepoints mapped to ASCII); `None` for unrecognised names.
+fn resolve_entity(name: &[u8]) -> Option<u8> {
+    match name {
+        b"amp" => Some(b'&'),
+        b"lt" => Some(b'<'),
+        b"gt" => Some(b'>'),
+        b"quot" => Some(b'"'),
+        b"apos" => Some(b'\''),
+        b"nbsp" => Some(b' '),
+        b"mdash" | b"emdash" => Some(b'-'),
+        b"ndash" | b"endash" => Some(b'-'),
+        b"lsquo" | b"rsquo" | b"sbquo" => Some(b'\''),
+        b"ldquo" | b"rdquo" | b"bdquo" => Some(b'"'),
+        b"hellip" => Some(b'.'),
+        b"copy" => Some(b'c'),
+        b"reg" => Some(b'R'),
+        b"trade" => Some(b'T'),
+        b"times" => Some(b'x'),
+        b"divide" => Some(b'/'),
+        b"deg" => Some(b'*'),
+        b"plusmn" => Some(b'+'),
+        b"frac12" | b"frac14" | b"frac34" => Some(b'/'),
+        _ => {
+            if name.starts_with(b"#x") || name.starts_with(b"#X") {
+                codepoint_to_byte(parse_hex(&name[2..]))
+            } else if name.starts_with(b"#") {
+                codepoint_to_byte(parse_decimal(&name[1..]))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn codepoint_to_byte(cp: u32) -> Option<u8> {
+    match cp {
+        0 => None,
+        0x0001..=0x007F => Some(cp as u8),
+        0x00A0 => Some(b' '), // non-breaking space
+        0x00AD => Some(b'-'), // soft hyphen
+        0x2013 | 0x2014 => Some(b'-'),
+        0x2018..=0x201A => Some(b'\''),
+        0x201C..=0x201E => Some(b'"'),
+        0x2022 => Some(b'*'),
+        0x2026 => Some(b'.'),
+        _ => Some(b'?'), // Unicode placeholder
+    }
+}
+
+// ── In-place entity decoding ──────────────────────────────────────────
+//
+// Separate from resolve_entity to avoid changing the in-place stripper's
+// exact behaviour (DecodedInplace::Unicode vs Some(b'?'), advance logic).
+
+enum DecodedInplace {
     Byte(u8),
-    Unicode(()),
+    #[allow(dead_code)]
+    Unicode,
     None,
 }
 
-fn decode_entity(input: &[u8], pos: usize) -> (DecodedChar, usize) {
+fn decode_entity_inplace(input: &[u8], pos: usize) -> (DecodedInplace, usize) {
     debug_assert!(input[pos] == b'&');
 
     let remaining = &input[pos + 1..];
@@ -266,45 +1058,62 @@ fn decode_entity(input: &[u8], pos: usize) -> (DecodedChar, usize) {
     let semi = remaining[..max_scan].iter().position(|&b| b == b';');
 
     let Some(semi) = semi else {
-        return (DecodedChar::None, 1);
+        return (DecodedInplace::None, 1);
     };
 
     let entity = &remaining[..semi];
     let advance = 1 + semi + 1;
 
     let decoded = match entity {
-        b"amp" => DecodedChar::Byte(b'&'),
-        b"lt" => DecodedChar::Byte(b'<'),
-        b"gt" => DecodedChar::Byte(b'>'),
-        b"quot" => DecodedChar::Byte(b'"'),
-        b"apos" => DecodedChar::Byte(b'\''),
-        b"nbsp" => DecodedChar::Byte(b' '),
-        b"mdash" | b"emdash" => DecodedChar::Byte(b'-'),
-        b"ndash" | b"endash" => DecodedChar::Byte(b'-'),
-        b"lsquo" | b"rsquo" | b"sbquo" => DecodedChar::Byte(b'\''),
-        b"ldquo" | b"rdquo" | b"bdquo" => DecodedChar::Byte(b'"'),
-        b"hellip" => DecodedChar::Byte(b'.'),
-        b"copy" => DecodedChar::Byte(b'c'),
-        b"reg" => DecodedChar::Byte(b'R'),
-        b"trade" => DecodedChar::Byte(b'T'),
-        b"times" => DecodedChar::Byte(b'x'),
-        b"divide" => DecodedChar::Byte(b'/'),
-        b"deg" => DecodedChar::Byte(b'*'),
-        b"plusmn" => DecodedChar::Byte(b'+'),
-        b"frac12" | b"frac14" | b"frac34" => DecodedChar::Byte(b'/'),
+        b"amp" => DecodedInplace::Byte(b'&'),
+        b"lt" => DecodedInplace::Byte(b'<'),
+        b"gt" => DecodedInplace::Byte(b'>'),
+        b"quot" => DecodedInplace::Byte(b'"'),
+        b"apos" => DecodedInplace::Byte(b'\''),
+        b"nbsp" => DecodedInplace::Byte(b' '),
+        b"mdash" | b"emdash" => DecodedInplace::Byte(b'-'),
+        b"ndash" | b"endash" => DecodedInplace::Byte(b'-'),
+        b"lsquo" | b"rsquo" | b"sbquo" => DecodedInplace::Byte(b'\''),
+        b"ldquo" | b"rdquo" | b"bdquo" => DecodedInplace::Byte(b'"'),
+        b"hellip" => DecodedInplace::Byte(b'.'),
+        b"copy" => DecodedInplace::Byte(b'c'),
+        b"reg" => DecodedInplace::Byte(b'R'),
+        b"trade" => DecodedInplace::Byte(b'T'),
+        b"times" => DecodedInplace::Byte(b'x'),
+        b"divide" => DecodedInplace::Byte(b'/'),
+        b"deg" => DecodedInplace::Byte(b'*'),
+        b"plusmn" => DecodedInplace::Byte(b'+'),
+        b"frac12" | b"frac14" | b"frac34" => DecodedInplace::Byte(b'/'),
         _ => {
             if entity.starts_with(b"#x") || entity.starts_with(b"#X") {
-                codepoint_to_decoded(parse_hex(&entity[2..]))
+                codepoint_to_decoded_inplace(parse_hex(&entity[2..]))
             } else if entity.starts_with(b"#") {
-                codepoint_to_decoded(parse_decimal(&entity[1..]))
+                codepoint_to_decoded_inplace(parse_decimal(&entity[1..]))
             } else {
-                DecodedChar::None
+                DecodedInplace::None
             }
         }
     };
 
     (decoded, advance)
 }
+
+fn codepoint_to_decoded_inplace(cp: u32) -> DecodedInplace {
+    match cp {
+        0 => DecodedInplace::None,
+        0x0001..=0x007F => DecodedInplace::Byte(cp as u8),
+        0x00A0 => DecodedInplace::Byte(b' '),
+        0x00AD => DecodedInplace::Byte(b'-'),
+        0x2013 | 0x2014 => DecodedInplace::Byte(b'-'),
+        0x2018..=0x201A => DecodedInplace::Byte(b'\''),
+        0x201C..=0x201E => DecodedInplace::Byte(b'"'),
+        0x2022 => DecodedInplace::Byte(b'*'),
+        0x2026 => DecodedInplace::Byte(b'.'),
+        _ => DecodedInplace::Unicode,
+    }
+}
+
+// ── Shared: numeric parsing ───────────────────────────────────────────
 
 fn parse_hex(bytes: &[u8]) -> u32 {
     let mut val = 0u32;
@@ -332,22 +1141,7 @@ fn parse_decimal(bytes: &[u8]) -> u32 {
     val
 }
 
-fn codepoint_to_decoded(cp: u32) -> DecodedChar {
-    match cp {
-        0 => DecodedChar::None,
-        0x0001..=0x007F => DecodedChar::Byte(cp as u8),
-        0x00A0 => DecodedChar::Byte(b' '),
-        0x00AD => DecodedChar::Byte(b'-'),
-        0x2013 | 0x2014 => DecodedChar::Byte(b'-'),
-        0x2018..=0x201A => DecodedChar::Byte(b'\''),
-        0x201C..=0x201E => DecodedChar::Byte(b'"'),
-        0x2022 => DecodedChar::Byte(b'*'),
-        0x2026 => DecodedChar::Byte(b'.'),
-        _ => DecodedChar::Unicode(()),
-    }
-}
-
-// -- scanning helpers --
+// ── Shared: character classification ──────────────────────────────────
 
 #[inline]
 fn is_html_ws(b: u8) -> bool {
@@ -358,6 +1152,14 @@ fn is_html_ws(b: u8) -> bool {
 fn is_tag_delim(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/')
 }
+
+/// Characters that can appear in an entity name between `&` and `;`.
+#[inline]
+fn is_entity_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'#'
+}
+
+// ── In-place scanning helpers ─────────────────────────────────────────
 
 fn skip_to_gt(data: &[u8], mut pos: usize) -> usize {
     while pos < data.len() {
