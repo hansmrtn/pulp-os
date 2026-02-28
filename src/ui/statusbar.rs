@@ -1,5 +1,5 @@
 // Persistent status bar at top of screen
-// Shows battery, uptime, heap, stack, and SD card state.
+// Shows battery, uptime, heap (current/peak/total), stack, and SD card state.
 
 use core::fmt::Write;
 
@@ -23,13 +23,14 @@ pub struct SystemStatus {
     pub battery_mv: u16,
     pub battery_pct: u8,
     pub heap_used: usize,
+    pub heap_peak: usize,
     pub heap_total: usize,
     pub stack_free: usize,
     pub sd_ok: bool,
 }
 
 pub struct StatusBar {
-    buf: [u8; 80],
+    buf: [u8; 96],
     len: usize,
 }
 
@@ -42,7 +43,7 @@ impl Default for StatusBar {
 impl StatusBar {
     pub const fn new() -> Self {
         Self {
-            buf: [0u8; 80],
+            buf: [0u8; 96],
             len: 0,
         }
     }
@@ -78,7 +79,14 @@ impl StatusBar {
         }
 
         if s.heap_total > 0 {
-            let _ = write!(w, "  H:{}/{}K", s.heap_used / 1024, s.heap_total / 1024);
+            // current / peak / total — all in KB
+            let _ = write!(
+                w,
+                "  H:{}/{}/{}K",
+                s.heap_used / 1024,
+                s.heap_peak / 1024,
+                s.heap_total / 1024
+            );
         }
 
         if s.stack_free > 0 {
@@ -114,6 +122,20 @@ impl StatusBar {
     }
 }
 
+/// Real free stack bytes: distance from current SP down to the
+/// linker-defined bottom of the stack region (`_stack_end_cpu0`).
+///
+/// On ESP32-C3 the memory layout (low → high) is:
+///
+///   .data / .bss (including the heap static)  ← `_stack_end_cpu0`
+///   ┈┈┈┈ free stack headroom ┈┈┈┈┈┈┈┈┈┈┈┈┈┈  ← SP (grows ↓)
+///   stack in use
+///   `_stack_start_cpu0`                        ← top of DRAM
+///
+/// Previous implementation measured `SP − DRAM_BASE` which included
+/// the heap, .bss, and .data — always returning a misleadingly large
+/// number.  This version measures only the gap that remains before
+/// the stack collides with .bss / the heap.
 pub fn free_stack_bytes() -> usize {
     let sp: usize;
     #[cfg(target_arch = "riscv32")]
@@ -125,9 +147,22 @@ pub fn free_stack_bytes() -> usize {
         sp = 0;
     }
 
-    // ESP32-C3 DRAM: 0x3FC80000..0x3FCE0000 (400KB)
-    const DRAM_BASE: usize = 0x3FC8_0000;
-    sp.saturating_sub(DRAM_BASE)
+    // _stack_end_cpu0 is placed by the linker right after .bss — the
+    // lowest address the stack may ever reach.  Any growth past this
+    // point would corrupt .bss (which contains the heap array).
+    #[cfg(target_arch = "riscv32")]
+    {
+        unsafe extern "C" {
+            static _stack_end_cpu0: u8;
+        }
+        let stack_bottom = (&raw const _stack_end_cpu0) as usize;
+        sp.saturating_sub(stack_bottom)
+    }
+
+    #[cfg(not(target_arch = "riscv32"))]
+    {
+        sp
+    }
 }
 
 struct BufWriter<'a> {

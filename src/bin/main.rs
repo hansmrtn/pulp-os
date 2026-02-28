@@ -1,16 +1,24 @@
-// pulp-os entry point — Embassy async main loop
+// pulp-os entry point — multi-task Embassy architecture
 //
-// Replaces the hand-rolled cooperative scheduler + block_on with
-// Embassy's executor.  A single async task drives everything:
+// Three cooperatively-scheduled Embassy tasks:
 //
-//   • 10 ms Ticker for input polling (replaces TIMER0 ISR + wake flags)
-//   • `select(busy_pin, ticker)` during display refresh lets us process
-//     input and pre-load the next page while the e-paper waveform runs
-//   • Direct `.await` on display BUSY pin — CPU sleeps (WFI) instead
-//     of spin-polling
+//   • `main`             — UI event loop, app dispatch, rendering.
+//                          Receives input from a Channel and checks
+//                          housekeeping signals each iteration.
 //
-// The App trait, all format/UI/driver code, and the strip-buffer
-// rendering pipeline are completely unchanged.
+//   • `input_task`       — Owns InputDriver + ADC.  Polls buttons at
+//                          10 ms via Ticker, publishes debounced events
+//                          through INPUT_EVENTS channel.  Reads battery
+//                          ADC every ~30 s and publishes via BATTERY_MV.
+//
+//   • `housekeeping_task`— Fires periodic signals consumed by main for
+//                          status-bar refresh (5 s), SD presence check
+//                          (30 s), and bookmark flush (30 s).
+//
+// The CPU sleeps (WFI) whenever all tasks are waiting — Embassy's
+// executor handles this transparently.  During e-paper waveforms the
+// main task `select`s between the BUSY pin, the input channel, and a
+// work ticker so page pre-loads happen concurrently with the display.
 
 #![no_std]
 #![no_main]
@@ -38,6 +46,7 @@ use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::{self, DirCache};
 use pulp_os::drivers::strip::StripBuffer;
+use pulp_os::kernel::tasks;
 use pulp_os::kernel::uptime_secs;
 use pulp_os::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use pulp_os::ui::{
@@ -51,14 +60,12 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 // ── Constants ───────────────────────────────────────────────────────────
 
+/// Work-step cadence: 10 ms between `on_work` calls so multi-step
+/// operations (EPUB init, chapter caching) can progress while the
+/// event loop remains responsive.
 const TICK_MS: u64 = 10;
 
-/// Number of ticks between status-bar updates (500 × 10 ms = 5 s).
-const STATUS_INTERVAL: u32 = 500;
-
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
-const SD_CHECK_EVERY: u32 = 6; // × STATUS_INTERVAL ≈ 30 s
-const BATTERY_READ_EVERY: u32 = 6; // × STATUS_INTERVAL ≈ 30 s
 
 // ── App dispatch macro (unchanged) ──────────────────────────────────────
 
@@ -136,29 +143,42 @@ macro_rules! apply_transition {
 //
 // Used for both full and partial refreshes.  While the display
 // controller is running a waveform (~400 ms DU, ~1.6 s GC), we
-// `select` between the BUSY pin going low and the next ticker tick.
-// On each tick we poll input and — critically — dispatch page-turn
-// events so that `on_work` can pre-load the next page from SD.
-// Transitions (Back, Home) are deferred until the waveform completes.
+// `select` between the BUSY pin, the input Channel, and a work
+// Ticker.  Page-turn events dispatched here trigger `on_work` to
+// pre-load the next page from SD, so by the time the waveform
+// completes the new content is ready to render immediately.
+// Non-trivial transitions (Back, Home) are deferred until the
+// waveform finishes.
+//
+// The input_task continues polling the ADC and publishing events into
+// INPUT_EVENTS while we're in this loop.
 
 macro_rules! busy_wait_with_input {
-    ($epd:expr, $ticker:expr, $input:expr, $mapper:expr,
+    ($epd:expr, $mapper:expr,
      $quick_menu:expr, $launcher:expr,
      $home:expr, $files:expr, $reader:expr, $settings:expr,
      $dir_cache:expr, $bm_cache:expr, $sd:expr) => {{
         let mut _deferred: Option<Transition> = None;
+        let mut _work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
         loop {
-            // Level-check first; avoids creating a future if already done.
+            // Level-check first; avoids creating futures if already done.
             if !$epd.is_busy() {
                 break;
             }
-            let result = select($epd.busy_pin().wait_for_low(), $ticker.next()).await;
-            match result {
+
+            // Wait for the display to finish, an input event, or a
+            // work tick — whichever comes first.  Nested `select`
+            // avoids depending on `select3`.
+            match select(
+                $epd.busy_pin().wait_for_low(),
+                select(tasks::INPUT_EVENTS.receive(), _work_ticker.next()),
+            )
+            .await
+            {
                 Either::First(_) => break,
-                Either::Second(_) => {
-                    let Some(hw_event) = $input.poll() else {
-                        continue;
-                    };
+
+                // Input event from the channel
+                Either::Second(Either::First(hw_event)) => {
                     let event = $mapper.map_event(hw_event);
 
                     // Skip quick-menu interactions during refresh;
@@ -173,17 +193,20 @@ macro_rules! busy_wait_with_input {
                     if !matches!(t, Transition::None) && _deferred.is_none() {
                         _deferred = Some(t);
                     }
-
-                    // Pre-load the next page while the waveform runs.
-                    let active = $launcher.active();
-                    let needs = with_app!(active, $home, $files, $reader, $settings, |app| app
-                        .needs_work());
-                    if needs {
-                        let mut svc = Services::new($dir_cache, $bm_cache, &$sd);
-                        with_app!(active, $home, $files, $reader, $settings, |app| app
-                            .on_work(&mut svc, &mut $launcher.ctx));
-                    }
                 }
+
+                // Work tick — no event, just drive on_work
+                Either::Second(Either::Second(_)) => {}
+            }
+
+            // Pre-load the next page while the waveform runs.
+            let active = $launcher.active();
+            let needs = with_app!(active, $home, $files, $reader, $settings, |app| app
+                .needs_work());
+            if needs {
+                let mut svc = Services::new($dir_cache, $bm_cache, &$sd);
+                with_app!(active, $home, $files, $reader, $settings, |app| app
+                    .on_work(&mut svc, &mut $launcher.ctx));
             }
         }
         _deferred
@@ -239,7 +262,7 @@ static SETTINGS: StaticCell<SettingsApp> = StaticCell::new();
 // ═════════════════════════════════════════════════════════════════════════
 
 #[esp_rtos::main]
-async fn main(_spawner: embassy_executor::Spawner) -> ! {
+async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -289,7 +312,10 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         }
     }
 
-    // ── Input ───────────────────────────────────────────────────────────
+    // ── Input (local before task spawn) ─────────────────────────────────
+    //
+    // InputDriver is created here, used for the initial battery read and
+    // progressive render callback, then *moved* into `input_task`.
 
     let mut input = InputDriver::new(board.input);
     let mapper = ButtonMapper::new();
@@ -323,7 +349,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         home.load_recent(&mut svc);
     }
 
-    // ── Initial render ──────────────────────────────────────────────────
+    // ── Initial render (before tasks are spawned) ───────────────────────
 
     let cached_battery_mv_init = battery::adc_to_battery_mv(input.read_battery_mv());
     update_statusbar(statusbar, cached_battery_mv_init, sd_ok);
@@ -351,33 +377,52 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     // Drain stale redraw left by on_enter
     let _ = launcher.ctx.take_redraw();
     info!("ui ready.");
+
+    // ── Spawn background tasks ──────────────────────────────────────────
+    //
+    // InputDriver is moved into the input task — from this point on,
+    // all button events arrive through INPUT_EVENTS and battery
+    // readings through BATTERY_MV.
+
+    spawner.spawn(tasks::input_task(input)).unwrap();
+    spawner.spawn(tasks::housekeeping_task()).unwrap();
+    info!("tasks spawned (input_task, housekeeping_task).");
     info!("kernel ready.");
 
     // ═════════════════════════════════════════════════════════════════════
     // Main event loop
+    //
+    // Wakes on:
+    //   • Input event from `input_task` via INPUT_EVENTS channel
+    //   • Work ticker (10 ms) for multi-step operations
+    //
+    // Each iteration also checks housekeeping signals (non-blocking)
+    // from `housekeeping_task` and drives app work + rendering.
     // ═════════════════════════════════════════════════════════════════════
 
-    let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
+    let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
     let mut partial_refreshes: u32 = 0;
-    let mut status_counter: u32 = 0;
-    let mut sd_check_counter: u32 = 0;
-    let mut battery_read_counter: u32 = 0;
     let mut cached_battery_mv: u16 = cached_battery_mv_init;
     #[allow(unused_assignments)]
     let mut render_bar_overlaps: bool = false;
 
     loop {
-        // ── 1. Wait for next tick ───────────────────────────────────────
+        // ── 1. Wait for input event or work tick ────────────────────────
         //
-        // The CPU enters WFI here.  Any interrupt (timer, GPIO) wakes it.
-        // If we fell behind (e.g. slow SD I/O), the ticker fires
-        // immediately for each missed tick until we catch up.
-        ticker.next().await;
+        // `select` wakes on whichever resolves first.  Input events
+        // wake the loop immediately; the work ticker ensures `on_work`
+        // progresses at 10 ms cadence even when no buttons are pressed
+        // (critical for multi-step EPUB init / chapter caching).
 
-        // ── 2. Poll and process input ───────────────────────────────────
+        let hw_event = match select(tasks::INPUT_EVENTS.receive(), work_ticker.next()).await {
+            Either::First(ev) => Some(ev),
+            Either::Second(_) => None,
+        };
 
-        if let Some(hw_event) = input.poll() {
+        // ── 2. Process input event ──────────────────────────────────────
+
+        if let Some(hw_event) = hw_event {
             // Button feedback (edge labels)
             match hw_event {
                 pulp_os::drivers::input::Event::Press(btn) => {
@@ -496,9 +541,9 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 
         // ── 3. App work ─────────────────────────────────────────────────
         //
-        // Run one work step per tick.  Multi-step operations (EPUB init,
-        // chapter caching) return after each SD I/O so input can be
-        // polled between steps.
+        // Run one work step per iteration.  Multi-step operations
+        // (EPUB init, chapter caching) return after each SD I/O so
+        // input can be processed between steps.
         {
             let active = launcher.active();
             let needs = with_app!(active, home, files, reader, settings, |app| {
@@ -512,33 +557,35 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             }
         }
 
-        // ── 4. Periodic housekeeping ────────────────────────────────────
+        // ── 4. Housekeeping (signal-driven) ─────────────────────────────
+        //
+        // Non-blocking channel checks — housekeeping_task fires these
+        // on independent timers.  Zero cost when no signal is pending.
 
-        status_counter += 1;
-        if status_counter >= STATUS_INTERVAL {
-            status_counter = 0;
+        // Battery voltage (updated every ~30 s by input_task)
+        if let Some(mv) = tasks::BATTERY_MV.try_take() {
+            cached_battery_mv = mv;
+        }
 
-            sd_check_counter += 1;
-            if sd_check_counter >= SD_CHECK_EVERY {
-                sd_check_counter = 0;
-                sd_ok = board
-                    .storage
-                    .sd
-                    .volume_mgr
-                    .open_volume(embedded_sdmmc::VolumeIdx(0))
-                    .is_ok();
-            }
+        // SD card presence check (every ~30 s)
+        if tasks::SD_CHECK_DUE.try_take().is_some() {
+            sd_ok = board
+                .storage
+                .sd
+                .volume_mgr
+                .open_volume(embedded_sdmmc::VolumeIdx(0))
+                .is_ok();
+        }
 
-            battery_read_counter += 1;
-            if battery_read_counter >= BATTERY_READ_EVERY {
-                battery_read_counter = 0;
-                cached_battery_mv = battery::adc_to_battery_mv(input.read_battery_mv());
-            }
-
+        // Bookmark flush (every ~30 s)
+        if tasks::BOOKMARK_FLUSH_DUE.try_take().is_some() {
             if bm_cache.is_dirty() {
                 bm_cache.flush(&board.storage.sd);
             }
+        }
 
+        // Status bar refresh (every ~5 s)
+        if tasks::STATUS_DUE.try_take().is_some() {
             update_statusbar(statusbar, cached_battery_mv, sd_ok);
         }
 
@@ -591,15 +638,13 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                         // Phase 2: kick DU waveform (~400-600 ms)
                         board.display.epd.partial_start_du(&rs);
 
-                        // Process input while DU runs — the key
-                        // snappiness win.  Page turns dispatched here
-                        // trigger on_work to pre-load the next page
+                        // Process input + drive work while DU runs —
+                        // the key snappiness win.  Page turns dispatched
+                        // here trigger on_work to pre-load the next page
                         // from SD, so by the time DU finishes the new
                         // content is ready to render immediately.
                         let deferred = busy_wait_with_input!(
                             board.display.epd,
-                            ticker,
-                            input,
                             mapper,
                             quick_menu,
                             launcher,
@@ -682,9 +727,9 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                             }
                             bumps.draw(s);
                         },
-                        || {
-                            let _ = input.poll();
-                        },
+                        // Input polling is handled by input_task; events
+                        // buffer in INPUT_EVENTS while strips are written.
+                        || {},
                     );
                 });
 
@@ -693,8 +738,6 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                 // Process input during the ~1.6 s GC waveform.
                 let deferred = busy_wait_with_input!(
                     board.display.epd,
-                    ticker,
-                    input,
                     mapper,
                     quick_menu,
                     launcher,
@@ -733,6 +776,7 @@ fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
         battery_mv,
         battery_pct: bat_pct,
         heap_used: stats.current_usage,
+        heap_peak: stats.max_usage,
         heap_total: HEAP_TOTAL,
         stack_free: free_stack_bytes(),
         sd_ok,
