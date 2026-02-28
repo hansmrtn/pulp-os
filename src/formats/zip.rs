@@ -1,9 +1,7 @@
 // ZIP central directory parser and streaming entry extraction
 //
-// parse_eocd -> parse_central_directory -> find -> extract_entry
-// ZipIndex ~5KB inline (256 entries); names heap-allocated during
-// parse, freed on clear(). DEFLATE in 4KB SD chunks; all allocs
-// use try_reserve for graceful OOM.
+// ZipIndex: 256 entries inline (~5KB); names heap-allocated during parse.
+// DEFLATE in 4KB chunks; try_reserve throughout for graceful OOM.
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -77,7 +75,7 @@ impl ZipIndex {
         self.names = Vec::new();
     }
 
-    // parse EOCD from the tail of the file; returns (cd_offset, cd_size)
+    // parse EOCD from file tail; returns (cd_offset, cd_size)
     pub fn parse_eocd(tail: &[u8], file_size: u32) -> Result<(u32, u32), &'static str> {
         if tail.len() < 22 {
             return Err("zip: tail too short for EOCD");
@@ -104,7 +102,7 @@ impl ZipIndex {
         Ok((cd_offset, cd_size))
     }
 
-    // parse central directory bytes into the entry index
+    // parse central directory into the entry index
     pub fn parse_central_directory(&mut self, cd: &[u8]) -> Result<(), &'static str> {
         self.count = 0;
         self.names.clear();
@@ -206,7 +204,7 @@ impl ZipIndex {
         None
     }
 
-    // bytes to skip past a local file header to reach entry data
+    // bytes past local file header to reach entry data
     pub fn local_header_data_skip(header: &[u8]) -> Result<u32, &'static str> {
         if header.len() < 30 {
             return Err("zip: local header too short");
@@ -220,7 +218,7 @@ impl ZipIndex {
     }
 }
 
-// ── Entry extraction (requires alloc) ─────────────────────────────────
+// ── Entry extraction ──────────────────────────────────────────────────
 
 pub fn extract_entry<E, F>(
     entry: &ZipEntry,
@@ -291,8 +289,7 @@ where
         .map_err(|_| "zip: chapter too large for memory")?;
     output.resize(uncomp_size, 0);
 
-    // ~11KB DecompressorOxide + 4KB rbuf on heap to avoid stack overflow.
-    // Alloc zeroed directly — Box::new() would construct on stack first.
+    // ~11KB DecompressorOxide; alloc zeroed directly — Box::new() overflows stack
     let decomp_ptr =
         unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<DecompressorOxide>()) };
     if decomp_ptr.is_null() {
@@ -307,7 +304,7 @@ where
     let mut comp_left = comp_size;
 
     loop {
-        // top up read buffer from SD
+        // top up read buffer
         if in_avail < DEFLATE_READ_BUF && comp_left > 0 {
             let space = DEFLATE_READ_BUF - in_avail;
             let want = space.min(comp_left);

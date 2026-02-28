@@ -101,11 +101,7 @@ pub fn encode_cache_meta(
     total
 }
 
-// Parse and validate META.BIN, writing chapter sizes directly into
-// the caller's slice.  Returns `Ok(chapter_count)` on success.
-//
-// This avoids the 1 KB `CacheInfo` temporary that previously lived on
-// the stack — critical on ESP32-C3 where esp-rtos leaves < 6 KB.
+// parse and validate META.BIN; write chapter sizes into caller's slice
 pub fn parse_cache_meta(
     data: &[u8],
     epub_size: u32,
@@ -159,8 +155,7 @@ pub fn parse_cache_meta(
     Ok(count)
 }
 
-// stream-decompress ZIP entry, strip HTML, emit plain-text chunks.
-// ~47KB temp heap for DEFLATE; freed on return. Returns total text bytes.
+// stream-decompress ZIP entry, strip HTML, emit plain-text chunks; ~47KB temp heap
 pub fn stream_strip_entry<E>(
     entry: &ZipEntry,
     local_offset: u32,
@@ -180,7 +175,7 @@ pub fn stream_strip_entry<E>(
     }
 }
 
-// stored entry: read raw, strip HTML, write via callback. Stack only.
+// stored entry: read raw, strip HTML, write via callback; stack only
 fn stream_stored<E>(
     entry: &ZipEntry,
     data_offset: u32,
@@ -230,10 +225,7 @@ fn stream_stored<E>(
     Ok(total_written)
 }
 
-// ── DEFLATE entries ───────────────────────────────────────────────────────
-
-// deflate entry: decompress in 32KB circular window, strip HTML.
-// ~47KB temp heap (DecompressorOxide + window + read buffer).
+// deflate entry: decompress in 32KB circular window, strip HTML; ~47KB temp heap
 fn stream_deflate<E>(
     entry: &ZipEntry,
     data_offset: u32,
@@ -252,12 +244,7 @@ fn stream_deflate<E>(
         uncomp_size
     );
 
-    // ── Heap allocations ──────────────────────────────────────────
-    //
-    // DecompressorOxide is ~11 KB (Huffman tables, state machine).
-    // Box::new() would construct on the stack first and memcpy,
-    // overflowing the ESP32-C3 stack.  Allocate zeroed directly.
-    // Safety: DecompressorOxide::default() is all-zeros.
+    // ~11KB DecompressorOxide; alloc zeroed directly — Box::new() overflows stack
 
     let decomp_ptr =
         unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<DecompressorOxide>()) };
@@ -266,20 +253,18 @@ fn stream_deflate<E>(
     }
     let mut decomp = unsafe { Box::from_raw(decomp_ptr as *mut DecompressorOxide) };
 
-    // 32 KB circular dictionary window.
+    // 32KB circular dictionary window
     let mut window = Vec::new();
     window
         .try_reserve_exact(WINDOW_SIZE)
         .map_err(|_| "cache: OOM for window")?;
     window.resize(WINDOW_SIZE, 0);
 
-    // 4 KB compressed-data read buffer.
+    // 4KB compressed-data read buffer
     let mut rbuf = Vec::new();
     rbuf.try_reserve_exact(READ_BUF_SIZE)
         .map_err(|_| "cache: OOM for read buffer")?;
     rbuf.resize(READ_BUF_SIZE, 0);
-
-    // ── Stack allocations ─────────────────────────────────────────
 
     let mut stripper = HtmlStripStream::new();
     let mut strip_buf = [0u8; STRIP_BUF_SIZE];
@@ -292,7 +277,7 @@ fn stream_deflate<E>(
     let mut out_pos: usize = 0; // logical position in the circular window
 
     loop {
-        // ── Top up read buffer from SD ────────────────────────────
+        // top up read buffer from SD
         if in_avail < READ_BUF_SIZE && comp_left > 0 {
             let space = READ_BUF_SIZE - in_avail;
             let want = space.min(comp_left);
@@ -313,13 +298,7 @@ fn stream_deflate<E>(
             return Err("cache: empty deflate stream");
         }
 
-        // ── Decompress ────────────────────────────────────────────
-        //
-        // Do NOT set TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF.
-        // This enables circular-buffer mode: the window wraps at
-        // WINDOW_SIZE and the decompressor returns HasMoreOutput
-        // when out_pos reaches the buffer boundary.
-
+        // circular-buffer mode: do NOT set TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
         let flags = if comp_left > 0 {
             inflate_flags::TINFL_FLAG_HAS_MORE_INPUT
         } else {
@@ -330,12 +309,7 @@ fn stream_deflate<E>(
         let (status, consumed, produced) =
             decompress(&mut decomp, &rbuf[..in_avail], &mut window, out_pos, flags);
 
-        // ── Feed new output to the HTML stripper ──────────────────
-        //
-        // In wrapping mode, decompress stops at the WINDOW_SIZE
-        // boundary, so `old_out_pos + produced <= WINDOW_SIZE`.
-        // The output is always a contiguous slice within the window.
-
+        // feed new output to HTML stripper; always contiguous within window
         if produced > 0 {
             let end = old_out_pos + produced;
             debug_assert!(
@@ -357,24 +331,16 @@ fn stream_deflate<E>(
 
         out_pos += produced;
 
-        // ── Shift remaining compressed input ──────────────────────
-
         if consumed > 0 && consumed < in_avail {
             rbuf.copy_within(consumed..in_avail, 0);
         }
         in_avail -= consumed;
 
-        // ── Handle status ─────────────────────────────────────────
-
         match status {
             TINFLStatus::Done => break,
 
             TINFLStatus::HasMoreOutput => {
-                // Window is full — the decompressor stopped at
-                // out_pos == WINDOW_SIZE.  Reset to 0 so the next
-                // call starts writing at the beginning of the
-                // circular buffer.  The window data stays intact
-                // for back-reference resolution.
+                // window full; reset to 0, data stays for back-references
                 out_pos = 0;
             }
 
@@ -391,8 +357,6 @@ fn stream_deflate<E>(
         }
     }
 
-    // ── Flush remaining stripped text ──────────────────────────────
-
     let trailing = stripper.finish(&mut strip_buf[strip_pos..]);
     strip_pos += trailing;
     if strip_pos > 0 {
@@ -400,11 +364,8 @@ fn stream_deflate<E>(
         total_written += strip_pos as u32;
     }
 
-    // decomp, window, rbuf dropped here → heap freed
     Ok(total_written)
 }
-
-// ── Stripper feed + flush helper ──────────────────────────────────────────
 
 // feed input through stripper; flush to output_fn at FLUSH_THRESHOLD
 fn feed_and_flush(
@@ -435,24 +396,13 @@ fn feed_and_flush(
         *strip_pos += written;
 
         if consumed == 0 && written == 0 {
-            // No progress.  If the strip buffer has data, flush it to
-            // make room; otherwise the input byte genuinely produced
-            // no output (e.g. a whitespace-only tag).
+            // no progress: flush if we have data, otherwise skip byte
             if *strip_pos > 0 {
                 output_fn(&strip_buf[..*strip_pos])?;
                 *total_written += *strip_pos as u32;
                 *strip_pos = 0;
             } else {
-                // Stripper consumed nothing and produced nothing with
-                // an empty output buffer.  This can happen if the input
-                // byte is inside a tag or entity that needs more bytes.
-                // Since we always pass a non-zero output slice above,
-                // this means the stripper is stuck waiting for more
-                // input context.  Advance ip to avoid an infinite loop.
-                //
-                // In practice this should not happen because the
-                // stripper always consumes at least one input byte when
-                // given output space.  Safety net only.
+                // safety net: advance to avoid infinite loop
                 ip += 1;
             }
             continue;

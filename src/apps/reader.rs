@@ -808,10 +808,7 @@ impl ReaderApp {
         );
     }
 
-    /// Read the entire current chapter into `ch_cache` (heap Vec).
-    /// Returns true if the chapter fits and was loaded successfully.
-    /// On failure the cache is cleared and the caller should fall
-    /// back to the paged SD path.
+    // load current chapter into ch_cache; returns true on success, false → fall back to paged SD
     fn try_cache_chapter<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -879,10 +876,7 @@ impl ReaderApp {
         true
     }
 
-    /// Compute ALL page offsets from the RAM-cached chapter text.
-    /// Pure CPU work, no SD I/O.  After this, `fully_indexed` is
-    /// true and the progress bar / page count are accurate from
-    /// page 1.
+    // compute all page offsets from cached chapter text; pure CPU, no SD I/O
     fn preindex_all_pages(&mut self) {
         if self.ch_cache.is_empty() {
             return;

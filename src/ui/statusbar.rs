@@ -26,11 +26,12 @@ pub struct SystemStatus {
     pub heap_peak: usize,
     pub heap_total: usize,
     pub stack_free: usize,
+    pub stack_hwm: usize,
     pub sd_ok: bool,
 }
 
 pub struct StatusBar {
-    buf: [u8; 96],
+    buf: [u8; 112],
     len: usize,
 }
 
@@ -43,7 +44,7 @@ impl Default for StatusBar {
 impl StatusBar {
     pub const fn new() -> Self {
         Self {
-            buf: [0u8; 96],
+            buf: [0u8; 112],
             len: 0,
         }
     }
@@ -90,7 +91,8 @@ impl StatusBar {
         }
 
         if s.stack_free > 0 {
-            let _ = write!(w, "  S:{}K", s.stack_free / 1024);
+            // free / high-water-mark (peak usage) — both in KB
+            let _ = write!(w, "  S:{}K/{}K", s.stack_free / 1024, s.stack_hwm / 1024);
         }
 
         let _ = write!(w, "  SD:{}", if s.sd_ok { "OK" } else { "--" });
@@ -122,20 +124,7 @@ impl StatusBar {
     }
 }
 
-/// Real free stack bytes: distance from current SP down to the
-/// linker-defined bottom of the stack region (`_stack_end_cpu0`).
-///
-/// On ESP32-C3 the memory layout (low → high) is:
-///
-///   .data / .bss (including the heap static)  ← `_stack_end_cpu0`
-///   ┈┈┈┈ free stack headroom ┈┈┈┈┈┈┈┈┈┈┈┈┈┈  ← SP (grows ↓)
-///   stack in use
-///   `_stack_start_cpu0`                        ← top of DRAM
-///
-/// Previous implementation measured `SP − DRAM_BASE` which included
-/// the heap, .bss, and .data — always returning a misleadingly large
-/// number.  This version measures only the gap that remains before
-/// the stack collides with .bss / the heap.
+// distance from current SP down to _stack_end_cpu0 (bottom of stack / top of .bss)
 pub fn free_stack_bytes() -> usize {
     let sp: usize;
     #[cfg(target_arch = "riscv32")]
@@ -147,9 +136,7 @@ pub fn free_stack_bytes() -> usize {
         sp = 0;
     }
 
-    // _stack_end_cpu0 is placed by the linker right after .bss — the
-    // lowest address the stack may ever reach.  Any growth past this
-    // point would corrupt .bss (which contains the heap array).
+    // lowest address the stack may reach; growth past this corrupts .bss
     #[cfg(target_arch = "riscv32")]
     {
         unsafe extern "C" {
@@ -162,6 +149,85 @@ pub fn free_stack_bytes() -> usize {
     #[cfg(not(target_arch = "riscv32"))]
     {
         sp
+    }
+}
+
+// ── Stack painting ───────────────────────────────────────────────────────
+//
+// paint_stack() fills unused stack with 0xDEAD_BEEF at boot.
+// stack_high_water_mark() scans upward to find peak usage.
+
+const STACK_PAINT_WORD: u32 = 0xDEAD_BEEF;
+
+// fill unused stack with sentinel; call once early in main before task spawn
+pub fn paint_stack() {
+    #[cfg(target_arch = "riscv32")]
+    {
+        let sp: usize;
+        unsafe {
+            core::arch::asm!("mv {}, sp", out(reg) sp);
+        }
+
+        unsafe extern "C" {
+            static _stack_end_cpu0: u8;
+        }
+        let bottom = (&raw const _stack_end_cpu0) as usize;
+
+        // skip 256B above _stack_end_cpu0: covers esp-hal stack guard word
+        let guard_skip = 256;
+        let paint_bottom = bottom + guard_skip;
+
+        // leave 256B below SP unpainted (our own frame + ISR margin)
+        let paint_top = sp.saturating_sub(256);
+
+        if paint_top <= paint_bottom {
+            return;
+        }
+
+        let start = (paint_bottom + 3) & !3;
+
+        let mut addr = start;
+        while addr + 4 <= paint_top {
+            unsafe {
+                core::ptr::write_volatile(addr as *mut u32, STACK_PAINT_WORD);
+            }
+            addr += 4;
+        }
+    }
+}
+
+// scan for first non-sentinel word from stack bottom; returns peak usage in bytes
+pub fn stack_high_water_mark() -> usize {
+    #[cfg(target_arch = "riscv32")]
+    {
+        unsafe extern "C" {
+            static _stack_end_cpu0: u8;
+            static _stack_start_cpu0: u8;
+        }
+        let bottom = (&raw const _stack_end_cpu0) as usize;
+        let top = (&raw const _stack_start_cpu0) as usize;
+
+        // skip same guard region as paint_stack
+        let guard_skip = 256;
+        let scan_bottom = bottom + guard_skip;
+
+        let start = (scan_bottom + 3) & !3;
+
+        let mut addr = start;
+        while addr + 4 <= top {
+            let val = unsafe { core::ptr::read_volatile(addr as *const u32) };
+            if val != STACK_PAINT_WORD {
+                break;
+            }
+            addr += 4;
+        }
+
+        top.saturating_sub(addr)
+    }
+
+    #[cfg(not(target_arch = "riscv32"))]
+    {
+        0
     }
 }
 

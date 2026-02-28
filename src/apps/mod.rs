@@ -1,9 +1,8 @@
 // Application framework and launcher
 //
-// Stack-allocated app structs behind the App trait. Launcher holds a
-// nav stack (max 4) and AppContext for messaging/redraw. No dyn, no heap.
-// Apps needing SD return needs_work()=true; kernel calls on_work() with
-// a Services handle before rendering. Services is the syscall boundary.
+// App trait + nav stack (max 4). No dyn, no heap.
+// needs_work()/on_work() decouple SD I/O from rendering.
+// Services is the syscall boundary into storage.
 
 pub mod bookmarks;
 pub mod files;
@@ -28,10 +27,8 @@ pub enum AppId {
     Settings,
 }
 
-// Push: new app on top, old app suspended (gets on_resume later)
-// Pop:  return to parent, current app exits
-// Replace: swap in place, no back navigation
-// Home: unwind entire stack back to Home
+// Push: suspend current, push new. Pop: exit current, resume parent.
+// Replace: swap in place. Home: unwind to root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
@@ -48,7 +45,7 @@ pub enum Redraw {
     Full,
 }
 
-// 64 bytes is enough for an 8.3 filename or short path
+// 8.3 filename or short path
 const MSG_BUF_SIZE: usize = 64;
 
 pub struct AppContext {
@@ -94,7 +91,6 @@ impl AppContext {
         self.redraw = Redraw::Full;
     }
 
-    // full GC refresh; use mark_dirty for small same-screen updates
     pub fn request_screen_redraw(&mut self) {
         self.request_full_redraw();
     }
@@ -125,7 +121,7 @@ impl AppContext {
     }
 }
 
-// Each call re-opens volume/dir/file; reader uses prefetch to amortize cost.
+// each call re-opens volume/dir/file; reader uses prefetch to amortize cost
 pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
     dir_cache: &'a mut DirCache,
     bookmarks: &'a mut BookmarkCache,
@@ -145,12 +141,10 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         }
     }
 
-    /// Access the shared bookmark cache (in-memory, no SD I/O).
     pub fn bookmarks(&self) -> &BookmarkCache {
         self.bookmarks
     }
 
-    /// Mutable access to the bookmark cache for saves.
     pub fn bookmarks_mut(&mut self) -> &mut BookmarkCache {
         self.bookmarks
     }
@@ -193,7 +187,7 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::write_file(self.sd, name, data)
     }
 
-    // ── Subdirectory operations (EPUB chapter cache) ──────────────
+    // ── Subdirectory ops (EPUB chapter cache) ────────────────────
 
     pub fn ensure_dir(&self, name: &str) -> Result<(), &'static str> {
         storage::ensure_dir(self.sd, name)
@@ -231,8 +225,6 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::ensure_pulp_dir(self.sd)
     }
 
-    // file ops directly inside _PULP/
-
     pub fn read_pulp_start(
         &self,
         name: &str,
@@ -254,7 +246,7 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::write_pulp_file(self.sd, name, data)
     }
 
-    // nested subdir ops inside _PULP/<dir>/
+    // nested ops inside _PULP/<dir>/
 
     pub fn ensure_pulp_subdir(&self, name: &str) -> Result<(), &'static str> {
         storage::ensure_pulp_subdir(self.sd, name)
@@ -298,20 +290,16 @@ pub trait App {
     }
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition;
 
-    // help text for current state
     fn help_text(&self) -> &'static str {
         ""
     }
 
-    // app items for quick menu; empty = core only
     fn quick_actions(&self) -> &[QuickAction] {
         &[]
     }
 
-    // quick menu trigger fired; id from QuickAction
     fn on_quick_trigger(&mut self, _id: u8, _ctx: &mut AppContext) {}
 
-    // quick menu cycle value updated
     fn on_quick_cycle_update(&mut self, _id: u8, _value: u8, _ctx: &mut AppContext) {}
 
     // called once per strip during refresh; widgets clip automatically

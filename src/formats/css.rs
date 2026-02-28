@@ -1,22 +1,8 @@
 // Minimal CSS parser for EPUB stylesheets
 //
-// Parses CSS text into a compact rule table for tag-based and class-based
-// style resolution.  Supports:
-//
-//   Selectors:  tag, .class, tag.class, grouped (h1, h2 { })
-//   Properties: font-weight, font-style, text-align, text-indent,
-//               margin (shorthand + individual), display, text-decoration
-//
-// @-rules (@media, @font-face, @import, @charset) are skipped.
-// Descendant / child / sibling combinators are simplified to the
-// rightmost simple selector (covers the common case).
-// Pseudo-classes and pseudo-elements are stripped.
-//
-// The rule table is stack-allocated: MAX_CSS_RULES entries at ~16 bytes
-// each = 2 KB.  Typical EPUBs have 30–80 rules.
-//
-// Resolution: `CssRules::resolve(tag, class)` returns merged `StyleProps`
-// from all matching rules, cascaded by specificity (tag < class < tag+class).
+// Selectors: tag, .class, tag.class, grouped. Combinators reduced to
+// rightmost simple selector. @-rules and pseudo-classes skipped.
+// Rule table stack-allocated: MAX_CSS_RULES × ~16B = 2KB.
 
 pub const MAX_CSS_RULES: usize = 128;
 

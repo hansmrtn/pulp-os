@@ -1,13 +1,7 @@
-// XTEink X4 board support package
+// XTEink X4 board support (ESP32-C3, SSD1677 800x480, SD over SPI2)
 //
-// ESP32C3, SSD1677 800x480 epaper, SD over shared SPI2.
-// DMA-backed SPI (GDMA CH0) — hardware pushes/pulls buffers over
-// SPI autonomously, freeing the CPU from FIFO babysitting.
-// RefCellDevice arbitrates bus (single threaded, no ISR access).
-//
-// Display BUSY (GPIO6) is no longer interrupt-driven here; esp-hal's
-// async `Wait` implementation manages the GPIO6 interrupt internally
-// when `Input::wait_for_low().await` is used from the Embassy executor.
+// DMA-backed SPI (GDMA CH0); RefCellDevice arbitrates bus.
+// BUSY (GPIO6) handled by esp-hal async Wait, not a pre-armed IRQ.
 
 pub mod action;
 pub mod button;
@@ -43,12 +37,11 @@ pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, 
 
 static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 
-// power button static: ISR clears interrupt, InputDriver reads level
+// ISR clears interrupt flag; InputDriver reads level via is_low()
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// GPIO ISR: power button (GPIO3) only; BUSY (GPIO6) handled by esp-hal async Wait.
-// The interrupt fires, clears its flag, and returns.  The interrupt itself exits
-// WFI inside the Embassy executor, so the next Ticker poll detects the button.
+// GPIO3 only; BUSY handled by esp-hal async Wait. Clears flag and returns;
+// any IRQ exits WFI inside the Embassy executor.
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
@@ -145,17 +138,17 @@ impl Board {
         }
     }
 
-    // 400kHz -> SD probe -> 20MHz, DMA-backed
+    // 400kHz for SD probe, then 20MHz; DMA-backed
     fn init_spi_peripherals(p: Peripherals) -> (DisplayHw, StorageHw) {
         let epd_cs = Output::new(p.GPIO21, Level::High, OutputConfig::default());
         let dc = Output::new(p.GPIO4, Level::High, OutputConfig::default());
         let rst = Output::new(p.GPIO5, Level::High, OutputConfig::default());
 
-        // do not arm an interrupt; esp-hal async Wait manages GPIO6 internally
+        // no pre-armed interrupt; esp-hal async Wait manages GPIO6
         let busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
         info!("display BUSY: GPIO6 (async wait, no pre-armed interrupt)");
 
-        // GPIO12 free in DIO mode; esp_hal has no type, use raw registers
+        // GPIO12 free in DIO mode; no esp-hal type, use raw registers
         let sd_cs = unsafe { raw_gpio::RawOutputPin::new(12) };
 
         let slow_cfg = spi::master::Config::default().with_frequency(Rate::from_khz(400));
@@ -166,11 +159,10 @@ impl Board {
             .with_mosi(p.GPIO10)
             .with_miso(p.GPIO7);
 
-        // 80 clocks with CS high (SD spec init) — done on raw SPI
-        // before DMA conversion since it's a one-shot init sequence.
+        // 80 clocks with CS high (SD spec init) before DMA conversion
         let _ = spi_raw.write(&[0xFF; 10]);
 
-        // 4096B each direction; strip max ~4000B, SD sectors 512B
+        // 4096B each direction: strip max ~4000B, SD sectors 512B
         let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(4096);
         let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
         let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();

@@ -626,10 +626,7 @@ pub fn parse_nav_toc(
     }
 }
 
-/// Find the byte range of the `<nav epub:type="toc">` content.
-///
-/// Returns `(content_start, content_end)` — the bytes between `>`
-/// and the matching `</nav>`.
+// find the byte range of <nav epub:type="toc"> content; returns (start, end)
 fn find_nav_toc_region(data: &[u8]) -> Option<(usize, usize)> {
     let mut pos: usize = 0;
     while pos < data.len() {
@@ -697,11 +694,8 @@ fn find_nav_toc_region(data: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// Resolve a TOC href to a spine index.
-///
-/// Strips the fragment identifier, percent-decodes, resolves relative to
-/// `base_dir`, looks up the ZIP entry, and maps it to a spine position.
-/// Returns `0xFFFF` if the href cannot be resolved.
+// resolve TOC href to spine index; strips fragment, percent-decodes, resolves relative path
+// returns 0xFFFF if href cannot be resolved
 fn href_to_spine_idx(href: &[u8], base_dir: &str, spine: &EpubSpine, zip: &ZipIndex) -> u16 {
     let decoded = percent_decode(href);
     let href_str = core::str::from_utf8(&decoded).unwrap_or("");

@@ -104,7 +104,7 @@ impl BookmarkSlot {
     }
 }
 
-/// Lightweight entry for the bookmark list in HomeApp (35 bytes vs 48).
+// lightweight entry for the bookmark list (35 bytes vs 48 for BookmarkSlot)
 #[derive(Clone, Copy)]
 pub struct BmListEntry {
     pub filename: [u8; FILENAME_CAP],
@@ -126,7 +126,7 @@ impl BmListEntry {
 
 // ── Hash ────────────────────────────────────────────────────────────
 
-/// FNV-1a 32-bit hash.
+// FNV-1a 32-bit hash
 pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in data {
@@ -138,14 +138,11 @@ pub fn fnv1a(data: &[u8]) -> u32 {
 
 // ── RAM-resident cache ──────────────────────────────────────────────
 
-/// In-memory bookmark table. Loaded from SD once, all reads served
-/// from RAM. Writes mark the cache dirty for later `flush()`.
-///
-/// Total size: 16 × ~48 bytes + overhead ≈ 780 bytes.
+// in-memory bookmark table; loaded once, reads from RAM, writes mark dirty
+// ~780 bytes total (16 × 48B slots + overhead)
 pub struct BookmarkCache {
     slots: [BookmarkSlot; SLOTS],
-    /// Number of slots that were present in the file (may be < SLOTS).
-    /// New saves beyond this index extend the count.
+    // slots present in file; new saves past this extend count
     count: usize,
     dirty: bool,
     loaded: bool,
@@ -167,23 +164,19 @@ impl BookmarkCache {
         }
     }
 
-    /// True if in-memory state has changed since the last flush.
+    // true if in-memory state has changed since the last flush
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// True if the cache has been loaded from SD at least once.
+    // true if loaded from SD at least once
     pub fn is_loaded(&self) -> bool {
         self.loaded
     }
 
     // ── Load from SD ────────────────────────────────────────────
 
-    /// Read the bookmark file from SD into the in-memory cache.
-    ///
-    /// Idempotent — does nothing if already loaded. Call once at
-    /// boot (or whenever SD becomes available) before using
-    /// `find()`, `save()`, or `load_all()`.
+    // read bookmark file from SD; idempotent — no-op if already loaded
     pub fn ensure_loaded<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         if self.loaded {
             return;
@@ -191,8 +184,7 @@ impl BookmarkCache {
         self.force_load(sd);
     }
 
-    /// Unconditionally reload from SD, discarding any in-memory
-    /// changes. Use after SD hot-swap or to recover from errors.
+    // unconditionally reload from SD, discarding in-memory changes
     pub fn force_load<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         let mut buf = [0u8; FILE_LEN];
         let slot_count = match storage::read_pulp_file_start(sd, BOOKMARK_FILE, &mut buf) {
@@ -217,8 +209,7 @@ impl BookmarkCache {
 
     // ── In-memory reads (no SD I/O) ─────────────────────────────
 
-    /// Find a bookmark by filename. Returns `None` if not found or
-    /// if the cache has not been loaded yet.
+    // find bookmark by filename; None if not found or not yet loaded
     pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
         if !self.loaded {
             return None;
@@ -234,8 +225,7 @@ impl BookmarkCache {
         None
     }
 
-    /// Copy all valid bookmarks into `out`, sorted by generation
-    /// descending (most recent first). Returns count written.
+    // copy valid bookmarks into out, sorted by generation descending; returns count written
     pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
         if !self.loaded {
             return 0;
@@ -280,12 +270,8 @@ impl BookmarkCache {
 
     // ── In-memory writes (marks dirty, no SD I/O) ───────────────
 
-    /// Save a bookmark for the given file. Updates the in-memory
-    /// cache and marks it dirty. Call `flush()` later to persist.
-    ///
-    /// Handles LRU eviction, generation increment, and matching
-    /// by hash + full filename — identical logic to the old
-    /// `bookmarks::save`, but entirely in RAM.
+    // save bookmark; updates cache + marks dirty; call flush() to persist
+    // handles LRU eviction, generation increment, hash+name matching
     pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         if !self.loaded {
             log::warn!("bookmarks: save called before load, ignoring");
@@ -365,11 +351,7 @@ impl BookmarkCache {
 
     // ── Flush to SD ─────────────────────────────────────────────
 
-    /// Write the in-memory cache to SD if dirty. No-op if clean.
-    ///
-    /// Call on app exit, nav transitions, or periodically.
-    /// Uses a 768-byte stack buffer for encoding — safe to call
-    /// from the main loop where stack depth is shallow.
+    // write cache to SD if dirty; no-op if clean; 768-byte stack buffer
     pub fn flush<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         if !self.dirty || !self.loaded {
             return;

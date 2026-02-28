@@ -1,11 +1,8 @@
-// Single-pass HTML to styled-text converter for EPUB chapter XHTML
+// Single-pass HTML to styled-text converter for EPUB XHTML
 //
-// HtmlStripStream: stateful streaming converter (feed/finish), emits
-// 2-byte [0x01, tag] markers for bold/italic/heading/blockquote.
-// strip_html_inplace(): in-place converter for container.xml/OPF/TOC.
-//
-// Marker protocol: [MARKER=0x01, tag]. Inline: B/b I/i. Block: H/h
-// Q/q S(hr). Ordering: close -> \n\n -> open -> text.
+// HtmlStripStream: streaming feed/finish; emits 2-byte [MARKER, tag] style codes.
+// strip_html_inplace(): in-place variant for container.xml/OPF/TOC.
+// Marker: [0x01, tag]. Inline: B/b I/i. Block: H/h Q/q S(hr).
 
 use alloc::vec::Vec;
 
@@ -23,13 +20,10 @@ pub const QUOTE_OFF: u8 = b'q';
 // Standalone
 pub const BREAK: u8 = b'S';
 
-/// True if `b` is the escape byte that starts a 2-byte style marker.
 #[inline]
 pub const fn is_marker(b: u8) -> bool {
     b == MARKER
 }
-
-// ── Streaming stripper ────────────────────────────────────────────────
 
 const TAG_BUF_CAP: usize = 16;
 const ENTITY_BUF_CAP: usize = 12;
@@ -37,37 +31,23 @@ const BANG_BUF_CAP: usize = 8;
 const PENDING_CAP: usize = 16;
 const DEFERRED_CAP: usize = 8;
 
-/// Processing phase for the streaming state machine.
+// streaming state machine phases
 #[derive(Clone, Copy, PartialEq)]
 #[repr(u8)]
 enum Phase {
-    /// Normal text — emit stripped content.
     Text,
-    /// Saw `<`, need one more byte to determine tag type.
     AfterLt,
-    /// Reading the tag name into `tag_buf`.
     TagName,
-    /// Past the tag name, skipping attributes until `>`.
     TagBody,
-    /// After `&`, accumulating entity name into `entity_buf`.
     Entity,
-    /// Inside a skip element (script/style/head).
     SkipContent,
-    /// In skip content, saw `<`; check for `/`.
     SkipLt,
-    /// In skip content, saw `</`; reading close tag name.
     SkipCloseName,
-    /// In skip content, skipping to `>`.
     SkipToGt,
-    /// After `<!`, probing for comment/CDATA/other.
     BangProbe,
-    /// Inside `<!-- ... -->`, scanning for `-->`.
     Comment,
-    /// Inside `<![CDATA[ ... ]]>`, scanning for `]]>`.
     Cdata,
-    /// Inside `<? ... ?>`, scanning for `?>`.
     Pi,
-    /// Inside `<! ... >` (not comment/CDATA), scanning for `>`.
     BangOther,
 }
 
@@ -77,24 +57,7 @@ impl Default for HtmlStripStream {
     }
 }
 
-/// Stateful streaming HTML-to-styled-text converter.
-///
-/// Processes arbitrary chunks of HTML input via `feed()`, emitting
-/// styled plain text with inline escape markers.  Carries all state
-/// across calls in ~80 bytes of struct.
-///
-/// # Usage
-///
-/// ```ignore
-/// let mut s = HtmlStripStream::new();
-/// loop {
-///     let (consumed, written) = s.feed(&input[ip..], &mut output[op..]);
-///     ip += consumed; op += written;
-///     if consumed == 0 && written == 0 { break; }
-/// }
-/// let trailing = s.finish(&mut output[op..]);
-/// op += trailing;
-/// ```
+// stateful streaming HTML-to-styled-text converter; ~80 bytes of state
 pub struct HtmlStripStream {
     phase: Phase,
 
@@ -102,8 +65,7 @@ pub struct HtmlStripStream {
     tag_buf: [u8; TAG_BUF_CAP],
     tag_len: u8,
     is_close_tag: bool,
-    /// Tag was identified as skip-content; enter SkipContent on `>`.
-    enter_skip: bool,
+    enter_skip: bool, // tag is skip-content; enter SkipContent on >
 
     // ── Entity accumulation ────────────────────────────────────
     entity_buf: [u8; ENTITY_BUF_CAP],
@@ -111,8 +73,7 @@ pub struct HtmlStripStream {
 
     // ── Skip content ───────────────────────────────────────────
     skip_target: Option<SkipTag>,
-    /// In SkipToGt: did the close tag name match?
-    skip_match: bool,
+    skip_match: bool, // in SkipToGt: did close tag name match?
 
     // ── Bang construct probing ─────────────────────────────────
     bang_buf: [u8; BANG_BUF_CAP],
@@ -123,13 +84,8 @@ pub struct HtmlStripStream {
 
     // ── Output state ───────────────────────────────────────────
     last_was_space: bool,
-    /// Deferred newlines.  Block elements increment this; newlines
-    /// are only written to output when a non-whitespace byte follows
-    /// (via `queue_text`).  Capped at 2 (one blank line).
-    trailing_nl: u8,
-    /// True once any visible character has been emitted.  Suppresses
-    /// leading whitespace and controls whether `finish()` adds `\n`.
-    has_output: bool,
+    trailing_nl: u8, // deferred newlines; flushed before next visible byte; capped at 2
+    has_output: bool, // true once any visible char emitted; suppresses leading whitespace
 
     // ── Deferred open-style markers ────────────────────────────
     //
@@ -176,11 +132,7 @@ impl HtmlStripStream {
         }
     }
 
-    /// Process a chunk of HTML input, writing styled text to `output`.
-    ///
-    /// Returns `(input_bytes_consumed, output_bytes_written)`.  Call
-    /// again with remaining input if not all was consumed (happens
-    /// when `output` fills up).
+    // process a chunk of HTML; returns (consumed, written); call again if not all consumed
     pub fn feed(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize) {
         let ilen = input.len();
         let olen = output.len();
@@ -506,11 +458,7 @@ impl HtmlStripStream {
         }
     }
 
-    /// Signal end of input.  Flushes pending state and appends a
-    /// terminal newline if any content was produced.
-    ///
-    /// Returns the number of bytes written to `output`.  Caller
-    /// should provide at least `PENDING_CAP + 1` bytes of space.
+    // flush pending state; appends terminal newline if content was produced; returns bytes written
     pub fn finish(&mut self, output: &mut [u8]) -> usize {
         let mut op: usize = 0;
 
@@ -557,10 +505,7 @@ impl HtmlStripStream {
 
     // ── Internal: output helpers ──────────────────────────────────
 
-    /// Queue a visible text byte for output.
-    ///
-    /// Flushes deferred newlines (only after first output) and any
-    /// deferred style markers, then queues the text byte itself.
+    // queue visible text byte; flushes deferred newlines and style markers first
     fn queue_text(&mut self, b: u8) {
         // Deferred newlines
         if self.has_output && self.trailing_nl > 0 {
@@ -584,7 +529,7 @@ impl HtmlStripStream {
         self.has_output = true;
     }
 
-    /// Handle a whitespace byte — collapse runs to a single space.
+    // handle whitespace byte; collapse runs to a single space
     fn queue_ws(&mut self) {
         if self.last_was_space || !self.has_output {
             return;
@@ -601,11 +546,7 @@ impl HtmlStripStream {
 
     // ── Internal: tag classification ──────────────────────────────
 
-    /// Classify the accumulated tag name and update output state.
-    ///
-    /// Called once per tag from TagName when the name is complete
-    /// (hit a delimiter).  May push close markers to `pending`
-    /// (immediate) and open markers to `deferred`.
+    // classify accumulated tag name; push close markers to pending, open markers to deferred
     fn classify_tag(&mut self) {
         // Copy tag name to a local to avoid borrowing self.tag_buf
         // while we mutate self through push_pending / push_deferred.
@@ -656,7 +597,7 @@ impl HtmlStripStream {
         }
     }
 
-    /// Transition out of TagName/TagBody on '>'.
+    // transition out of TagName/TagBody on >
     fn finish_tag(&mut self) {
         if self.enter_skip {
             self.enter_skip = false;
@@ -942,10 +883,7 @@ fn find_close_tag(data: &[u8], name: &[u8]) -> Option<usize> {
 
 // ── Shared: entity resolution (streaming stripper) ────────────────────
 
-/// Resolve an entity name (bytes between `&` and `;`) to an output byte.
-///
-/// Returns `Some(byte)` for recognised entities (including Unicode
-/// codepoints mapped to ASCII); `None` for unrecognised names.
+// resolve entity name to output byte; None for unrecognised names
 fn resolve_entity(name: &[u8]) -> Option<u8> {
     match name {
         b"amp" => Some(b'&'),
@@ -1109,7 +1047,6 @@ fn is_tag_delim(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/')
 }
 
-/// Characters that can appear in an entity name between `&` and `;`.
 #[inline]
 fn is_entity_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'#'

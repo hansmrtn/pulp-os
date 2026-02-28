@@ -11,7 +11,10 @@ mod widget;
 pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
 pub use button_feedback::ButtonFeedback;
 pub use quick_menu::QuickMenu;
-pub use statusbar::{BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes};
+pub use statusbar::{
+    BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes, paint_stack,
+    stack_high_water_mark,
+};
 pub use widget::{Alignment, Region};
 
 // full logical screen region (480×800 after Deg270 rotation)
