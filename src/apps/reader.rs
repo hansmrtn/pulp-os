@@ -30,7 +30,7 @@ use crate::formats::html_strip::{
 };
 use crate::formats::zip::{self, ZipIndex};
 use crate::ui::quick_menu::QuickAction;
-use crate::ui::{Alignment, CONTENT_TOP, DynamicLabel, Label, Region};
+use crate::ui::{Alignment, CONTENT_TOP, Region};
 
 const MARGIN: u16 = 8;
 const HEADER_Y: u16 = CONTENT_TOP + 2;
@@ -490,7 +490,7 @@ impl ReaderApp {
             self.buf_len = self.prefetch_len;
             self.prefetch_page = NO_PREFETCH;
             self.prefetch_len = 0;
-        } else         if self.is_epub && self.chapters_cached {
+        } else if self.is_epub && self.chapters_cached {
             let dir_buf = self.cache_dir;
             let dir = cache::dir_name_str(&dir_buf);
             let ch_file = cache::chapter_file_name(self.chapter);
@@ -1072,6 +1072,52 @@ fn read_full<SPI: embedded_hal::spi::SpiDevice>(
     Ok(())
 }
 
+// Tiny stack buffer for formatted text (replaces DynamicLabel in reader header/status)
+struct FmtBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FmtBuf<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for FmtBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(N - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+// Draw text in FONT_6X13 with the given alignment, clearing the region background.
+fn draw_mono_text(strip: &mut StripBuffer, region: Region, text: &str, align: Alignment) {
+    region
+        .to_rect()
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+        .draw(strip)
+        .unwrap();
+    if text.is_empty() {
+        return;
+    }
+    let tw = text.len() as u32 * 6;
+    let pos = align.position(region, Size::new(tw, 13));
+    let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
+    Text::new(text, Point::new(pos.x, pos.y + 13), style)
+        .draw(strip)
+        .unwrap();
+}
+
 fn extract_zip_entry<SPI: embedded_hal::spi::SpiDevice>(
     svc: &mut Services<'_, SPI>,
     name: &str,
@@ -1168,7 +1214,7 @@ impl App for ReaderApp {
                 State::NeedBookmark => {
                     self.bookmark_load(svc.bookmarks());
 
-                                let _ = svc.write_pulp(RECENT_FILE, &self.filename[..self.filename_len]);
+                    let _ = svc.write_pulp(RECENT_FILE, &self.filename[..self.filename_len]);
 
                     if self.is_epub {
                         self.zip.clear();
@@ -1507,24 +1553,21 @@ impl App for ReaderApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        Label::new(HEADER_REGION, self.display_name(), &FONT_6X13)
-            .alignment(Alignment::CenterLeft)
-            .draw(strip)
-            .unwrap();
+        draw_mono_text(
+            strip,
+            HEADER_REGION,
+            self.display_name(),
+            Alignment::CenterLeft,
+        );
 
         if self.state == State::ShowToc {
-            let mut status = DynamicLabel::<32>::new(STATUS_REGION, &FONT_6X13)
-                .alignment(Alignment::CenterRight);
-            let _ = write!(status, "Contents");
-            status.draw(strip).unwrap();
+            draw_mono_text(strip, STATUS_REGION, "Contents", Alignment::CenterRight);
         } else if self.is_epub && !self.spine.is_empty() {
-            let mut status = DynamicLabel::<32>::new(STATUS_REGION, &FONT_6X13)
-                .alignment(Alignment::CenterRight);
-
+            let mut sbuf = FmtBuf::<32>::new();
             if self.spine.len() > 1 {
                 if self.fully_indexed {
                     let _ = write!(
-                        status,
+                        sbuf,
                         "Ch{}/{} {}/{}",
                         self.chapter + 1,
                         self.spine.len(),
@@ -1533,7 +1576,7 @@ impl App for ReaderApp {
                     );
                 } else {
                     let _ = write!(
-                        status,
+                        sbuf,
                         "Ch{}/{} p{}",
                         self.chapter + 1,
                         self.spine.len(),
@@ -1541,29 +1584,24 @@ impl App for ReaderApp {
                     );
                 }
             } else if self.fully_indexed {
-                let _ = write!(status, "{}/{}", self.page + 1, self.total_pages);
+                let _ = write!(sbuf, "{}/{}", self.page + 1, self.total_pages);
             } else {
-                let _ = write!(status, "p{}", self.page + 1);
+                let _ = write!(sbuf, "p{}", self.page + 1);
             }
-
-            status.draw(strip).unwrap();
+            draw_mono_text(strip, STATUS_REGION, sbuf.as_str(), Alignment::CenterRight);
         } else if self.file_size > 0 {
-            let mut status = DynamicLabel::<24>::new(STATUS_REGION, &FONT_6X13)
-                .alignment(Alignment::CenterRight);
+            let mut sbuf = FmtBuf::<24>::new();
             if self.fully_indexed {
-                let _ = write!(status, "{}/{}", self.page + 1, self.total_pages);
+                let _ = write!(sbuf, "{}/{}", self.page + 1, self.total_pages);
             } else {
-                let _ = write!(status, "{} | {}%", self.page + 1, self.progress_pct());
+                let _ = write!(sbuf, "{} | {}%", self.page + 1, self.progress_pct());
             }
-            status.draw(strip).unwrap();
+            draw_mono_text(strip, STATUS_REGION, sbuf.as_str(), Alignment::CenterRight);
         }
 
         if let Some(msg) = self.error {
             let r = Region::new(MARGIN, TEXT_Y, 464, 20);
-            Label::new(r, msg, &FONT_6X13)
-                .alignment(Alignment::CenterLeft)
-                .draw(strip)
-                .unwrap();
+            draw_mono_text(strip, r, msg, Alignment::CenterLeft);
             return;
         }
 
@@ -1637,7 +1675,7 @@ impl App for ReaderApp {
                 let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
                 let x_indent = INDENT_PX as i32 * span.indent as i32;
 
-            let line = &self.buf[start..end];
+                let line = &self.buf[start..end];
                 let mut cx = MARGIN as i32 + x_indent;
                 let mut sty = span.style();
                 let mut j = 0usize;

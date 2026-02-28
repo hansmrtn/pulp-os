@@ -15,9 +15,7 @@ use crate::drivers::storage::DirEntry;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::ui::{
-    Alignment, BitmapButton, BitmapButtonStyle, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region,
-};
+use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 const PAGE_SIZE: usize = 7;
 
@@ -319,12 +317,11 @@ impl App for FilesApp {
                 let entry = &self.entries[i];
                 let name = entry.name_str();
 
-                let mut btn = BitmapButton::new(region, name, self.body_font)
-                    .style(BitmapButtonStyle::Rounded(10));
-                if i == self.selected {
-                    btn.set_pressed(true);
-                }
-                btn.draw(strip).unwrap();
+                BitmapLabel::new(region, name, self.body_font)
+                    .alignment(Alignment::CenterLeft)
+                    .inverted(i == self.selected)
+                    .draw(strip)
+                    .unwrap();
             } else {
                 // Clear phantom rows below the list end.
                 region

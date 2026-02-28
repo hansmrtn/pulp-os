@@ -1,23 +1,18 @@
 // Widget toolkit for 1-bit e-paper displays
-// Region based layout, dirty tracking, strip-buffered rendering.
+// Text-only UI: BitmapLabel/BitmapDynLabel with inverted highlight for selection.
+// Region-based layout, strip-buffered rendering.
 
-mod bitmap_button;
 mod bitmap_label;
-mod button;
 pub mod button_feedback;
-mod label;
 pub mod quick_menu;
 pub mod statusbar;
 mod widget;
 
-pub use bitmap_button::{BitmapButton, BitmapButtonStyle};
 pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
-pub use button::{Button, ButtonStyle};
 pub use button_feedback::ButtonFeedback;
-pub use label::{DynamicLabel, Label};
 pub use quick_menu::QuickMenu;
 pub use statusbar::{BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes};
-pub use widget::{Alignment, Region, Widget, WidgetState};
+pub use widget::{Alignment, Region};
 
 // full logical screen region (480×800 after Deg270 rotation)
 pub const SCREEN_REGION: Region = Region::new(

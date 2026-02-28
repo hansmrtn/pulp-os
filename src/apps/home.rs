@@ -17,9 +17,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::ui::{
-    Alignment, BitmapButton, BitmapButtonStyle, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region,
-};
+use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 // menu layout
 const ITEM_W: u16 = 280;
@@ -402,12 +400,11 @@ impl HomeApp {
 
         for i in 0..self.item_count {
             let label = self.item_label(i);
-            let mut btn = BitmapButton::new(self.item_regions[i], label, self.body_font)
-                .style(BitmapButtonStyle::Rounded(10));
-            if i == self.selected {
-                btn.set_pressed(true);
-            }
-            btn.draw(strip).unwrap();
+            BitmapLabel::new(self.item_regions[i], label, self.body_font)
+                .alignment(Alignment::Center)
+                .inverted(i == self.selected)
+                .draw(strip)
+                .unwrap();
         }
     }
 

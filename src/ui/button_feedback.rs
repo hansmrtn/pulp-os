@@ -1,13 +1,9 @@
 // Button feedback — edge labels with press inversion
 //
-// Bottom tabs show the mapped action; side ridges are labelless.
-// On press the fill inverts; shape stays fixed for minimal dirty regions.
+// Bottom tabs show the mapped action; side labels for vol.
+// On press the text inverts (white-on-black); no borders or shapes.
 
-use embedded_graphics::{
-    pixelcolor::BinaryColor,
-    prelude::*,
-    primitives::{CornerRadii, PrimitiveStyle, RoundedRectangle},
-};
+use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
 use super::widget::Region;
 use crate::board::action::{Action, ButtonMapper};
@@ -17,13 +13,9 @@ use crate::fonts::font_data;
 
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;
-const TAB_RADIUS: u32 = 6;
-const TAB_STROKE: u32 = 2;
 
-const RIDGE_W: u16 = 6;
+const RIDGE_W: u16 = 22;
 const RIDGE_H: u16 = 36;
-const RIDGE_RADIUS: u32 = 3;
-const RIDGE_STROKE: u32 = 1;
 
 const SCREEN_W: u16 = 480;
 const SCREEN_H: u16 = 800;
@@ -102,29 +94,6 @@ fn bump_region(def: &BumpDef) -> Region {
     }
 }
 
-// Edge-flush shapes: only the inward-facing corners are rounded.
-fn tab_radii() -> CornerRadii {
-    let r = Size::new(TAB_RADIUS, TAB_RADIUS);
-    let z = Size::new(0, 0);
-    CornerRadii {
-        top_left: r,
-        top_right: r,
-        bottom_left: z,
-        bottom_right: z,
-    }
-}
-
-fn ridge_radii() -> CornerRadii {
-    let r = Size::new(RIDGE_RADIUS, RIDGE_RADIUS);
-    let z = Size::new(0, 0);
-    CornerRadii {
-        top_left: r,
-        top_right: z,
-        bottom_left: r,
-        bottom_right: z,
-    }
-}
-
 fn action_label(action: Action) -> &'static str {
     match action {
         Action::Next => "Next",
@@ -184,83 +153,42 @@ impl ButtonFeedback {
 
         for (i, def) in BUMPS.iter().enumerate() {
             let pressed = self.active == Some(i);
-            match def.edge {
-                Edge::Bottom => draw_tab(strip, def, pressed, &self.mapper, font),
-                Edge::Right => draw_ridge(strip, def, pressed),
+            let r = bump_region(def);
+
+            if !r.intersects(strip.logical_window()) {
+                continue;
+            }
+
+            let (bg, fg) = if pressed {
+                (BinaryColor::On, BinaryColor::Off)
+            } else {
+                (BinaryColor::Off, BinaryColor::On)
+            };
+
+            // fill background
+            r.to_rect()
+                .into_styled(PrimitiveStyle::with_fill(bg))
+                .draw(strip)
+                .unwrap();
+
+            // draw label text (bottom tabs only; side ridges are too narrow)
+            if def.edge == Edge::Bottom {
+                let action = self.mapper.map_button(def.button);
+                let label = action_label(action);
+                if label.is_empty() {
+                    continue;
+                }
+
+                let text_w = font.measure_str(label) as i32;
+                let lh = font.line_height as i32;
+                let asc = font.ascent as i32;
+
+                let text_x = r.x as i32 + (r.w as i32 - text_w) / 2;
+                let text_top = r.y as i32 + (r.h as i32 - lh) / 2;
+                let baseline = text_top + asc;
+
+                font.draw_str_fg(strip, label, fg, text_x, baseline);
             }
         }
-    }
-}
-
-fn draw_tab(
-    strip: &mut StripBuffer,
-    def: &BumpDef,
-    pressed: bool,
-    mapper: &ButtonMapper,
-    font: &crate::fonts::bitmap::BitmapFont,
-) {
-    let r = bump_region(def);
-    let radii = tab_radii();
-    let shape = RoundedRectangle::new(r.to_rect(), radii);
-
-    if pressed {
-        shape
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(strip)
-            .unwrap();
-        shape
-            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, TAB_STROKE))
-            .draw(strip)
-            .unwrap();
-    } else {
-        shape
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .unwrap();
-    }
-
-    // use BitmapFont directly to avoid BitmapLabel bg overwriting rounded corners
-    let action = mapper.map_button(def.button);
-    let label = action_label(action);
-    if label.is_empty() {
-        return;
-    }
-
-    let text_fg = if pressed {
-        BinaryColor::On
-    } else {
-        BinaryColor::Off
-    };
-
-    let text_w = font.measure_str(label) as i32;
-    let lh = font.line_height as i32;
-    let asc = font.ascent as i32;
-
-    let text_x = r.x as i32 + (r.w as i32 - text_w) / 2;
-    let text_top = r.y as i32 + (r.h as i32 - lh) / 2;
-    let baseline = text_top + asc;
-
-    font.draw_str_fg(strip, label, text_fg, text_x, baseline);
-}
-
-fn draw_ridge(strip: &mut StripBuffer, def: &BumpDef, pressed: bool) {
-    let r = bump_region(def);
-    let radii = ridge_radii();
-    let shape = RoundedRectangle::new(r.to_rect(), radii);
-
-    if pressed {
-        shape
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(strip)
-            .unwrap();
-        shape
-            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, RIDGE_STROKE))
-            .draw(strip)
-            .unwrap();
-    } else {
-        shape
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .unwrap();
     }
 }

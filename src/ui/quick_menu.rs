@@ -3,10 +3,12 @@
 // Core actions (Refresh, Go Home) always present; apps inject up to
 // MAX_APP_ACTIONS items above. Two kinds: Cycle (rotate options)
 // and Trigger (fire on Select). Menu/Back dismisses.
+//
+// Rendering: plain inverted-text rows, no borders or separators.
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
-use super::bitmap_label::{BitmapDynLabel, BitmapLabel};
+use super::bitmap_label::BitmapDynLabel;
 use super::widget::{Alignment, Region};
 use crate::board::action::Action;
 use crate::drivers::strip::StripBuffer;
@@ -20,7 +22,6 @@ const OVERLAY_BOTTOM: u16 = 790; // 10px from screen bottom
 const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
-const BORDER: u16 = 2;
 const PAD_TOP: u16 = 10;
 const PAD_BOTTOM: u16 = 8;
 const LABEL_X: u16 = OVERLAY_X + 16;
@@ -28,7 +29,6 @@ const LABEL_W: u16 = 150;
 const VALUE_X: u16 = LABEL_X + LABEL_W + 8;
 const VALUE_W: u16 = OVERLAY_W - 16 - LABEL_W - 8 - 16;
 const HELP_H: u16 = 20;
-const SEPARATOR_GAP: u16 = 8; // gap between app and core sections
 
 pub const MAX_APP_ACTIONS: usize = 6;
 
@@ -187,7 +187,7 @@ impl QuickMenu {
         self.selected = 0;
         self.open = true;
         self.dirty = true;
-        self.overlay_region = Self::compute_region(self.count, n_app > 0);
+        self.overlay_region = Self::compute_region(self.count);
     }
 
     pub fn hide(&mut self) {
@@ -300,22 +300,14 @@ impl QuickMenu {
 
     // ── Layout helpers ────────────────────────────────────────────
 
-    fn compute_region(total_items: usize, has_app_items: bool) -> Region {
-        let sep = if has_app_items { SEPARATOR_GAP } else { 0 };
-        let content_h = PAD_TOP + (ITEM_STRIDE * total_items as u16) + sep + HELP_H + PAD_BOTTOM;
-        let h = content_h + BORDER * 2;
-        let y = OVERLAY_BOTTOM - h;
-        Region::new(OVERLAY_X, y, OVERLAY_W, h)
+    fn compute_region(total_items: usize) -> Region {
+        let content_h = PAD_TOP + (ITEM_STRIDE * total_items as u16) + HELP_H + PAD_BOTTOM;
+        let y = OVERLAY_BOTTOM - content_h;
+        Region::new(OVERLAY_X, y, OVERLAY_W, content_h)
     }
 
-    // extra SEPARATOR_GAP offset once we cross into the core section
     fn item_y(&self, i: usize) -> u16 {
-        let sep = if self.app_count > 0 && i >= self.app_count {
-            SEPARATOR_GAP
-        } else {
-            0
-        };
-        self.overlay_region.y + BORDER + PAD_TOP + i as u16 * ITEM_STRIDE + sep
+        self.overlay_region.y + PAD_TOP + i as u16 * ITEM_STRIDE
     }
 
     fn item_label_region(&self, i: usize) -> Region {
@@ -364,27 +356,15 @@ impl QuickMenu {
         }
 
         let font = &font_data::REGULAR_BODY_SMALL;
-        let outer = self.overlay_region.to_rect();
 
-        outer
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(strip)
-            .unwrap();
-        outer
-            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, BORDER as u32))
-            .draw(strip)
-            .unwrap();
-
-        // separator between app and core sections
-        if self.app_count > 0 {
-            let sep_y = self.item_y(self.app_count) - SEPARATOR_GAP / 2;
-            embedded_graphics::primitives::Rectangle::new(
-                Point::new((OVERLAY_X + 20) as i32, sep_y as i32),
-                Size::new((OVERLAY_W - 40) as u32, 1),
-            )
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .unwrap();
+        // clear the overlay background
+        let outer = self.overlay_region;
+        if outer.intersects(strip.logical_window()) {
+            outer
+                .to_rect()
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(strip)
+                .unwrap();
         }
 
         let mut val_buf = BitmapDynLabel::<20>::new(Region::new(0, 0, 1, 1), font);
@@ -392,28 +372,72 @@ impl QuickMenu {
         for i in 0..self.count {
             let selected = i == self.selected;
 
-            BitmapLabel::new(self.item_label_region(i), self.items[i].label, font)
-                .alignment(Alignment::CenterLeft)
-                .inverted(selected)
-                .draw(strip)
-                .unwrap();
+            let label_region = self.item_label_region(i);
+            let value_region = self.item_value_region(i);
 
-            self.format_value(i, &mut val_buf);
-            BitmapLabel::new(self.item_value_region(i), val_buf.text(), font)
-                .alignment(Alignment::Center)
-                .inverted(selected)
-                .draw(strip)
-                .unwrap();
+            // Selected row: inverted (white text on black)
+            if selected {
+                let row_region = Region::new(OVERLAY_X, self.item_y(i), OVERLAY_W, ITEM_H);
+                if row_region.intersects(strip.logical_window()) {
+                    row_region
+                        .to_rect()
+                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                        .draw(strip)
+                        .unwrap();
+                }
+            }
+
+            // Draw label text
+            if label_region.intersects(strip.logical_window()) {
+                let fg = if selected {
+                    BinaryColor::Off
+                } else {
+                    BinaryColor::On
+                };
+                let text = self.items[i].label;
+                if !text.is_empty() {
+                    let text_w = font.measure_str(text) as u32;
+                    let text_h = font.line_height as u32;
+                    let top_left =
+                        Alignment::CenterLeft.position(label_region, Size::new(text_w, text_h));
+                    let baseline = top_left.y + font.ascent as i32;
+                    font.draw_str_fg(strip, text, fg, top_left.x, baseline);
+                }
+            }
+
+            // Draw value text
+            if value_region.intersects(strip.logical_window()) {
+                self.format_value(i, &mut val_buf);
+                let vtext = val_buf.text();
+                if !vtext.is_empty() {
+                    let fg = if selected {
+                        BinaryColor::Off
+                    } else {
+                        BinaryColor::On
+                    };
+                    let text_w = font.measure_str(vtext) as u32;
+                    let text_h = font.line_height as u32;
+                    let top_left =
+                        Alignment::Center.position(value_region, Size::new(text_w, text_h));
+                    let baseline = top_left.y + font.ascent as i32;
+                    font.draw_str_fg(strip, vtext, fg, top_left.x, baseline);
+                }
+            }
         }
 
+        // Help text at the bottom
         let help = match &self.items[self.selected].kind {
             MenuItemKind::AppCycle { .. } => "Up/Down: move  Jump: adjust  Sel: cycle  Menu: close",
             _ => "Up/Down: move  Sel: activate  Menu: close",
         };
 
-        BitmapLabel::new(self.help_region(), help, font)
-            .alignment(Alignment::Center)
-            .draw(strip)
-            .unwrap();
+        let help_region = self.help_region();
+        if help_region.intersects(strip.logical_window()) {
+            let text_w = font.measure_str(help) as u32;
+            let text_h = font.line_height as u32;
+            let top_left = Alignment::Center.position(help_region, Size::new(text_w, text_h));
+            let baseline = top_left.y + font.ascent as i32;
+            font.draw_str_fg(strip, help, BinaryColor::On, top_left.x, baseline);
+        }
     }
 }

@@ -1,12 +1,8 @@
-// Region geometry, alignment, and base widget trait
-// All coordinates are logical (rotation aware). x/w should be 8 aligned
+// Region geometry and alignment helpers
+// All coordinates are logical (rotation aware). x/w should be 8-aligned
 // for partial refresh to avoid byte boundary fixups on the controller.
 
-use embedded_graphics::{
-    pixelcolor::BinaryColor,
-    prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
-};
+use embedded_graphics::{prelude::*, primitives::Rectangle};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Region {
@@ -136,42 +132,5 @@ impl Alignment {
             Alignment::BottomCenter => Point::new(rx + (rw - cw) / 2, ry + rh - ch),
             Alignment::BottomRight => Point::new(rx + rw - cw, ry + rh - ch),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum WidgetState {
-    #[default]
-    Dirty,
-    Clean,
-}
-
-pub trait Widget {
-    fn bounds(&self) -> Region;
-
-    fn draw<D>(&self, display: &mut D) -> Result<(), D::Error>
-    where
-        D: DrawTarget<Color = BinaryColor>;
-
-    fn is_dirty(&self) -> bool {
-        true
-    }
-
-    fn mark_clean(&mut self) {}
-
-    fn mark_dirty(&mut self) {}
-
-    fn clear<D>(&self, display: &mut D) -> Result<(), D::Error>
-    where
-        D: DrawTarget<Color = BinaryColor>,
-    {
-        self.bounds()
-            .to_rect()
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(display)
-    }
-
-    fn refresh_bounds(&self) -> Region {
-        self.bounds().align8()
     }
 }
