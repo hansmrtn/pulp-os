@@ -1,0 +1,15 @@
+[package]
+name = "smol-epub"
+edition = "2024"
+rust-version = "1.88"
+version = "0.1.0"
+description = "Minimal no_std EPUB parser with streaming image decoders"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+log = "0.4"
+
+[features]
+default = ["images"]
+images = []

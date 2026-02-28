@@ -1131,8 +1131,8 @@ dependencies = [
  "esp-rtos",
  "fontdue",
  "log",
- "miniz_oxide",
  "nb 1.1.0",
+ "smol-epub",
  "static_cell",
 ]
 
@@ -1282,6 +1282,14 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "smol-epub"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "miniz_oxide",
 ]
 
 [[package]]

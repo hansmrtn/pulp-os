@@ -7,8 +7,8 @@
 
 use alloc::vec::Vec;
 
-use crate::formats::xml;
-use crate::formats::zip::ZipIndex;
+use crate::xml;
+use crate::zip::ZipIndex;
 
 pub const TITLE_CAP: usize = 96;
 pub const AUTHOR_CAP: usize = 64;

@@ -24,7 +24,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::png::DecodedImage;
+use crate::png::DecodedImage;
 
 // ── JPEG marker bytes ─────────────────────────────────────────────────
 

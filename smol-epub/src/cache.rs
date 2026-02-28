@@ -7,8 +7,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::formats::html_strip::HtmlStripStream;
-use crate::formats::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
+use crate::html_strip::HtmlStripStream;
+use crate::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
 
 const CACHE_MAGIC: u32 = 0x504C_5043; // "PLPC"
 const CACHE_VERSION: u8 = 1;
