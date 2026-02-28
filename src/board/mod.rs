@@ -7,7 +7,7 @@
 //
 // Display BUSY (GPIO6) is no longer interrupt-driven here; esp-hal's
 // async `Wait` implementation manages the GPIO6 interrupt internally
-// when `Input::wait_for_low().await` is called via `block_on`.
+// when `Input::wait_for_low().await` is used from the Embassy executor.
 
 pub mod action;
 pub mod button;
@@ -36,8 +36,6 @@ use esp_hal::{
 use log::info;
 use static_cell::StaticCell;
 
-use crate::kernel::wake;
-
 pub type SpiBus = spi::master::SpiDmaBus<'static, Blocking>;
 pub type SharedSpiDevice = RefCellDevice<'static, SpiBus, Output<'static>, Delay>;
 pub type SdSpiDevice = RefCellDevice<'static, SpiBus, raw_gpio::RawOutputPin, Delay>;
@@ -48,7 +46,9 @@ static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 // power button static: ISR clears interrupt, InputDriver reads level
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// GPIO ISR: power button (GPIO3) only; BUSY (GPIO6) handled by esp-hal async Wait
+// GPIO ISR: power button (GPIO3) only; BUSY (GPIO6) handled by esp-hal async Wait.
+// The interrupt fires, clears its flag, and returns.  The interrupt itself exits
+// WFI inside the Embassy executor, so the next Ticker poll detects the button.
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
@@ -56,7 +56,7 @@ fn gpio_handler() {
             && btn.is_interrupt_set()
         {
             btn.clear_interrupt();
-            wake::signal_button();
+            // No explicit signal needed — any interrupt wakes the Embassy executor.
         }
     });
 }

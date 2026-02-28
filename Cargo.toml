@@ -9,7 +9,15 @@ name = "pulp-os"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
+esp-hal  = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
+esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3"] }
+
+# esp-rtos pulls in embassy-executor and the time-driver backend;
+# we still need these for user-facing types (Spawner, Timer, Ticker, select).
+# Versions MUST match what esp-rtos 0.2.0 resolves internally.
+embassy-executor = "0.9"
+embassy-time     = "0.4"
+embassy-futures  = "0.1"
 
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3", "log-04"] }
 log                    = "0.4.27"

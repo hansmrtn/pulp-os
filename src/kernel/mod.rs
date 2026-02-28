@@ -1,12 +1,10 @@
-// Cooperative scheduler and wake/sleep primitives
-// Single core, no preemption. WFI idles the CPU between events.
+// Kernel module — Embassy-based async runtime
 //
-// block_on: minimal single-threaded executor for async hardware waits
-// (display BUSY, GPIO edges). Runs one future to completion, WFI
-// between polls. Not a general-purpose executor.
+// The hand-rolled cooperative scheduler and WFI/wake primitives have
+// been replaced by Embassy's executor and timer driver.  This module
+// now provides only a thin uptime helper (backed by embassy_time) and
+// a no-op signal hook for the power-button GPIO ISR.
 
-pub mod scheduler;
 pub mod wake;
 
-pub use scheduler::{Job, Scheduler};
-pub use wake::block_on;
+pub use wake::uptime_secs;

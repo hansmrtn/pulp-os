@@ -22,11 +22,6 @@ const READ_BUF_SIZE: usize = 4096; // compressed read chunk
 const STRIP_BUF_SIZE: usize = 4096; // strip output accumulator
 const FLUSH_THRESHOLD: usize = STRIP_BUF_SIZE - 128;
 
-pub struct CacheInfo {
-    pub chapter_count: usize,
-    pub chapter_sizes: [u32; MAX_CACHE_CHAPTERS],
-}
-
 #[inline]
 pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -106,13 +101,18 @@ pub fn encode_cache_meta(
     total
 }
 
-// parse and validate META.BIN; returns CacheInfo or Err if stale
+// Parse and validate META.BIN, writing chapter sizes directly into
+// the caller's slice.  Returns `Ok(chapter_count)` on success.
+//
+// This avoids the 1 KB `CacheInfo` temporary that previously lived on
+// the stack — critical on ESP32-C3 where esp-rtos leaves < 6 KB.
 pub fn parse_cache_meta(
     data: &[u8],
     epub_size: u32,
     name_hash: u32,
     expected_chapters: usize,
-) -> Result<CacheInfo, &'static str> {
+    chapter_sizes_out: &mut [u32],
+) -> Result<usize, &'static str> {
     if data.len() < META_HEADER {
         return Err("cache: meta too short");
     }
@@ -146,17 +146,17 @@ pub fn parse_cache_meta(
         return Err("cache: meta truncated");
     }
 
-    let mut info = CacheInfo {
-        chapter_count: count,
-        chapter_sizes: [0u32; MAX_CACHE_CHAPTERS],
-    };
-
-    for (i, size) in info.chapter_sizes.iter_mut().enumerate().take(count) {
-        let off = META_HEADER + i * 4;
-        *size = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+    if chapter_sizes_out.len() < count {
+        return Err("cache: output slice too small");
     }
 
-    Ok(info)
+    for i in 0..count {
+        let off = META_HEADER + i * 4;
+        chapter_sizes_out[i] =
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+    }
+
+    Ok(count)
 }
 
 // stream-decompress ZIP entry, strip HTML, emit plain-text chunks.

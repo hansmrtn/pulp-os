@@ -667,19 +667,22 @@ impl ReaderApp {
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
 
-        let mut meta_buf = [0u8; cache::META_MAX_SIZE];
-        if let Ok(n) = svc.read_pulp_sub_chunk(dir, cache::META_FILE, 0, &mut meta_buf)
-            && let Ok(info) = cache::parse_cache_meta(
-                &meta_buf[..n],
+        // Read META.BIN into self.buf (8 KB, already owned) instead of
+        // a 1 KB stack-allocated meta_buf.  Parse chapter sizes directly
+        // into self.chapter_sizes — eliminates ~2 KB of stack temporaries
+        // that overflowed under esp-rtos.
+        let meta_cap = cache::META_MAX_SIZE.min(self.buf.len());
+        if let Ok(n) = svc.read_pulp_sub_chunk(dir, cache::META_FILE, 0, &mut self.buf[..meta_cap])
+            && let Ok(count) = cache::parse_cache_meta(
+                &self.buf[..n],
                 self.epub_file_size,
                 self.epub_name_hash,
                 self.spine.len(),
+                &mut self.chapter_sizes,
             )
         {
-            self.chapter_sizes[..info.chapter_count]
-                .copy_from_slice(&info.chapter_sizes[..info.chapter_count]);
             self.chapters_cached = true;
-            log::info!("epub: cache hit ({} chapters)", info.chapter_count);
+            log::info!("epub: cache hit ({} chapters)", count);
             return Ok(true);
         }
 

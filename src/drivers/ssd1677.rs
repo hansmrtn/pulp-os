@@ -590,6 +590,69 @@ where
     pub fn needs_initial_refresh(&self) -> bool {
         self.initial_refresh
     }
+
+    // ── Split-phase full refresh ────────────────────────────
+    // Decomposes render_full so the caller (Embassy main loop) can
+    // `select` between BUSY-done and a timer tick during the 1.6 s
+    // GC waveform, processing input while the panel refreshes.
+
+    /// Write the full frame to both RED and BW RAM, calling
+    /// `poll_input` between every strip so buttons are captured
+    /// during the ~20 ms SPI transfer phase.
+    ///
+    /// Does **not** kick the GC waveform — call [`start_full_update`]
+    /// afterwards.
+    pub fn write_full_frame_progressive<F, P>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: &F,
+        mut poll_input: P,
+    ) where
+        F: Fn(&mut StripBuffer),
+        P: FnMut(),
+    {
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        delay.delay_millis(1);
+
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
+
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+                poll_input();
+            }
+        }
+    }
+
+    /// Kick the GC (full) waveform.  Non-blocking — BUSY goes high
+    /// immediately and stays high for ~1.6 s.  Poll [`is_busy`] or
+    /// await the BUSY pin, then call [`finish_full_update`].
+    pub fn start_full_update(&mut self) {
+        // bypass RED as 0, BW normal
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x40, 0x00]);
+
+        // Mode 1 (GC full waveform)
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0xF7]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        // BUSY is now high; caller must wait for it to go low.
+    }
+
+    /// Finalise state after a GC waveform completes (BUSY low).
+    pub fn finish_full_update(&mut self) {
+        self.power_is_on = false;
+        self.initial_refresh = false;
+    }
 }
 
 // ── Async (non-blocking) API ────────────────────────────────────────────
