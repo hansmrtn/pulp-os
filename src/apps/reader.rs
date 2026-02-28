@@ -18,6 +18,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
+use crate::apps::bookmarks;
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
@@ -49,7 +50,7 @@ const PAGE_REGION: Region = Region::new(0, HEADER_Y, 480, 800 - HEADER_Y);
 
 const NO_PREFETCH: usize = usize::MAX;
 
-const TEXT_W: f32 = (480 - 2 * MARGIN) as f32;
+const TEXT_W: u32 = (480 - 2 * MARGIN) as u32;
 const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
 const INDENT_PX: u32 = 24; // pixels per blockquote indent level
@@ -68,6 +69,8 @@ const QA_TOC: u8 = 5;
 
 const QA_FONT_OPTIONS: &[&str] = &["Small", "Medium", "Large"];
 const QA_MAX: usize = 5;
+
+pub const RECENT_FILE: &str = "RECENT";
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -158,6 +161,7 @@ pub struct ReaderApp {
     spine: EpubSpine,
     chapter: u16,
     goto_last_page: bool,
+    restore_offset: Option<u32>,
 
     // epub chapter cache (SD-backed, no heap for chapter text)
     cache_dir: [u8; 8],
@@ -219,6 +223,7 @@ impl ReaderApp {
             spine: EpubSpine::new(),
             chapter: 0,
             goto_last_page: false,
+            restore_offset: None,
 
             cache_dir: [0u8; 8],
             epub_name_hash: 0,
@@ -315,169 +320,41 @@ impl ReaderApp {
         (buf, self.filename_len)
     }
 
-    // ── Bookmarks ─────────────────────────────────────────────────────────────
-    //
-    // File: "BOOKMARKS" on the SD root — a flat array of 20-byte records.
-    // Layout:
-    //   name_hash  u32     bytes 0–3    FNV-1a of filename
-    //   page       u32     bytes 4–7    page index (within chapter for epub)
-    //   chapter    u16     bytes 8–9    epub chapter; 0 for txt
-    //   flags      u16     bytes 10–11  bit 0 = valid
-    //   name_pfx   [u8;8]  bytes 12–19  filename prefix for collision safety
-    //
-    // Lookup matches on hash AND name prefix to avoid silent wrong-position
-    // restores when two filenames collide in FNV-1a.
+    // ── Bookmarks (delegates to shared apps::bookmarks module) ────────────────
 
-    const BOOKMARK_FILE: &'static str = "BOOKMARKS";
-    const BOOKMARK_SLOTS: usize = 32;
-    const BOOKMARK_RECORD_LEN: usize = 20;
-    const BOOKMARK_FILE_LEN: usize = Self::BOOKMARK_SLOTS * Self::BOOKMARK_RECORD_LEN;
-    const NAME_PFX_LEN: usize = 8;
-
-    // FNV-1a 32-bit hash of the current filename
-    fn bookmark_key(&self) -> u32 {
-        let mut h: u32 = 0x811c_9dc5;
-        for &b in &self.filename[..self.filename_len] {
-            h ^= b as u32;
-            h = h.wrapping_mul(0x0100_0193);
-        }
-        h
-    }
-
-    fn name_prefix(&self) -> [u8; Self::NAME_PFX_LEN] {
-        let mut pfx = [0u8; Self::NAME_PFX_LEN];
-        let n = self.filename_len.min(Self::NAME_PFX_LEN);
-        pfx[..n].copy_from_slice(&self.filename[..n]);
-        pfx
-    }
-
-    fn bookmark_encode(&self) -> [u8; Self::BOOKMARK_RECORD_LEN] {
-        let key = self.bookmark_key();
-        let page = self.page as u32;
-        let chapter = self.chapter;
-        let flags: u16 = 1;
-        let pfx = self.name_prefix();
-        let mut rec = [0u8; Self::BOOKMARK_RECORD_LEN];
-        rec[0..4].copy_from_slice(&key.to_le_bytes());
-        rec[4..8].copy_from_slice(&page.to_le_bytes());
-        rec[8..10].copy_from_slice(&chapter.to_le_bytes());
-        rec[10..12].copy_from_slice(&flags.to_le_bytes());
-        rec[12..20].copy_from_slice(&pfx);
-        rec
-    }
-
-    // save bookmark; called synchronously by main on nav events
+    // called synchronously by main on nav events
     pub fn save_position<SPI: embedded_hal::spi::SpiDevice>(&self, svc: &mut Services<'_, SPI>) {
         if self.state == State::Ready {
-            self.bookmark_save(svc);
-        }
-    }
-
-    fn bookmark_save<SPI: embedded_hal::spi::SpiDevice>(&self, svc: &mut Services<'_, SPI>) {
-        let key = self.bookmark_key();
-        let pfx = self.name_prefix();
-        let mut file_buf = [0u8; Self::BOOKMARK_FILE_LEN];
-        let mut slot_count = 0usize;
-
-        if let Ok((_, n)) = svc.read_file_start(Self::BOOKMARK_FILE, &mut file_buf) {
-            slot_count = (n / Self::BOOKMARK_RECORD_LEN).min(Self::BOOKMARK_SLOTS);
-        }
-
-        let mut target_slot = slot_count;
-        for i in 0..slot_count {
-            let base = i * Self::BOOKMARK_RECORD_LEN;
-            let flags = u16::from_le_bytes([file_buf[base + 10], file_buf[base + 11]]);
-            if flags & 1 == 0 {
-                if target_slot == slot_count {
-                    target_slot = i;
-                }
-                continue;
-            }
-            let stored_key = u32::from_le_bytes([
-                file_buf[base],
-                file_buf[base + 1],
-                file_buf[base + 2],
-                file_buf[base + 3],
-            ]);
-            if stored_key == key && file_buf[base + 12..base + 20] == pfx {
-                target_slot = i;
-                break;
-            }
-        }
-
-        if target_slot >= Self::BOOKMARK_SLOTS {
-            // All slots full; overwrite slot 0 (LRU would be nicer but costly).
-            target_slot = 0;
-        }
-
-        let base = target_slot * Self::BOOKMARK_RECORD_LEN;
-        let rec = self.bookmark_encode();
-        file_buf[base..base + Self::BOOKMARK_RECORD_LEN].copy_from_slice(&rec);
-
-        let new_len = ((target_slot + 1).max(slot_count)) * Self::BOOKMARK_RECORD_LEN;
-
-        match svc.write_file(Self::BOOKMARK_FILE, &file_buf[..new_len]) {
-            Ok(_) => log::info!(
-                "bookmark: saved page={} ch={} for key={:#010x}",
-                self.page,
+            bookmarks::save(
+                svc,
+                &self.filename[..self.filename_len],
+                self.offsets[self.page],
                 self.chapter,
-                key
-            ),
-            Err(e) => log::warn!("bookmark: save failed: {}", e),
+            );
         }
     }
 
-    // restore a saved bookmark; returns true if found
     fn bookmark_load<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> bool {
-        let key = self.bookmark_key();
-        let pfx = self.name_prefix();
-        let mut file_buf = [0u8; Self::BOOKMARK_FILE_LEN];
-
-        let slot_count = match svc.read_file_start(Self::BOOKMARK_FILE, &mut file_buf) {
-            Ok((_, n)) => (n / Self::BOOKMARK_RECORD_LEN).min(Self::BOOKMARK_SLOTS),
-            Err(_) => return false,
-        };
-
-        for i in 0..slot_count {
-            let base = i * Self::BOOKMARK_RECORD_LEN;
-            let flags = u16::from_le_bytes([file_buf[base + 10], file_buf[base + 11]]);
-            if flags & 1 == 0 {
-                continue;
-            }
-            let stored_key = u32::from_le_bytes([
-                file_buf[base],
-                file_buf[base + 1],
-                file_buf[base + 2],
-                file_buf[base + 3],
-            ]);
-            if stored_key != key || file_buf[base + 12..base + 20] != pfx {
-                continue;
-            }
-
-            let page = u32::from_le_bytes([
-                file_buf[base + 4],
-                file_buf[base + 5],
-                file_buf[base + 6],
-                file_buf[base + 7],
-            ]) as usize;
-            let chapter = u16::from_le_bytes([file_buf[base + 8], file_buf[base + 9]]);
-
+        if let Some(slot) = bookmarks::find(svc, &self.filename[..self.filename_len]) {
             log::info!(
-                "bookmark: restoring page={} ch={} for key={:#010x}",
-                page,
-                chapter,
-                key
+                "bookmark: restoring off={} ch={} for {}",
+                slot.byte_offset,
+                slot.chapter,
+                slot.filename_str(),
             );
-
-            self.page = page;
-            self.chapter = chapter;
-            return true;
+            self.chapter = slot.chapter;
+            self.restore_offset = if slot.byte_offset > 0 {
+                Some(slot.byte_offset)
+            } else {
+                None
+            };
+            true
+        } else {
+            false
         }
-
-        false
     }
 
     fn display_name(&self) -> &str {
@@ -620,7 +497,7 @@ impl ReaderApp {
             let dir = cache::dir_name_str(&dir_buf);
             let ch_file = cache::chapter_file_name(self.chapter);
             let ch_str = cache::chapter_file_str(&ch_file);
-            let n = svc.read_chunk_in_dir(dir, ch_str, self.offsets[self.page], &mut self.buf)?;
+            let n = svc.read_pulp_sub_chunk(dir, ch_str, self.offsets[self.page], &mut self.buf)?;
             self.buf_len = n;
         } else if self.file_size == 0 {
             // TXT first load; read_file_start folds size + read into one open
@@ -665,7 +542,7 @@ impl ReaderApp {
                 let dir = cache::dir_name_str(&dir_buf);
                 let ch_file = cache::chapter_file_name(self.chapter);
                 let ch_str = cache::chapter_file_str(&ch_file);
-                svc.read_chunk_in_dir(dir, ch_str, pf_offset, &mut self.prefetch)
+                svc.read_pulp_sub_chunk(dir, ch_str, pf_offset, &mut self.prefetch)
             } else {
                 svc.read_file_chunk(name, pf_offset, &mut self.prefetch)
             };
@@ -794,7 +671,7 @@ impl ReaderApp {
 
         // Try to load and validate existing cache
         let mut meta_buf = [0u8; cache::META_MAX_SIZE];
-        if let Ok(n) = svc.read_chunk_in_dir(dir, cache::META_FILE, 0, &mut meta_buf)
+        if let Ok(n) = svc.read_pulp_sub_chunk(dir, cache::META_FILE, 0, &mut meta_buf)
             && let Ok(info) = cache::parse_cache_meta(
                 &meta_buf[..n],
                 self.epub_file_size,
@@ -811,7 +688,7 @@ impl ReaderApp {
 
         // Cache miss — stream each chapter to SD
         log::info!("epub: building cache for {} chapters", self.spine.len());
-        svc.ensure_dir(dir)?;
+        svc.ensure_pulp_subdir(dir)?;
 
         let (nb, nl) = self.name_copy();
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
@@ -825,7 +702,7 @@ impl ReaderApp {
             let ch_str = cache::chapter_file_str(&ch_file);
 
             // Create empty file (truncate if stale)
-            svc.write_in_dir(dir, ch_str, &[])?;
+            svc.write_pulp_sub(dir, ch_str, &[])?;
 
             // Stream: decompress → HTML strip → append to cache file.
             // Temporary heap (~47 KB) is allocated inside stream_strip_entry
@@ -835,7 +712,7 @@ impl ReaderApp {
                 &entry,
                 entry.local_offset,
                 |offset, buf| svc_ref.read_file_chunk(epub_name, offset, buf),
-                |chunk| svc_ref.append_in_dir(dir, ch_str, chunk),
+                |chunk| svc_ref.append_pulp_sub(dir, ch_str, chunk),
             )?;
 
             self.chapter_sizes[ch] = text_size;
@@ -849,7 +726,7 @@ impl ReaderApp {
             &self.chapter_sizes[..spine_len],
             &mut meta_buf,
         );
-        svc.write_in_dir(dir, cache::META_FILE, &meta_buf[..meta_len])?;
+        svc.write_pulp_sub(dir, cache::META_FILE, &meta_buf[..meta_len])?;
 
         self.chapters_cached = true;
         log::info!("epub: cache complete");
@@ -1010,10 +887,10 @@ fn wrap_proportional(
     fonts: &fonts::FontSet,
     lines: &mut [LineSpan],
     max_lines: usize,
-    max_width_px: f32,
+    max_width_px: u32,
 ) -> (usize, usize) {
     let max_l = max_lines.min(lines.len());
-    let base_max_w = max_width_px as u32;
+    let base_max_w = max_width_px;
     let mut lc: usize = 0;
     let mut ls: usize = 0;
     let mut px: u32 = 0;
@@ -1209,6 +1086,7 @@ impl App for ReaderApp {
         self.chapter = 0;
         self.error = None;
         self.goto_last_page = false;
+        self.restore_offset = None;
 
         self.apply_font_metrics();
 
@@ -1228,6 +1106,7 @@ impl App for ReaderApp {
         self.buf_len = 0;
         self.prefetch_page = NO_PREFETCH;
         self.prefetch_len = 0;
+        self.restore_offset = None;
 
         if self.is_epub {
             self.toc.clear();
@@ -1278,24 +1157,19 @@ impl App for ReaderApp {
         loop {
             match self.state {
                 State::NeedBookmark => {
-                    let found = self.bookmark_load(svc);
+                    self.bookmark_load(svc);
+
+                    // write recent file for "Continue Reading" on home screen
+                    let _ = svc.write_pulp(RECENT_FILE, &self.filename[..self.filename_len]);
+
                     if self.is_epub {
-                        if found {
-                            // chapter was restored; NeedInit will load that chapter
-                            // and page_forward will position within it.
-                        }
                         self.zip.clear();
                         self.meta = EpubMeta::new();
                         self.spine = EpubSpine::new();
                         self.chapters_cached = false;
-                        // goto_last_page only when bookmark says page > 0
                         self.goto_last_page = false;
                         self.state = State::NeedInit;
                     } else {
-                        // For TXT, page index maps directly to offsets[].
-                        // We'll seek to offsets[page] once NeedPage runs and
-                        // the offset table is populated. If page == 0 nothing
-                        // special is needed.
                         self.state = State::NeedPage;
                     }
                     continue;
@@ -1370,10 +1244,6 @@ impl App for ReaderApp {
                 },
 
                 State::NeedIndex => {
-                    // epub_index_chapter calls reset_paging() which zeroes
-                    // self.page.  Save the target values first so bookmark
-                    // restore and backward-nav-to-last-page still work.
-                    let target_page = self.page;
                     let want_last = self.goto_last_page;
                     self.goto_last_page = false;
 
@@ -1391,38 +1261,16 @@ impl App for ReaderApp {
                                 ctx.mark_dirty(PAGE_REGION);
                             }
                         }
-                    } else if target_page > 0 {
-                        // Bookmark requested a non-zero page within this
-                        // chapter. Scan forward until we reach it.
-                        loop {
-                            match self.load_and_prefetch(svc) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    self.error = Some(e);
-                                    self.state = State::Error;
-                                    ctx.mark_dirty(PAGE_REGION);
-                                    break;
-                                }
-                            }
-                            if self.page >= target_page || self.page + 1 >= self.total_pages {
-                                break;
-                            }
-                            self.page += 1;
-                        }
-                        if self.state != State::Error {
-                            self.state = State::Ready;
-                            ctx.mark_dirty(PAGE_REGION);
-                        }
                     } else {
+                        // NeedPage handles restore_offset if set
                         self.state = State::NeedPage;
                         continue;
                     }
                 }
 
                 State::NeedPage => {
-                    // Unified for TXT and cached EPUB — both read from SD.
-                    let target_page = self.page;
-                    if target_page > 0 && self.offsets[target_page] == 0 {
+                    if let Some(target_off) = self.restore_offset.take() {
+                        // font-independent bookmark restore: scan to byte offset
                         self.page = 0;
                         loop {
                             match self.load_and_prefetch(svc) {
@@ -1434,7 +1282,10 @@ impl App for ReaderApp {
                                     break;
                                 }
                             }
-                            if self.page >= target_page || self.page + 1 >= self.total_pages {
+                            if self.page + 1 >= self.total_pages {
+                                break;
+                            }
+                            if self.offsets[self.page + 1] > target_off {
                                 break;
                             }
                             self.page += 1;

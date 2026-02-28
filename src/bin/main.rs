@@ -35,7 +35,7 @@ use pulp_os::board::Board;
 use pulp_os::board::action::{Action, ActionEvent, ButtonMapper};
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
-use pulp_os::drivers::storage::DirCache;
+use pulp_os::drivers::storage::{self, DirCache};
 use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::wake::{self, signal_timer, try_wake};
 use pulp_os::kernel::{Job, Scheduler};
@@ -56,6 +56,9 @@ const IDLE_THRESHOLD_POLLS: u32 = 200; // 200 * 10ms = 2s before idle
 
 // fallback ghost-clear interval used before settings are loaded from SD
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
+
+// only probe SD card health every N status-bar updates (~30s at 5s interval)
+const SD_CHECK_EVERY: u32 = 6;
 
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
     Mutex::new(RefCell::new(None));
@@ -136,6 +139,11 @@ fn main() -> ! {
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .is_ok();
 
+    // ensure _PULP app-data directory exists before any config I/O
+    if sd_ok && let Err(e) = storage::ensure_pulp_dir(&board.storage.sd) {
+        info!("warning: failed to create _PULP dir: {}", e);
+    }
+
     let mut home = HomeApp::new();
     let mut files = FilesApp::new();
     let mut reader = ReaderApp::new();
@@ -153,10 +161,11 @@ fn main() -> ! {
     let mut timer_is_slow = false;
     let mut partial_refreshes: u32 = 0;
     let mut dir_cache = DirCache::new();
+    let mut sd_check_counter: u32 = 0;
 
-    // Load saved settings before the first render so font sizes and other
-    // preferences are in effect from frame zero, not only after the user
-    // visits the Settings app for the first time.
+    // Load saved settings and recent book before the first render so
+    // font sizes, preferences, and "Continue" button are ready from
+    // frame zero.
     {
         let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
         settings.load_eager(&mut svc);
@@ -166,6 +175,7 @@ fn main() -> ! {
         files.set_ui_font_size(ui_idx);
         settings.set_ui_font_size(ui_idx);
         reader.set_book_font_size(book_idx);
+        home.load_recent(&mut svc);
     }
 
     home.on_enter(&mut launcher.ctx);
@@ -518,12 +528,17 @@ fn main() -> ! {
                 }
 
                 Job::UpdateStatusBar => {
-                    sd_ok = board
-                        .storage
-                        .sd
-                        .volume_mgr
-                        .open_volume(embedded_sdmmc::VolumeIdx(0))
-                        .is_ok();
+                    // probe SD health infrequently to avoid repeated I/O
+                    sd_check_counter += 1;
+                    if sd_check_counter >= SD_CHECK_EVERY {
+                        sd_check_counter = 0;
+                        sd_ok = board
+                            .storage
+                            .sd
+                            .volume_mgr
+                            .open_volume(embedded_sdmmc::VolumeIdx(0))
+                            .is_ok();
+                    }
                     update_statusbar(&mut statusbar, &mut input, sd_ok);
                 }
             }

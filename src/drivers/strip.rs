@@ -55,17 +55,25 @@ impl StripBuffer {
         self.buf[..STRIP_BUF_SIZE].fill(0xFF);
     }
 
-    pub fn begin_window(&mut self, rotation: Rotation, x: u16, y: u16, w: u16, h: u16) {
+    pub fn begin_window(&mut self, rotation: Rotation, x: u16, y: u16, w: u16, mut h: u16) {
         let rb = (w / 8) as usize;
+        if rb == 0 {
+            self.win_w = 0;
+            self.win_h = 0;
+            self.row_bytes = 0;
+            return;
+        }
+        let max_h = (STRIP_BUF_SIZE / rb) as u16;
+        if h > max_h {
+            log::warn!(
+                "begin_window: {}x{} exceeds strip buf, clamping h -> {}",
+                w,
+                h,
+                max_h
+            );
+            h = max_h;
+        }
         let total = rb * h as usize;
-        assert!(
-            total <= STRIP_BUF_SIZE,
-            "partial region {}×{} = {} bytes exceeds strip buffer ({})",
-            w,
-            h,
-            total,
-            STRIP_BUF_SIZE,
-        );
 
         self.rotation = rotation;
         self.win_x = x;

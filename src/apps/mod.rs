@@ -5,6 +5,7 @@
 // Apps needing SD return needs_work()=true; kernel calls on_work() with
 // a Services handle before rendering. Services is the syscall boundary.
 
+pub mod bookmarks;
 pub mod files;
 pub mod home;
 pub mod reader;
@@ -201,6 +202,67 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
 
     pub fn delete_in_dir(&self, dir: &str, name: &str) -> Result<(), &'static str> {
         storage::delete_file_in_dir(self.sd, dir, name)
+    }
+
+    // ── _PULP app-data directory ──────────────────────────────────
+
+    pub fn ensure_pulp_dir(&self) -> Result<(), &'static str> {
+        storage::ensure_pulp_dir(self.sd)
+    }
+
+    // file ops directly inside _PULP/
+
+    pub fn read_pulp_start(
+        &self,
+        name: &str,
+        buf: &mut [u8],
+    ) -> Result<(u32, usize), &'static str> {
+        storage::read_pulp_file_start(self.sd, name, buf)
+    }
+
+    pub fn read_pulp_chunk(
+        &self,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        storage::read_pulp_file_chunk(self.sd, name, offset, buf)
+    }
+
+    pub fn write_pulp(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        storage::write_pulp_file(self.sd, name, data)
+    }
+
+    // nested subdir ops inside _PULP/<dir>/
+
+    pub fn ensure_pulp_subdir(&self, name: &str) -> Result<(), &'static str> {
+        storage::ensure_pulp_subdir(self.sd, name)
+    }
+
+    pub fn write_pulp_sub(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        storage::write_in_pulp_subdir(self.sd, dir, name, data)
+    }
+
+    pub fn append_pulp_sub(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        storage::append_in_pulp_subdir(self.sd, dir, name, data)
+    }
+
+    pub fn read_pulp_sub_chunk(
+        &self,
+        dir: &str,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        storage::read_chunk_in_pulp_subdir(self.sd, dir, name, offset, buf)
+    }
+
+    pub fn file_size_pulp_sub(&self, dir: &str, name: &str) -> Result<u32, &'static str> {
+        storage::file_size_in_pulp_subdir(self.sd, dir, name)
+    }
+
+    pub fn delete_pulp_sub(&self, dir: &str, name: &str) -> Result<(), &'static str> {
+        storage::delete_in_pulp_subdir(self.sd, dir, name)
     }
 }
 

@@ -33,7 +33,7 @@ const HEADING_ITEMS_GAP: u16 = 8;
 
 // ── Persistent settings ───────────────────────────────────────────────────────
 
-const SETTINGS_FILE: &str = "settings.bin";
+const SETTINGS_FILE: &str = "SETTINGS.BIN";
 
 // #[repr(C)] on-disk layout (8 bytes total):
 //   sleep_timeout      u16   bytes 0–1
@@ -175,7 +175,7 @@ impl SettingsApp {
     fn load<SPI: embedded_hal::spi::SpiDevice>(&mut self, services: &mut Services<'_, SPI>) {
         // Buffer must be >= size_of::<SystemSettings>() = 8 bytes.
         let mut buf = [0u8; 32];
-        match services.read_file_start(SETTINGS_FILE, &mut buf) {
+        match services.read_pulp_start(SETTINGS_FILE, &mut buf) {
             Ok((size, n)) if n > 0 => {
                 self.settings = SystemSettings::from_bytes(&buf[..n.min(size as usize)]);
                 log::info!("settings: loaded from {}", SETTINGS_FILE);
@@ -189,7 +189,7 @@ impl SettingsApp {
     }
 
     fn save<SPI: embedded_hal::spi::SpiDevice>(&self, services: &Services<'_, SPI>) -> bool {
-        match services.write_file(SETTINGS_FILE, self.settings.to_bytes()) {
+        match services.write_pulp(SETTINGS_FILE, self.settings.to_bytes()) {
             Ok(_) => {
                 log::info!("settings: saved to {}", SETTINGS_FILE);
                 true
@@ -296,7 +296,7 @@ impl SettingsApp {
             }
             2 => {
                 self.settings.ghost_clear_every =
-                    self.settings.ghost_clear_every.saturating_sub(5).max(5);
+                    self.settings.ghost_clear_every.saturating_sub(5).max(1);
             }
             3 => {
                 if self.settings.book_font_size_idx > 0 {
