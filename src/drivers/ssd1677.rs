@@ -12,7 +12,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
-use super::strip::{STRIP_COUNT, StripBuffer};
+use super::strip::{STRIP_BUF_SIZE, STRIP_COUNT, StripBuffer};
 
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
@@ -187,9 +187,9 @@ where
         self.update_partial();
 
         // step 3: sync both planes (RED then BW)
-        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
-            self.write_region_strips(strip, px, py, pw, ph, ram_cmd, &draw, left_mask, right_mask);
-        }
+        // Render each strip chunk once and write to both planes,
+        // instead of rendering all chunks twice (once per plane).
+        self.write_region_strips_dual(strip, px, py, pw, ph, &draw, left_mask, right_mask);
 
         self.power_off();
     }
@@ -241,6 +241,63 @@ where
                 }
             }
             self.send_data(strip.data());
+            y += rows;
+        }
+    }
+
+    /// Sync both RAM planes (RED + BW) rendering each strip chunk
+    /// only once. For each chunk the draw closure runs once; the
+    /// rendered data is sent to RED then BW via per-chunk RAM area
+    /// commands. This is 1× draw calls instead of 2× for the
+    /// step-3 sync in partial refresh (and 2N total instead of 3N
+    /// across the whole partial refresh sequence).
+    #[allow(clippy::too_many_arguments)]
+    fn write_region_strips_dual<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        px: u16,
+        py: u16,
+        pw: u16,
+        ph: u16,
+        draw: &F,
+        left_mask: u8,
+        right_mask: u8,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        let max_rows = StripBuffer::max_rows_for_width(pw);
+        let row_bytes = (pw / 8) as usize;
+        let needs_mask = left_mask != 0 || right_mask != 0;
+
+        let mut y = py;
+        while y < py + ph {
+            let rows = max_rows.min(py + ph - y);
+            strip.begin_window(self.rotation, px, y, pw, rows);
+            draw(strip);
+
+            if needs_mask && row_bytes > 0 {
+                for row in strip.data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+            }
+
+            // Save rendered strip so we can send it to both planes.
+            // strip.data() lives in RAM and persists after send_data,
+            // but set_partial_ram_area calls send_command/send_data
+            // internally which is fine — the strip buffer is separate.
+            let data_len = strip.data().len();
+            let mut replay = [0xFFu8; STRIP_BUF_SIZE];
+            replay[..data_len].copy_from_slice(strip.data());
+
+            // Write to both RED and BW planes from the same rendered data.
+            // Per-chunk RAM area avoids needing a full-region streaming pass.
+            for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+                self.set_partial_ram_area(px, y, pw, rows);
+                self.send_command(ram_cmd);
+                self.send_data(&replay[..data_len]);
+            }
+
             y += rows;
         }
     }
@@ -505,9 +562,9 @@ where
         self.update_partial_async().await;
 
         // step 3: sync both planes (RED then BW)
-        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
-            self.write_region_strips(strip, px, py, pw, ph, ram_cmd, &draw, left_mask, right_mask);
-        }
+        // Render each strip chunk once and write to both planes,
+        // instead of rendering all chunks twice (once per plane).
+        self.write_region_strips_dual(strip, px, py, pw, ph, &draw, left_mask, right_mask);
 
         self.power_off_async().await;
     }

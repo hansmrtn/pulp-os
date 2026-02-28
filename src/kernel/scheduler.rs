@@ -2,6 +2,9 @@
 //
 // Jobs are signals, not data carriers. Three tiers (High/Normal/Low),
 // FIFO within each. Fixed-size ring buffers, no allocation.
+//
+// Dedup uses a u8 bitmap (one bit per Job variant) for O(1)
+// push_unique instead of linear queue scans.
 
 use core::fmt;
 
@@ -11,6 +14,14 @@ pub enum Job {
     Render,
     AppWork,
     UpdateStatusBar,
+}
+
+impl Job {
+    /// Bit index for the pending bitmap (0..3).
+    #[inline]
+    const fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
 }
 
 impl fmt::Display for Job {
@@ -89,28 +100,14 @@ impl<const N: usize> JobQueue<N> {
         self.len -= 1;
         job
     }
-
-    fn contains(&self, job: &Job) -> bool {
-        if self.len == 0 {
-            return false;
-        }
-        let mut i = self.head;
-        for _ in 0..self.len {
-            if let Some(ref j) = self.buf[i]
-                && j == job
-            {
-                return true;
-            }
-            i = (i + 1) % N;
-        }
-        false
-    }
 }
 
 pub struct Scheduler {
     high: JobQueue<4>,
     normal: JobQueue<8>,
     low: JobQueue<16>,
+    /// One bit per `Job` variant — set on `push_unique`, cleared on `pop`.
+    pending: u8,
 }
 
 impl Scheduler {
@@ -119,46 +116,54 @@ impl Scheduler {
             high: JobQueue::new(),
             normal: JobQueue::new(),
             low: JobQueue::new(),
+            pending: 0,
         }
     }
 
+    /// Push a job without dedup. The pending bitmap is still updated
+    /// so that a subsequent `push_unique` for the same variant is
+    /// correctly suppressed.
     pub fn push(&mut self, job: Job) -> Result<(), PushError> {
-        match job.priority() {
+        let result = match job.priority() {
             Priority::High => self.high.push(job),
             Priority::Normal => self.normal.push(job),
             Priority::Low => self.low.push(job),
         }
-        .map_err(PushError::Full)
+        .map_err(PushError::Full);
+
+        if result.is_ok() {
+            self.pending |= job.bit();
+        }
+        result
     }
 
+    /// Push a job only if the same variant is not already enqueued.
+    /// O(1) via bitmap check — no queue scan.
     pub fn push_unique(&mut self, job: Job) -> Result<(), PushError> {
-        match job.priority() {
-            Priority::High => {
-                if self.high.contains(&job) {
-                    return Ok(());
-                }
-                self.high.push(job).map_err(PushError::Full)
-            }
-            Priority::Normal => {
-                if self.normal.contains(&job) {
-                    return Ok(());
-                }
-                self.normal.push(job).map_err(PushError::Full)
-            }
-            Priority::Low => {
-                if self.low.contains(&job) {
-                    return Ok(());
-                }
-                self.low.push(job).map_err(PushError::Full)
-            }
+        if self.pending & job.bit() != 0 {
+            return Ok(());
         }
+        self.push(job)
     }
 
     pub fn pop(&mut self) -> Option<Job> {
-        self.high
+        let job = self
+            .high
             .pop()
             .or_else(|| self.normal.pop())
-            .or_else(|| self.low.pop())
+            .or_else(|| self.low.pop());
+
+        if let Some(j) = job {
+            // Only clear the bit if no other instance of this variant
+            // remains in any queue. For the common case (push_unique
+            // only, at most one instance per variant) this is always
+            // safe to clear immediately. If `push` was used to enqueue
+            // duplicates, the bit may be cleared early — but that only
+            // means a subsequent `push_unique` might re-enqueue rather
+            // than suppress, which is harmless for signal-style jobs.
+            self.pending &= !j.bit();
+        }
+        job
     }
 }
 

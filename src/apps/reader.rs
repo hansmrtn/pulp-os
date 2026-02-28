@@ -323,10 +323,9 @@ impl ReaderApp {
     // ── Bookmarks (delegates to shared apps::bookmarks module) ────────────────
 
     // called synchronously by main on nav events
-    pub fn save_position<SPI: embedded_hal::spi::SpiDevice>(&self, svc: &mut Services<'_, SPI>) {
+    pub fn save_position(&self, bm: &mut bookmarks::BookmarkCache) {
         if self.state == State::Ready {
-            bookmarks::save(
-                svc,
+            bm.save(
                 &self.filename[..self.filename_len],
                 self.offsets[self.page],
                 self.chapter,
@@ -334,11 +333,8 @@ impl ReaderApp {
         }
     }
 
-    fn bookmark_load<SPI: embedded_hal::spi::SpiDevice>(
-        &mut self,
-        svc: &mut Services<'_, SPI>,
-    ) -> bool {
-        if let Some(slot) = bookmarks::find(svc, &self.filename[..self.filename_len]) {
+    fn bookmark_load(&mut self, bm: &bookmarks::BookmarkCache) -> bool {
+        if let Some(slot) = bm.find(&self.filename[..self.filename_len]) {
             log::info!(
                 "bookmark: restoring off={} ch={} for {}",
                 slot.byte_offset,
@@ -1157,7 +1153,7 @@ impl App for ReaderApp {
         loop {
             match self.state {
                 State::NeedBookmark => {
-                    self.bookmark_load(svc);
+                    self.bookmark_load(svc.bookmarks());
 
                     // write recent file for "Continue Reading" on home screen
                     let _ = svc.write_pulp(RECENT_FILE, &self.filename[..self.filename_len]);

@@ -252,7 +252,7 @@ impl App for HomeApp {
         }
 
         if self.needs_load_bookmarks {
-            self.bm_count = bookmarks::load_all(svc, &mut self.bm_entries);
+            self.bm_count = svc.bookmarks().load_all(&mut self.bm_entries);
             self.needs_load_bookmarks = false;
             if self.state == HomeState::ShowBookmarks {
                 ctx.mark_dirty(self.bm_page_region());

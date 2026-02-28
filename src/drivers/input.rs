@@ -3,6 +3,10 @@
 // One button at a time (ladder hw limitation). Three sources:
 // Row1 (GPIO1), Row2 (GPIO2), Power (GPIO3 interrupt).
 // 15ms debounce, 1s long press, 150ms repeat.
+//
+// ADC reads are oversampled (4 samples averaged) to reject noise
+// from ESP32-C3 ADC non-linearity and battery voltage sag during
+// SPI traffic. ~40µs total per channel — invisible at 10ms poll.
 
 use esp_hal::time::{Duration, Instant};
 
@@ -12,6 +16,7 @@ use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladd
 const DEBOUNCE_MS: u64 = 15;
 const LONG_PRESS_MS: u64 = 1000;
 const REPEAT_MS: u64 = 150;
+const ADC_OVERSAMPLE: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -136,14 +141,34 @@ impl InputDriver {
             return Some(Button::Power);
         }
 
-        let mv1: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row1)).unwrap();
-        let mv2: u16 = nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row2)).unwrap();
+        let mv1 = self.read_averaged_row1();
+        let mv2 = self.read_averaged_row2();
 
         decode_ladder(mv1, ROW1_THRESHOLDS).or_else(|| decode_ladder(mv2, ROW2_THRESHOLDS))
     }
 
+    fn read_averaged_row1(&mut self) -> u16 {
+        let mut sum: u32 = 0;
+        for _ in 0..ADC_OVERSAMPLE {
+            sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row1)).unwrap() as u32;
+        }
+        (sum / ADC_OVERSAMPLE) as u16
+    }
+
+    fn read_averaged_row2(&mut self) -> u16 {
+        let mut sum: u32 = 0;
+        for _ in 0..ADC_OVERSAMPLE {
+            sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row2)).unwrap() as u32;
+        }
+        (sum / ADC_OVERSAMPLE) as u16
+    }
+
     pub fn read_battery_mv(&mut self) -> u16 {
-        nb::block!(self.hw.adc.read_oneshot(&mut self.hw.battery)).unwrap()
+        let mut sum: u32 = 0;
+        for _ in 0..ADC_OVERSAMPLE {
+            sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.battery)).unwrap() as u32;
+        }
+        (sum / ADC_OVERSAMPLE) as u16
     }
 
     pub fn is_debouncing(&self) -> bool {

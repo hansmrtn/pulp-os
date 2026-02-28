@@ -18,6 +18,8 @@ use crate::drivers::strip::StripBuffer;
 use crate::ui::Region;
 use crate::ui::quick_menu::QuickAction;
 
+pub use bookmarks::BookmarkCache;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
     Home,
@@ -126,12 +128,31 @@ impl AppContext {
 // Each call re-opens volume/dir/file; reader uses prefetch to amortize cost.
 pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
     dir_cache: &'a mut DirCache,
+    bookmarks: &'a mut BookmarkCache,
     sd: &'a SdStorage<SPI>,
 }
 
 impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
-    pub fn new(dir_cache: &'a mut DirCache, sd: &'a SdStorage<SPI>) -> Self {
-        Self { dir_cache, sd }
+    pub fn new(
+        dir_cache: &'a mut DirCache,
+        bookmarks: &'a mut BookmarkCache,
+        sd: &'a SdStorage<SPI>,
+    ) -> Self {
+        Self {
+            dir_cache,
+            bookmarks,
+            sd,
+        }
+    }
+
+    /// Access the shared bookmark cache (in-memory, no SD I/O).
+    pub fn bookmarks(&self) -> &BookmarkCache {
+        self.bookmarks
+    }
+
+    /// Mutable access to the bookmark cache for saves.
+    pub fn bookmarks_mut(&mut self) -> &mut BookmarkCache {
+        self.bookmarks
     }
 
     pub fn dir_page(

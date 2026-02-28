@@ -35,7 +35,9 @@ use pulp_os::apps::files::FilesApp;
 use pulp_os::apps::home::HomeApp;
 use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
-use pulp_os::apps::{App, AppContext, AppId, Launcher, Redraw, Services, Transition};
+use pulp_os::apps::{
+    App, AppContext, AppId, BookmarkCache, Launcher, Redraw, Services, Transition,
+};
 use pulp_os::board::Board;
 use pulp_os::board::action::{Action, ActionEvent, ButtonMapper};
 use pulp_os::drivers::battery;
@@ -57,13 +59,17 @@ const STATUSBAR_INTERVAL_TICKS: u32 = 500; // 5 seconds in 10ms ticks
 
 const ACTIVE_TIMER_MS: u64 = 10;
 const IDLE_TIMER_MS: u64 = 100;
-const IDLE_THRESHOLD_POLLS: u32 = 200; // 200 * 10ms = 2s before idle
+const IDLE_THRESHOLD_POLLS: u32 = 50; // 50 * 10ms = 500ms before idle
 
 // fallback ghost-clear interval used before settings are loaded from SD
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
 
 // only probe SD card health every N status-bar updates (~30s at 5s interval)
 const SD_CHECK_EVERY: u32 = 6;
+
+// only read battery ADC every N status-bar updates (~30s at 5s interval)
+// to avoid blocking ADC conversions on every 5s tick
+const BATTERY_READ_EVERY: u32 = 6;
 
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
     Mutex::new(RefCell::new(None));
@@ -166,13 +172,20 @@ fn main() -> ! {
     let mut timer_is_slow = false;
     let mut partial_refreshes: u32 = 0;
     let mut dir_cache = DirCache::new();
+    let mut bm_cache = BookmarkCache::new();
     let mut sd_check_counter: u32 = 0;
+    let mut battery_read_counter: u32 = 0;
+    let mut cached_battery_mv: u16 = battery::adc_to_battery_mv(input.read_battery_mv());
+
+    // Load bookmarks from SD into the RAM cache before anything else
+    // touches them. ensure_loaded takes &SdStorage directly.
+    bm_cache.ensure_loaded(&board.storage.sd);
 
     // Load saved settings and recent book before the first render so
     // font sizes, preferences, and "Continue" button are ready from
     // frame zero.
     {
-        let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
+        let mut svc = Services::new(&mut dir_cache, &mut bm_cache, &board.storage.sd);
         settings.load_eager(&mut svc);
         let ui_idx = settings.system_settings().ui_font_size_idx;
         let book_idx = settings.system_settings().book_font_size_idx;
@@ -184,7 +197,7 @@ fn main() -> ! {
     }
 
     home.on_enter(&mut launcher.ctx);
-    update_statusbar(&mut statusbar, &mut input, sd_ok);
+    update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
     block_on(
         board
             .display
@@ -309,9 +322,7 @@ fn main() -> ! {
                                         );
                                         // Save reader position before exit
                                         if nav.from == AppId::Reader {
-                                            let mut svc =
-                                                Services::new(&mut dir_cache, &board.storage.sd);
-                                            reader.save_position(&mut svc);
+                                            reader.save_position(&mut bm_cache);
                                         }
                                         with_app!(nav.from, home, files, reader, settings, |app| {
                                             app.on_exit();
@@ -352,9 +363,7 @@ fn main() -> ! {
                                     });
                                     // reader triggers always flush position to SD
                                     if active == AppId::Reader {
-                                        let mut svc =
-                                            Services::new(&mut dir_cache, &board.storage.sd);
-                                        reader.save_position(&mut svc);
+                                        reader.save_position(&mut bm_cache);
                                     }
                                     launcher.ctx.mark_dirty(region);
                                     let needs =
@@ -401,8 +410,7 @@ fn main() -> ! {
                         // Save reader position before suspending or exiting so
                         // we can restore it on the next open.
                         if nav.from == AppId::Reader {
-                            let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
-                            reader.save_position(&mut svc);
+                            reader.save_position(&mut bm_cache);
                         }
 
                         if nav.suspend {
@@ -461,7 +469,7 @@ fn main() -> ! {
                     match launcher.ctx.take_redraw() {
                         Redraw::Full => {
                             // Explicit full refresh request — always honour it.
-                            update_statusbar(&mut statusbar, &mut input, sd_ok);
+                            update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                             with_app!(active, home, files, reader, settings, |app| {
                                 block_on(board.display.epd.render_full_async(
                                     &mut strip,
@@ -487,7 +495,7 @@ fn main() -> ! {
                             if partial_refreshes >= ghost_clear_every {
                                 // Promote to a full hardware refresh to
                                 // clear accumulated ghosting artifacts.
-                                update_statusbar(&mut statusbar, &mut input, sd_ok);
+                                update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                                 with_app!(active, home, files, reader, settings, |app| {
                                     block_on(board.display.epd.render_full_async(
                                         &mut strip,
@@ -536,7 +544,7 @@ fn main() -> ! {
 
                 Job::AppWork => {
                     let active = launcher.active();
-                    let mut svc = Services::new(&mut dir_cache, &board.storage.sd);
+                    let mut svc = Services::new(&mut dir_cache, &mut bm_cache, &board.storage.sd);
                     with_app!(active, home, files, reader, settings, |app| {
                         app.on_work(&mut svc, &mut launcher.ctx);
                     });
@@ -557,7 +565,18 @@ fn main() -> ! {
                             .open_volume(embedded_sdmmc::VolumeIdx(0))
                             .is_ok();
                     }
-                    update_statusbar(&mut statusbar, &mut input, sd_ok);
+                    // read battery ADC infrequently (~30s) to avoid
+                    // blocking ADC conversions on every 5s tick
+                    battery_read_counter += 1;
+                    if battery_read_counter >= BATTERY_READ_EVERY {
+                        battery_read_counter = 0;
+                        cached_battery_mv = battery::adc_to_battery_mv(input.read_battery_mv());
+                    }
+                    // Flush dirty bookmarks to SD periodically (~5s).
+                    if bm_cache.is_dirty() {
+                        bm_cache.flush(&board.storage.sd);
+                    }
+                    update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                 }
             }
         }
@@ -595,17 +614,15 @@ fn main() -> ! {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn update_statusbar(bar: &mut StatusBar, input: &mut InputDriver, sd_ok: bool) {
+fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
     const HEAP_TOTAL: usize = 256720;
     let stats = esp_alloc::HEAP.stats();
 
-    let adc_mv = input.read_battery_mv();
-    let bat_mv = battery::adc_to_battery_mv(adc_mv);
-    let bat_pct = battery::battery_percentage(bat_mv);
+    let bat_pct = battery::battery_percentage(battery_mv);
 
     bar.update(&SystemStatus {
         uptime_secs: wake::uptime_secs(),
-        battery_mv: bat_mv,
+        battery_mv,
         battery_pct: bat_pct,
         heap_used: stats.current_usage,
         heap_total: HEAP_TOTAL,

@@ -1,11 +1,17 @@
-// Shared bookmark record format and helpers
+// RAM-resident bookmark cache
 //
-// 48-byte slots in _PULP/BOOKMARKS, 16 max. Full filename per slot
-// for bookmark browsing. LRU eviction via generation counter.
-// File I/O uses a heap-allocated temporary buffer (768 bytes, freed
-// on return) to keep the stack light.
+// 16 slots × 48 bytes decoded, held permanently in RAM (~780 bytes).
+// Loaded from SD once via `ensure_loaded()`; all subsequent reads
+// (`find`, `load_all`) served from memory with zero SD I/O.
 //
-// Record layout (little-endian):
+// Writes (`save`) update the in-memory cache and set a dirty flag.
+// `flush()` persists to SD only when dirty — called by the main
+// loop on nav transitions, app exit, or periodically.
+//
+// This eliminates the read→modify→write cycle on every position
+// save and removes all heap allocation from the bookmark path.
+//
+// Record layout (little-endian, 48 bytes per slot):
 //   [0..4)   name_hash    u32
 //   [4..8)   byte_offset  u32   font-independent file/chapter position
 //   [8..10)  chapter      u16   epub chapter; 0 for txt
@@ -15,11 +21,8 @@
 //   [15]     _pad         u8
 //   [16..48) filename     [u8;32]
 
-extern crate alloc;
-
-use alloc::vec;
-
-use crate::apps::Services;
+use crate::drivers::sdcard::SdStorage;
+use crate::drivers::storage;
 
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
@@ -27,7 +30,8 @@ pub const RECORD_LEN: usize = 48;
 pub const FILE_LEN: usize = SLOTS * RECORD_LEN; // 768
 pub const FILENAME_CAP: usize = 32;
 
-// full decoded slot — used transiently, not stored in arrays
+// ── Slot types ──────────────────────────────────────────────────────
+
 #[derive(Clone, Copy)]
 pub struct BookmarkSlot {
     pub name_hash: u32,
@@ -100,7 +104,7 @@ impl BookmarkSlot {
     }
 }
 
-// lightweight entry for the bookmark list in HomeApp (35 bytes vs 48)
+/// Lightweight entry for the bookmark list in HomeApp (35 bytes vs 48).
 #[derive(Clone, Copy)]
 pub struct BmListEntry {
     pub filename: [u8; FILENAME_CAP],
@@ -120,7 +124,9 @@ impl BmListEntry {
     }
 }
 
-// FNV-1a 32-bit hash
+// ── Hash ────────────────────────────────────────────────────────────
+
+/// FNV-1a 32-bit hash.
 pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in data {
@@ -130,177 +136,263 @@ pub fn fnv1a(data: &[u8]) -> u32 {
     h
 }
 
-// ── File I/O (heap-buffered, one SD read per call) ────────────────────
+// ── RAM-resident cache ──────────────────────────────────────────────
 
-// read the bookmark file into a heap Vec; returns (buf, slot_count).
-// caller must drop the Vec when done to free the heap.
-fn read_file<SPI: embedded_hal::spi::SpiDevice>(
-    svc: &mut Services<'_, SPI>,
-) -> (alloc::vec::Vec<u8>, usize) {
-    let mut buf = vec![0u8; FILE_LEN];
-    match svc.read_pulp_start(BOOKMARK_FILE, &mut buf) {
-        Ok((_, n)) => {
-            let count = (n / RECORD_LEN).min(SLOTS);
-            (buf, count)
-        }
-        Err(_) => (buf, 0),
+/// In-memory bookmark table. Loaded from SD once, all reads served
+/// from RAM. Writes mark the cache dirty for later `flush()`.
+///
+/// Total size: 16 × ~48 bytes + overhead ≈ 780 bytes.
+pub struct BookmarkCache {
+    slots: [BookmarkSlot; SLOTS],
+    /// Number of slots that were present in the file (may be < SLOTS).
+    /// New saves beyond this index extend the count.
+    count: usize,
+    dirty: bool,
+    loaded: bool,
+}
+
+impl Default for BookmarkCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-#[inline]
-fn slot_at(buf: &[u8], i: usize) -> BookmarkSlot {
-    let base = i * RECORD_LEN;
-    BookmarkSlot::decode(&buf[base..base + RECORD_LEN])
-}
-
-// ── Public API ────────────────────────────────────────────────────────
-
-// load all valid bookmarks into BmListEntry array, sorted by generation
-// descending (most recent first). returns count written.
-pub fn load_all<SPI: embedded_hal::spi::SpiDevice>(
-    svc: &mut Services<'_, SPI>,
-    out: &mut [BmListEntry],
-) -> usize {
-    let (buf, slot_count) = read_file(svc);
-    let mut gens = [0u16; SLOTS];
-    let mut count = 0usize;
-
-    for i in 0..slot_count {
-        if count >= out.len() {
-            break;
-        }
-        let slot = slot_at(&buf, i);
-        if slot.valid && slot.name_len > 0 {
-            gens[count] = slot.generation;
-            out[count] = BmListEntry {
-                filename: slot.filename,
-                name_len: slot.name_len,
-                chapter: slot.chapter,
-            };
-            count += 1;
+impl BookmarkCache {
+    pub const fn new() -> Self {
+        Self {
+            slots: [BookmarkSlot::EMPTY; SLOTS],
+            count: 0,
+            dirty: false,
+            loaded: false,
         }
     }
-    // buf dropped here — heap freed
 
-    // insertion sort by generation descending
-    for i in 1..count {
-        let key_gen = gens[i];
-        let key_entry = out[i];
-        let mut j = i;
-        while j > 0 && gens[j - 1] < key_gen {
-            gens[j] = gens[j - 1];
-            out[j] = out[j - 1];
-            j -= 1;
-        }
-        gens[j] = key_gen;
-        out[j] = key_entry;
+    /// True if in-memory state has changed since the last flush.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
-    count
-}
-
-// find a bookmark by filename; returns None if not found.
-pub fn find<SPI: embedded_hal::spi::SpiDevice>(
-    svc: &mut Services<'_, SPI>,
-    filename: &[u8],
-) -> Option<BookmarkSlot> {
-    let key = fnv1a(filename);
-    let (buf, slot_count) = read_file(svc);
-
-    for i in 0..slot_count {
-        let slot = slot_at(&buf, i);
-        if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
-            return Some(slot);
-        }
+    /// True if the cache has been loaded from SD at least once.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
-    // buf dropped here — heap freed
 
-    None
-}
+    // ── Load from SD ────────────────────────────────────────────
 
-// save a bookmark for the given file. handles LRU eviction, generation
-// increment, and matching by hash + full filename.
-pub fn save<SPI: embedded_hal::spi::SpiDevice>(
-    svc: &mut Services<'_, SPI>,
-    filename: &[u8],
-    byte_offset: u32,
-    chapter: u16,
-) {
-    let key = fnv1a(filename);
-    let (mut buf, slot_count) = read_file(svc);
+    /// Read the bookmark file from SD into the in-memory cache.
+    ///
+    /// Idempotent — does nothing if already loaded. Call once at
+    /// boot (or whenever SD becomes available) before using
+    /// `find()`, `save()`, or `load_all()`.
+    pub fn ensure_loaded<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
+        if self.loaded {
+            return;
+        }
+        self.force_load(sd);
+    }
 
-    // scan for target slot, max generation, and LRU candidate
-    let mut max_gen: u16 = 0;
-    let mut target: Option<usize> = None;
-    let mut first_free: Option<usize> = None;
-    let mut lru_slot: usize = 0;
-    let mut lru_gen: u16 = u16::MAX;
+    /// Unconditionally reload from SD, discarding any in-memory
+    /// changes. Use after SD hot-swap or to recover from errors.
+    pub fn force_load<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
+        let mut buf = [0u8; FILE_LEN];
+        let slot_count = match storage::read_pulp_file_start(sd, BOOKMARK_FILE, &mut buf) {
+            Ok((_, n)) => (n / RECORD_LEN).min(SLOTS),
+            Err(_) => 0,
+        };
 
-    for i in 0..slot_count {
-        let slot = slot_at(&buf, i);
+        for i in 0..slot_count {
+            let base = i * RECORD_LEN;
+            self.slots[i] = BookmarkSlot::decode(&buf[base..base + RECORD_LEN]);
+        }
+        for i in slot_count..SLOTS {
+            self.slots[i] = BookmarkSlot::EMPTY;
+        }
 
-        if !slot.valid {
-            if first_free.is_none() {
-                first_free = Some(i);
+        self.count = slot_count;
+        self.dirty = false;
+        self.loaded = true;
+
+        log::info!("bookmarks: loaded {} slots from SD", slot_count);
+    }
+
+    // ── In-memory reads (no SD I/O) ─────────────────────────────
+
+    /// Find a bookmark by filename. Returns `None` if not found or
+    /// if the cache has not been loaded yet.
+    pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
+        if !self.loaded {
+            return None;
+        }
+
+        let key = fnv1a(filename);
+        for i in 0..self.count {
+            let slot = &self.slots[i];
+            if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
+                return Some(*slot);
             }
-            continue;
         }
-
-        if slot.generation > max_gen {
-            max_gen = slot.generation;
-        }
-        if slot.generation < lru_gen {
-            lru_gen = slot.generation;
-            lru_slot = i;
-        }
-
-        if slot.name_hash == key && slot.matches_name(filename) {
-            target = Some(i);
-            break;
-        }
+        None
     }
 
-    let write_slot = target.or(first_free).unwrap_or(if slot_count >= SLOTS {
-        lru_slot
-    } else {
-        slot_count
-    });
+    /// Copy all valid bookmarks into `out`, sorted by generation
+    /// descending (most recent first). Returns count written.
+    pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
+        if !self.loaded {
+            return 0;
+        }
 
-    let generation = max_gen.wrapping_add(1);
-    let name_len = filename.len().min(FILENAME_CAP);
-    let mut new_slot = BookmarkSlot {
-        name_hash: key,
-        byte_offset,
-        chapter,
-        valid: true,
-        generation,
-        name_len: name_len as u8,
-        filename: [0u8; FILENAME_CAP],
-    };
-    new_slot.filename[..name_len].copy_from_slice(&filename[..name_len]);
+        // Collect valid entries with their generation for sorting.
+        let mut gens = [0u16; SLOTS];
+        let mut count = 0usize;
 
-    // patch the slot in the buffer
-    let base = write_slot * RECORD_LEN;
-    let new_count = (write_slot + 1).max(slot_count);
-    let file_len = new_count * RECORD_LEN;
+        for i in 0..self.count {
+            if count >= out.len() {
+                break;
+            }
+            let slot = &self.slots[i];
+            if slot.valid && slot.name_len > 0 {
+                gens[count] = slot.generation;
+                out[count] = BmListEntry {
+                    filename: slot.filename,
+                    name_len: slot.name_len,
+                    chapter: slot.chapter,
+                };
+                count += 1;
+            }
+        }
 
-    // ensure buf is large enough if we're appending past the old end
-    if file_len > buf.len() {
-        buf.resize(file_len, 0);
+        // Insertion sort by generation descending (most recent first).
+        for i in 1..count {
+            let key_gen = gens[i];
+            let key_entry = out[i];
+            let mut j = i;
+            while j > 0 && gens[j - 1] < key_gen {
+                gens[j] = gens[j - 1];
+                out[j] = out[j - 1];
+                j -= 1;
+            }
+            gens[j] = key_gen;
+            out[j] = key_entry;
+        }
+
+        count
     }
 
-    let rec = new_slot.encode();
-    buf[base..base + RECORD_LEN].copy_from_slice(&rec);
+    // ── In-memory writes (marks dirty, no SD I/O) ───────────────
 
-    match svc.write_pulp(BOOKMARK_FILE, &buf[..file_len]) {
-        Ok(_) => log::info!(
-            "bookmark: saved off={} ch={} gen={} for {:?}",
+    /// Save a bookmark for the given file. Updates the in-memory
+    /// cache and marks it dirty. Call `flush()` later to persist.
+    ///
+    /// Handles LRU eviction, generation increment, and matching
+    /// by hash + full filename — identical logic to the old
+    /// `bookmarks::save`, but entirely in RAM.
+    pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
+        if !self.loaded {
+            log::warn!("bookmarks: save called before load, ignoring");
+            return;
+        }
+
+        let key = fnv1a(filename);
+
+        // Scan for: target slot, max generation, first free, LRU.
+        let mut max_gen: u16 = 0;
+        let mut target: Option<usize> = None;
+        let mut first_free: Option<usize> = None;
+        let mut lru_slot: usize = 0;
+        let mut lru_gen: u16 = u16::MAX;
+
+        for i in 0..self.count {
+            let slot = &self.slots[i];
+
+            if !slot.valid {
+                if first_free.is_none() {
+                    first_free = Some(i);
+                }
+                continue;
+            }
+
+            if slot.generation > max_gen {
+                max_gen = slot.generation;
+            }
+            if slot.generation < lru_gen {
+                lru_gen = slot.generation;
+                lru_slot = i;
+            }
+
+            if slot.name_hash == key && slot.matches_name(filename) {
+                target = Some(i);
+                break;
+            }
+        }
+
+        let write_slot = target.or(first_free).unwrap_or(if self.count >= SLOTS {
+            lru_slot
+        } else {
+            self.count
+        });
+
+        let generation = max_gen.wrapping_add(1);
+        let name_len = filename.len().min(FILENAME_CAP);
+
+        let mut new_slot = BookmarkSlot {
+            name_hash: key,
+            byte_offset,
+            chapter,
+            valid: true,
+            generation,
+            name_len: name_len as u8,
+            filename: [0u8; FILENAME_CAP],
+        };
+        new_slot.filename[..name_len].copy_from_slice(&filename[..name_len]);
+
+        self.slots[write_slot] = new_slot;
+
+        // Extend count if we wrote past the current end.
+        if write_slot >= self.count {
+            self.count = write_slot + 1;
+        }
+
+        self.dirty = true;
+
+        log::info!(
+            "bookmark: cached off={} ch={} gen={} for {:?}",
             byte_offset,
             chapter,
             generation,
             core::str::from_utf8(filename).unwrap_or("?"),
-        ),
-        Err(e) => log::warn!("bookmark: save failed: {}", e),
+        );
     }
-    // buf dropped here — heap freed
+
+    // ── Flush to SD ─────────────────────────────────────────────
+
+    /// Write the in-memory cache to SD if dirty. No-op if clean.
+    ///
+    /// Call on app exit, nav transitions, or periodically.
+    /// Uses a 768-byte stack buffer for encoding — safe to call
+    /// from the main loop where stack depth is shallow.
+    pub fn flush<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
+        if !self.dirty || !self.loaded {
+            return;
+        }
+
+        let file_len = self.count * RECORD_LEN;
+        let mut buf = [0u8; FILE_LEN];
+
+        for i in 0..self.count {
+            let base = i * RECORD_LEN;
+            let rec = self.slots[i].encode();
+            buf[base..base + RECORD_LEN].copy_from_slice(&rec);
+        }
+
+        match storage::write_pulp_file(sd, BOOKMARK_FILE, &buf[..file_len]) {
+            Ok(_) => {
+                self.dirty = false;
+                log::info!("bookmarks: flushed {} slots to SD", self.count);
+            }
+            Err(e) => {
+                log::warn!("bookmarks: flush failed: {}", e);
+                // Leave dirty=true so we retry next time.
+            }
+        }
+    }
 }
