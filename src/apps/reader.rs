@@ -324,9 +324,8 @@ impl ReaderApp {
         (buf, self.filename_len)
     }
 
-    // ── Bookmarks (delegates to shared apps::bookmarks module) ────────────────
+    // ── Bookmarks ─────────────────────────────────────────────────────────────
 
-    // called synchronously by main on nav events
     pub fn save_position(&self, bm: &mut bookmarks::BookmarkCache) {
         if self.state == State::Ready {
             bm.save(
@@ -491,8 +490,7 @@ impl ReaderApp {
             self.buf_len = self.prefetch_len;
             self.prefetch_page = NO_PREFETCH;
             self.prefetch_len = 0;
-        } else if self.is_epub && self.chapters_cached {
-            // EPUB: read from cached styled-text file on SD
+        } else         if self.is_epub && self.chapters_cached {
             let dir_buf = self.cache_dir;
             let dir = cache::dir_name_str(&dir_buf);
             let ch_file = cache::chapter_file_name(self.chapter);
@@ -500,7 +498,6 @@ impl ReaderApp {
             let n = svc.read_pulp_sub_chunk(dir, ch_str, self.offsets[self.page], &mut self.buf)?;
             self.buf_len = n;
         } else if self.file_size == 0 {
-            // TXT first load; read_file_start folds size + read into one open
             let (size, n) = svc.read_file_start(name, &mut self.buf)?;
             self.file_size = size;
             self.buf_len = n;
@@ -512,12 +509,10 @@ impl ReaderApp {
                 return Ok(());
             }
         } else {
-            // TXT cache miss (backward nav, etc.)
             let n = svc.read_file_chunk(name, self.offsets[self.page], &mut self.buf)?;
             self.buf_len = n;
         }
 
-        // wrap lines and discover next page offset
         let consumed = self.wrap_lines_counted(self.buf_len);
         let next_offset = self.offsets[self.page] + consumed as u32;
 
@@ -534,7 +529,6 @@ impl ReaderApp {
             }
         }
 
-        // prefetch next page
         if self.page + 1 < self.total_pages {
             let pf_offset = self.offsets[self.page + 1];
             let pf_result = if self.is_epub && self.chapters_cached {
@@ -564,10 +558,7 @@ impl ReaderApp {
         Ok(())
     }
 
-    /// EPUB init phase 1: file size, EOCD, central directory.
-    ///
-    /// Heap allocation (~cd_size) is freed before return.
-    /// Caller transitions to `NeedOpf` on success.
+    // parse ZIP EOCD + central directory; heap freed before return
     fn epub_init_zip<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -575,7 +566,6 @@ impl ReaderApp {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
-        // 1. Get file size and compute cache identifiers
         let epub_size = svc.file_size(name)?;
         if epub_size < 22 {
             return Err("epub: file too small");
@@ -584,7 +574,6 @@ impl ReaderApp {
         self.epub_name_hash = cache::fnv1a(name.as_bytes());
         self.cache_dir = cache::dir_name_for_hash(self.epub_name_hash);
 
-        // 2. Read EOCD from tail of file
         let tail_size = (epub_size as usize).min(EOCD_TAIL);
         let tail_offset = epub_size - tail_size as u32;
         let n = svc.read_file_chunk(name, tail_offset, &mut self.buf[..tail_size])?;
@@ -597,7 +586,6 @@ impl ReaderApp {
             epub_size
         );
 
-        // 3. Read central directory (heap temporary)
         let mut cd_buf = vec![0u8; cd_size as usize];
         read_full(svc, name, cd_offset, &mut cd_buf)?;
         self.zip.clear();
@@ -609,13 +597,7 @@ impl ReaderApp {
         Ok(())
     }
 
-    /// EPUB init phase 2: container.xml → OPF → spine + metadata.
-    ///
-    /// Runs after `epub_init_zip` with the ZIP index populated.
-    /// Two heap allocations (container_data, opf_data) are each
-    /// freed before the next, keeping peak usage lower than the
-    /// original monolithic `epub_init`.
-    /// Caller transitions to `NeedToc` on success.
+    // container.xml → OPF → spine + metadata; each heap alloc freed before next
     fn epub_init_opf<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -623,7 +605,6 @@ impl ReaderApp {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
-        // 4. Read container.xml
         let container_idx = self
             .zip
             .find("META-INF/container.xml")
@@ -639,7 +620,6 @@ impl ReaderApp {
 
         log::info!("epub: OPF at {}", opf_path);
 
-        // 5. Read and parse OPF
         let opf_idx = self
             .zip
             .find(opf_path)
@@ -656,8 +636,7 @@ impl ReaderApp {
             &mut self.spine,
         )?;
 
-        // Discover TOC source while OPF bytes are still available;
-        // actual extraction is deferred to NeedToc to avoid stack overflow.
+        // defer TOC extraction to NeedToc to avoid stack overflow with OPF
         self.toc_source = epub::find_toc_source(&opf_data, opf_dir, &self.zip);
         drop(opf_data);
 
@@ -668,7 +647,6 @@ impl ReaderApp {
             self.spine.len()
         );
 
-        // Set display title from metadata (inline to avoid borrow conflict)
         let tlen = self.meta.title_len as usize;
         if tlen > 0 {
             let n = tlen.min(self.title.len());
@@ -681,12 +659,7 @@ impl ReaderApp {
         Ok(())
     }
 
-    /// Validate existing SD chapter cache.
-    ///
-    /// Returns `Ok(true)` on cache hit (chapters_cached set, ready to
-    /// proceed to NeedIndex).  Returns `Ok(false)` on cache miss
-    /// (subdir created, cache_chapter reset to 0, caller should
-    /// transition to NeedCacheChapter).
+    // Ok(true) = cache hit; Ok(false) = miss, subdir created, cache_chapter=0
     fn epub_check_cache<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -694,7 +667,6 @@ impl ReaderApp {
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
 
-        // Try to load and validate existing cache
         let mut meta_buf = [0u8; cache::META_MAX_SIZE];
         if let Ok(n) = svc.read_pulp_sub_chunk(dir, cache::META_FILE, 0, &mut meta_buf)
             && let Ok(info) = cache::parse_cache_meta(
@@ -711,22 +683,14 @@ impl ReaderApp {
             return Ok(true);
         }
 
-        // Cache miss — prepare for per-chapter streaming
         log::info!("epub: building cache for {} chapters", self.spine.len());
         svc.ensure_pulp_subdir(dir)?;
         self.cache_chapter = 0;
         Ok(false)
     }
 
-    /// Cache a single chapter to SD.
-    ///
-    /// Processes `self.cache_chapter`, increments it, and returns
-    /// `Ok(true)` if more chapters remain or `Ok(false)` when all
-    /// chapters have been cached (META.BIN written).
-    ///
-    /// ~47KB temporary heap per call (DecompressorOxide + window);
-    /// freed on return so the scheduler can run between chapters
-    /// without holding peak memory.
+    // decompress + strip one chapter to SD; ~47KB heap freed on return
+    // Ok(true) = more remain, Ok(false) = all done (META.BIN written)
     fn epub_cache_one_chapter<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -735,7 +699,6 @@ impl ReaderApp {
         let spine_len = self.spine.len();
 
         if ch >= spine_len {
-            // All chapters done — should not happen, but handle gracefully
             return self.epub_finish_cache(svc);
         }
 
@@ -751,12 +714,7 @@ impl ReaderApp {
         let ch_file = cache::chapter_file_name(ch as u16);
         let ch_str = cache::chapter_file_str(&ch_file);
 
-        // Create empty file (truncate if stale)
-        svc.write_pulp_sub(dir, ch_str, &[])?;
-
-        // Stream: decompress → HTML strip → append to cache file.
-        // Temporary heap (~47 KB) is allocated inside stream_strip_entry
-        // and freed when it returns.
+        svc.write_pulp_sub(dir, ch_str, &[])?; // truncate if stale
         let svc_ref = &*svc;
         let text_size = cache::stream_strip_entry(
             &entry,
@@ -771,13 +729,12 @@ impl ReaderApp {
         self.cache_chapter += 1;
 
         if (self.cache_chapter as usize) < spine_len {
-            Ok(true) // more chapters remain
+            Ok(true)
         } else {
             self.epub_finish_cache(svc)
         }
     }
 
-    /// Write META.BIN after all chapters have been cached.
     fn epub_finish_cache<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -797,10 +754,9 @@ impl ReaderApp {
 
         self.chapters_cached = true;
         log::info!("epub: cache complete");
-        Ok(false) // no more chapters
+        Ok(false)
     }
 
-    // reset paging for current chapter from SD cache; no I/O
     fn epub_index_chapter(&mut self) {
         self.reset_paging();
         let ch = self.chapter as usize;
@@ -821,8 +777,6 @@ impl ReaderApp {
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> Result<(), &'static str> {
-        // Scan forward, building the page offset table, until the
-        // entire chapter / file is indexed.
         while !self.fully_indexed && self.total_pages < MAX_PAGES {
             self.page = self.total_pages - 1;
             self.load_and_prefetch(svc)?;
@@ -845,14 +799,12 @@ impl ReaderApp {
         }
 
         if self.page + 1 < self.total_pages {
-            // Normal page turn within the current content
             self.page += 1;
             self.state = State::NeedPage;
             return true;
         }
 
         if self.is_epub && self.fully_indexed {
-            // At the end of a chapter — try next chapter
             if (self.chapter as usize + 1) < self.spine.len() {
                 self.chapter += 1;
                 self.goto_last_page = false;
@@ -876,7 +828,6 @@ impl ReaderApp {
         }
 
         if self.is_epub && self.chapter > 0 {
-            // At the start of a chapter — go to last page of prev chapter
             self.chapter -= 1;
             self.goto_last_page = true;
             self.state = State::NeedIndex;
@@ -1141,7 +1092,6 @@ impl App for ReaderApp {
         self.filename[..len].copy_from_slice(&msg[..len]);
         self.filename_len = len;
 
-        // Default display title = filename (inline to avoid borrow conflict)
         let n = self.filename_len.min(self.title.len());
         self.title[..n].copy_from_slice(&self.filename[..n]);
         self.title_len = n;
@@ -1157,14 +1107,10 @@ impl App for ReaderApp {
 
         self.apply_font_metrics();
 
-        // Load the bookmark first; the actual book init follows in on_work
-        // after we know the saved position.
         self.state = State::NeedBookmark;
 
         log::info!("reader: opening {}", self.name());
 
-        // Full GC refresh for the initial screen transition.
-        // Subsequent page turns in on_work use mark_dirty (DU partial).
         ctx.request_screen_redraw();
     }
 
@@ -1181,20 +1127,14 @@ impl App for ReaderApp {
         }
     }
 
-    fn on_suspend(&mut self) {
-        // Position is saved synchronously by main.rs via save_position()
-        // before this is called, so nothing extra is needed here.
-    }
+    fn on_suspend(&mut self) {}
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
         let font_changed = self.book_font_size_idx != self.applied_font_idx;
         self.apply_font_metrics();
         if font_changed {
             self.reset_paging();
-            // Cache files are font-independent (styled text), but page
-            // offsets depend on line height / advance widths.  For EPUB
-            // rebuild the chapter's page index from the cached text;
-            // for TXT just re-page from the file.
+            // page offsets depend on line height; cache files are font-independent
             if self.is_epub && self.chapters_cached {
                 self.state = State::NeedIndex;
             } else {
@@ -1228,8 +1168,7 @@ impl App for ReaderApp {
                 State::NeedBookmark => {
                     self.bookmark_load(svc.bookmarks());
 
-                    // write recent file for "Continue Reading" on home screen
-                    let _ = svc.write_pulp(RECENT_FILE, &self.filename[..self.filename_len]);
+                                let _ = svc.write_pulp(RECENT_FILE, &self.filename[..self.filename_len]);
 
                     if self.is_epub {
                         self.zip.clear();
@@ -1246,9 +1185,7 @@ impl App for ReaderApp {
 
                 State::NeedInit => match self.epub_init_zip(svc) {
                     Ok(()) => {
-                        self.state = State::NeedOpf;
-                        // Yield to scheduler — CD heap is freed,
-                        // input can be processed before OPF extraction.
+                        self.state = State::NeedOpf; // yield; CD heap freed
                     }
                     Err(e) => {
                         log::info!("reader: epub init (zip) failed: {}", e);
@@ -1260,9 +1197,7 @@ impl App for ReaderApp {
 
                 State::NeedOpf => match self.epub_init_opf(svc) {
                     Ok(()) => {
-                        self.state = State::NeedToc;
-                        // Yield to scheduler — OPF heap is freed
-                        // before TOC extraction allocates.
+                        self.state = State::NeedToc; // yield; OPF heap freed
                     }
                     Err(e) => {
                         log::info!("reader: epub init (opf) failed: {}", e);
@@ -1273,9 +1208,6 @@ impl App for ReaderApp {
                 },
 
                 State::NeedToc => {
-                    // Runs in its own on_work cycle so the epub_init
-                    // stack frames are fully unwound before we allocate
-                    // the decompression buffer for the TOC file.
                     if let Some(source) = self.toc_source.take() {
                         let (nb, nl) = self.name_copy();
                         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
@@ -1316,16 +1248,11 @@ impl App for ReaderApp {
 
                 State::NeedCache => match self.epub_check_cache(svc) {
                     Ok(true) => {
-                        // Cache hit — skip straight to indexing.
                         self.state = State::NeedIndex;
                         continue;
                     }
                     Ok(false) => {
-                        // Cache miss — build one chapter at a time.
-                        self.state = State::NeedCacheChapter;
-                        // Yield to scheduler so input can be polled
-                        // between chapters and a loading indicator
-                        // could be shown in the future.
+                        self.state = State::NeedCacheChapter; // yield between chapters
                     }
                     Err(e) => {
                         log::info!("reader: cache check failed: {}", e);
@@ -1336,12 +1263,8 @@ impl App for ReaderApp {
                 },
 
                 State::NeedCacheChapter => match self.epub_cache_one_chapter(svc) {
-                    Ok(true) => {
-                        // More chapters — stay in NeedCacheChapter
-                        // but yield to scheduler between chapters.
-                    }
+                    Ok(true) => {} // more chapters; yield
                     Ok(false) => {
-                        // All chapters cached — proceed to indexing.
                         self.state = State::NeedIndex;
                         continue;
                     }
@@ -1372,7 +1295,6 @@ impl App for ReaderApp {
                             }
                         }
                     } else {
-                        // NeedPage handles restore_offset if set
                         self.state = State::NeedPage;
                         continue;
                     }
@@ -1380,7 +1302,7 @@ impl App for ReaderApp {
 
                 State::NeedPage => {
                     if let Some(target_off) = self.restore_offset.take() {
-                        // font-independent bookmark restore: scan to byte offset
+                        // bookmark restore: scan to saved byte offset
                         self.page = 0;
                         loop {
                             match self.load_and_prefetch(svc) {
@@ -1573,8 +1495,6 @@ impl App for ReaderApp {
         if id == QA_FONT_SIZE {
             self.book_font_size_idx = value;
             self.apply_font_metrics();
-            // Cache files are styled text — font-independent.  Only the
-            // page offset table needs rebuilding on font change.
             if self.state == State::Ready {
                 if self.is_epub && self.chapters_cached {
                     self.state = State::NeedIndex;
@@ -1717,9 +1637,7 @@ impl App for ReaderApp {
                 let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
                 let x_indent = INDENT_PX as i32 * span.indent as i32;
 
-                // Style-marker-aware rendering: walk bytes, switch
-                // fonts on [MARKER, tag] pairs, draw everything else.
-                let line = &self.buf[start..end];
+            let line = &self.buf[start..end];
                 let mut cx = MARGIN as i32 + x_indent;
                 let mut sty = span.style();
                 let mut j = 0usize;
@@ -1740,7 +1658,7 @@ impl App for ReaderApp {
                         b as char
                     } else {
                         j += 1;
-                        continue; // skip non-printable (stray marker bytes, etc.)
+                        continue; // skip non-printable
                     };
                     cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
                     j += 1;

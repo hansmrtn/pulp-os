@@ -48,11 +48,7 @@ static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 // power button static: ISR clears interrupt, InputDriver reads level
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// GPIO ISR: power button (GPIO3) only.
-//
-// Display BUSY (GPIO6) is handled by esp-hal's async Wait
-// implementation, which registers its own interrupt handler
-// internally when `Input::wait_for_low().await` is polled.
+// GPIO ISR: power button (GPIO3) only; BUSY (GPIO6) handled by esp-hal async Wait
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
@@ -155,9 +151,7 @@ impl Board {
         let dc = Output::new(p.GPIO4, Level::High, OutputConfig::default());
         let rst = Output::new(p.GPIO5, Level::High, OutputConfig::default());
 
-        // BUSY pin — do NOT arm an interrupt here. esp-hal's async
-        // `Input::wait_for_low()` manages the GPIO6 interrupt
-        // internally when polled through `block_on`.
+        // do not arm an interrupt; esp-hal async Wait manages GPIO6 internally
         let busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
         info!("display BUSY: GPIO6 (async wait, no pre-armed interrupt)");
 
@@ -176,19 +170,11 @@ impl Board {
         // before DMA conversion since it's a one-shot init sequence.
         let _ = spi_raw.write(&[0xFF; 10]);
 
-        // Allocate DMA descriptors and buffers (4096 bytes each
-        // direction).  Strip data is max 4000 bytes per SPI write;
-        // SD sectors are 512 bytes.  The macro creates static arrays
-        // so they live for 'static and satisfy DMA alignment.
+        // 4096B each direction; strip max ~4000B, SD sectors 512B
         let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(4096);
         let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
         let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
 
-        // Convert to DMA-backed SPI bus.  The GDMA controller
-        // autonomously pushes/pulls memory buffers over SPI, freeing
-        // the CPU from babysitting the 64-byte SPI FIFO on every
-        // transfer.  SpiDmaBus implements SpiBus so RefCellDevice
-        // and everything above is unchanged.
         let spi_dma_bus = spi_raw
             .with_dma(p.DMA_CH0)
             .with_buffers(dma_rx_buf, dma_tx_buf);
@@ -196,7 +182,6 @@ impl Board {
         let spi_ref: &'static RefCell<SpiBus> = SPI_BUS.init(RefCell::new(spi_dma_bus));
         info!("SPI bus: DMA enabled (CH0, 4096B TX+RX)");
 
-        // SD card init happens at 400kHz through the DMA bus
         let sd_spi = RefCellDevice::new(spi_ref, sd_cs, Delay::new()).unwrap();
         let sd = SdStorage::new(sd_spi);
 

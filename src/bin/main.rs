@@ -1,21 +1,8 @@
 // pulp-os entry point and main loop
 //
-// Boot sequence: timer -> hardware -> UI -> enter Home app
-// Main loop: drain scheduler -> WFI -> translate wake flags -> repeat
-//
-// Apps are stack allocated and dispatched via with_app! macro (no dyn).
-// Timer scales from 10ms (active) to 100ms (idle) to save power;
-// any button activity snaps it back immediately.
-//
-// Input events are translated through ButtonMapper into semantic
-// ActionEvents before reaching apps.  The Power button opens a
-// quick-action overlay that floats over the bottom of the screen;
-// while the overlay is open all input is routed to it.
-//
-// Display refresh uses async busy-wait via `block_on`: the CPU
-// sleeps (WFI) during the 200ms–1.6s e-paper update instead of
-// spin-polling. The scheduler and wake-flag architecture are
-// preserved; only the display wait path is async.
+// Boot: timer → hardware → UI → Home. Main loop: drain scheduler → WFI → repeat.
+// Apps stack-allocated, dispatched via with_app! (no dyn). Timer scales 10ms→100ms
+// on idle. Display refresh async via block_on; CPU sleeps (WFI) during e-paper wait.
 
 #![no_std]
 #![no_main]
@@ -62,15 +49,9 @@ const ACTIVE_TIMER_MS: u64 = 10;
 const IDLE_TIMER_MS: u64 = 100;
 const IDLE_THRESHOLD_POLLS: u32 = 50; // 50 * 10ms = 500ms before idle
 
-// fallback ghost-clear interval used before settings are loaded from SD
-const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
-
-// only probe SD card health every N status-bar updates (~30s at 5s interval)
-const SD_CHECK_EVERY: u32 = 6;
-
-// only read battery ADC every N status-bar updates (~30s at 5s interval)
-// to avoid blocking ADC conversions on every 5s tick
-const BATTERY_READ_EVERY: u32 = 6;
+const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10; // fallback before settings load
+const SD_CHECK_EVERY: u32 = 6;             // ~30s at 5s status interval
+const BATTERY_READ_EVERY: u32 = 6;         // ~30s; avoids ADC on every 5s tick
 
 static TIMER0: Mutex<RefCell<Option<PeriodicTimer<'static, esp_hal::Blocking>>>> =
     Mutex::new(RefCell::new(None));
@@ -180,13 +161,9 @@ fn main() -> ! {
     let mut render_state: Option<RenderState> = None;
     let mut render_bar_overlaps: bool = false;
 
-    // Load bookmarks from SD into the RAM cache before anything else
-    // touches them. ensure_loaded takes &SdStorage directly.
     bm_cache.ensure_loaded(&board.storage.sd);
 
-    // Load saved settings and recent book before the first render so
-    // font sizes, preferences, and "Continue" button are ready from
-    // frame zero.
+    // load settings + recent book before first render
     {
         let mut svc = Services::new(&mut dir_cache, &mut bm_cache, &board.storage.sd);
         settings.load_eager(&mut svc);
@@ -212,9 +189,7 @@ fn main() -> ! {
             let _ = input.poll();
         },
     ));
-    // Boot render_full was done outside the scheduler; drain any
-    // stale redraw that on_enter left behind so the first user
-    // interaction doesn't trigger a redundant screen repaint.
+    // drain stale redraw left by on_enter before entering the loop
     let _ = launcher.ctx.take_redraw();
     info!("ui ready.");
     info!("kernel ready.");
@@ -248,7 +223,6 @@ fn main() -> ! {
                     }
                     idle_polls = 0;
 
-                    // Track press/release on the raw event (physical button, not mapped action).
                     match hw_event {
                         pulp_os::drivers::input::Event::Press(btn) => {
                             if let Some(r) = bumps.on_press(btn) {
@@ -263,13 +237,9 @@ fn main() -> ! {
                         _ => {}
                     }
 
-                    // Translate physical button event to semantic action
                     let event = mapper.map_event(hw_event);
 
                     // ── Quick menu intercept ────────────────────────
-                    //
-                    // While the overlay is visible every press/repeat
-                    // is routed to the quick menu instead of the app.
                     if quick_menu.open {
                         if let ActionEvent::Press(action) | ActionEvent::Repeat(action) = event {
                             let result = quick_menu.on_action(action);
@@ -291,8 +261,6 @@ fn main() -> ! {
                                         &mut settings,
                                         &mut launcher.ctx,
                                     );
-                                    // Redraw the area the overlay covered
-                                    // to restore the app content beneath
                                     launcher.ctx.mark_dirty(region);
                                 }
                                 QuickMenuResult::RefreshScreen => {
@@ -305,7 +273,6 @@ fn main() -> ! {
                                         &mut settings,
                                         &mut launcher.ctx,
                                     );
-                                    // Force a full GC refresh on next render
                                     launcher.ctx.request_full_redraw();
                                 }
                                 QuickMenuResult::GoHome => {
@@ -318,15 +285,13 @@ fn main() -> ! {
                                         &mut settings,
                                         &mut launcher.ctx,
                                     );
-                                    // Navigate home
-                                    let transition = Transition::Home;
-                                    if let Some(nav) = launcher.apply(transition) {
-                                        info!(
-                                            "app: {:?} -> {:?} (quick menu GoHome)",
-                                            nav.from, nav.to
-                                        );
-                                        // Save reader position before exit
-                                        if nav.from == AppId::Reader {
+                                        let transition = Transition::Home;
+                                        if let Some(nav) = launcher.apply(transition) {
+                                            info!(
+                                                "app: {:?} -> {:?} (quick menu GoHome)",
+                                                nav.from, nav.to
+                                            );
+                                            if nav.from == AppId::Reader {
                                             reader.save_position(&mut bm_cache);
                                         }
                                         with_app!(nav.from, home, files, reader, settings, |app| {
@@ -382,9 +347,7 @@ fn main() -> ! {
                             }
                         }
 
-                        // Whether consumed, closed, or triggered —
-                        // check if we need a render
-                        if launcher.ctx.has_redraw() {
+                    if launcher.ctx.has_redraw() {
                             let _ = sched.push_unique(Job::Render);
                         }
                         continue;
@@ -412,13 +375,11 @@ fn main() -> ! {
                     if let Some(nav) = launcher.apply(transition) {
                         info!("app: {:?} -> {:?}", nav.from, nav.to);
 
-                        // Save reader position before suspending or exiting so
-                        // we can restore it on the next open.
-                        if nav.from == AppId::Reader {
-                            reader.save_position(&mut bm_cache);
-                        }
+                    if nav.from == AppId::Reader {
+                        reader.save_position(&mut bm_cache);
+                    }
 
-                        if nav.suspend {
+                    if nav.suspend {
                             with_app!(nav.from, home, files, reader, settings, |app| {
                                 app.on_suspend();
                             });
@@ -428,11 +389,7 @@ fn main() -> ! {
                             });
                         }
 
-                        // Propagate persisted preferences into apps that need
-                        // them before their lifecycle callbacks fire.  This
-                        // block runs for both fresh enter and resume so that
-                        // a setting changed while an app was suspended in the
-                        // stack takes effect immediately on return.
+                        // propagate persisted prefs before lifecycle callbacks
                         {
                             let ui_idx = settings.system_settings().ui_font_size_idx;
                             let book_idx = settings.system_settings().book_font_size_idx;
@@ -456,8 +413,7 @@ fn main() -> ! {
                         }
                     }
 
-                    // if app has pending async work, let AppWork own the render
-                    // decision (else if); avoids double refresh on e-paper
+                    // let AppWork own render decision to avoid double refresh
                     let active = launcher.active();
                     let needs = with_app!(active, home, files, reader, settings, |app| {
                         app.needs_work()
@@ -470,16 +426,13 @@ fn main() -> ! {
                 }
 
                 Job::Render => {
-                    // Guard: don't start a new render while a split-phase
-                    // partial refresh is in progress. The pending redraw
-                    // will be picked up after RenderPhase3 completes.
+                    // don't start a new render while split-phase partial is in progress
                     if render_state.is_some() {
                         continue;
                     }
                     let active = launcher.active();
                     match launcher.ctx.take_redraw() {
                         Redraw::Full => {
-                            // Explicit full refresh request — always honour it.
                             update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                             with_app!(active, home, files, reader, settings, |app| {
                                 block_on(board.display.epd.render_full_async_progressive(
@@ -507,8 +460,7 @@ fn main() -> ! {
                                 DEFAULT_GHOST_CLEAR_EVERY
                             };
                             if partial_refreshes >= ghost_clear_every {
-                                // Promote to a full hardware refresh to
-                                // clear accumulated ghosting artifacts.
+                                // promote to full GC to clear ghosting
                                 update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                                 with_app!(active, home, files, reader, settings, |app| {
                                     block_on(board.display.epd.render_full_async_progressive(
@@ -530,11 +482,7 @@ fn main() -> ! {
                                 partial_refreshes = 0;
                                 info!("display: promoted partial to full (ghosting clear)");
                             } else {
-                                // Split-phase partial refresh: write BW
-                                // RAM, kick DU waveform, then yield to
-                                // the scheduler during the 400-600ms
-                                // display update so input stays responsive
-                                // and background work can run.
+                                // split-phase partial: write BW, kick DU, yield to scheduler
                                 let r = r.align8();
                                 render_bar_overlaps = r.y < BAR_HEIGHT;
                                 idle_polls = 0; // keep active timer during refresh
@@ -561,16 +509,11 @@ fn main() -> ! {
                                 });
 
                                 if let Some(rs) = rs {
-                                    // Kick DU waveform — returns immediately
                                     board.display.epd.partial_start_du(&rs);
                                     render_state = Some(rs);
                                     partial_refreshes += 1;
-                                    // Yield to scheduler; RenderPhase2 is
-                                    // Normal priority so PollInput (High)
-                                    // runs first on each wake.
                                     let _ = sched.push_unique(Job::RenderPhase2);
                                 } else if board.display.epd.needs_initial_refresh() {
-                                    // First refresh must be full GC
                                     update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                                     with_app!(active, home, files, reader, settings, |app| {
                                         block_on(board.display.epd.render_full_async_progressive(
@@ -599,25 +542,15 @@ fn main() -> ! {
                 }
 
                 Job::RenderPhase2 => {
-                    // Poll display BUSY during the 400-600ms DU waveform.
-                    // This job is Normal priority, so any PollInput (High)
-                    // that arrives from a button press runs first — making
-                    // the UI responsive during the e-paper refresh.
+                    // Normal priority; PollInput (High) runs first on each wake
                     if board.display.epd.is_busy() {
                         let _ = sched.push_unique(Job::RenderPhase2);
-                        // Break out of the job-drain loop so the outer
-                        // loop can WFI until the next interrupt (timer
-                        // tick or button press) instead of spin-polling.
-                        break;
+                        break; // WFI until next interrupt instead of spin-polling
                     }
-                    // DU refresh complete — proceed to sync phase
                     let _ = sched.push_unique(Job::RenderPhase3);
                 }
 
                 Job::RenderPhase3 => {
-                    // Phase 3: write identical content to both RED and BW
-                    // RAM planes (sync) so the next partial refresh has a
-                    // clean differential baseline, then power off.
                     if let Some(rs) = render_state.take() {
                         let active = launcher.active();
                         with_app!(active, home, files, reader, settings, |app| {
@@ -636,13 +569,8 @@ fn main() -> ! {
                                 },
                             );
                         });
-                        // Blocking power-off (~200ms). Acceptable: short
-                        // duration and CPU sleeps via WFI inside wait_busy.
-                        board.display.epd.power_off();
+                        board.display.epd.power_off(); // ~200ms, WFI inside wait_busy
                     }
-                    // A new redraw may have arrived during the DU wait
-                    // (user pressed a button, app updated state). Pick
-                    // it up now that the display is free.
                     if launcher.ctx.has_redraw() {
                         let _ = sched.push_unique(Job::Render);
                     }
@@ -660,7 +588,6 @@ fn main() -> ! {
                 }
 
                 Job::UpdateStatusBar => {
-                    // probe SD health infrequently to avoid repeated I/O
                     sd_check_counter += 1;
                     if sd_check_counter >= SD_CHECK_EVERY {
                         sd_check_counter = 0;
@@ -671,14 +598,11 @@ fn main() -> ! {
                             .open_volume(embedded_sdmmc::VolumeIdx(0))
                             .is_ok();
                     }
-                    // read battery ADC infrequently (~30s) to avoid
-                    // blocking ADC conversions on every 5s tick
                     battery_read_counter += 1;
                     if battery_read_counter >= BATTERY_READ_EVERY {
                         battery_read_counter = 0;
                         cached_battery_mv = battery::adc_to_battery_mv(input.read_battery_mv());
                     }
-                    // Flush dirty bookmarks to SD periodically (~5s).
                     if bm_cache.is_dirty() {
                         bm_cache.flush(&board.storage.sd);
                     }
@@ -687,7 +611,6 @@ fn main() -> ! {
             }
         }
 
-        // wait for wake event then translate flags into jobs
         let wake = match try_wake() {
             Some(w) => w,
             None => {
@@ -713,8 +636,6 @@ fn main() -> ! {
             }
         }
 
-        // Display BUSY is now handled by async GPIO wait inside
-        // block_on(render_*_async()), so no wake.display handling needed.
     }
 }
 
@@ -737,7 +658,7 @@ fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
     });
 }
 
-// sync cycle changes back to the active app; persist settings-owned values
+// sync quick menu cycle changes to active app; persist settings-owned values
 fn sync_quick_menu(
     qm: &QuickMenu,
     active: AppId,
@@ -758,7 +679,6 @@ fn sync_quick_menu(
         }
     }
 
-    // persist font size to SystemSettings so it survives across sessions
     if active == AppId::Reader
         && let Some(font_idx) = qm.app_cycle_value(1)
     {

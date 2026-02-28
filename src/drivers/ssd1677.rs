@@ -54,11 +54,7 @@ mod cmd {
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
 }
 
-/// Parameters saved between split-phase partial refresh steps.
-///
-/// Produced by [`DisplayDriver::partial_phase1_bw`], consumed by
-/// [`DisplayDriver::partial_phase3_sync`].  Stored alongside the
-/// display driver in the main loop — the scheduler carries no data.
+/// Region parameters threaded between split-phase partial refresh steps.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderState {
     pub px: u16,
@@ -143,18 +139,7 @@ where
         self.initial_refresh = false;
     }
 
-    /// Full refresh with input polling between strips.
-    ///
-    /// Identical to [`render_full`](Self::render_full) except that
-    /// `poll_input` is called after each strip is sent over SPI.
-    /// The 24-strip write sequence (12 strips × 2 RAM planes) takes
-    /// several milliseconds; polling between strips ensures button
-    /// presses during a GC refresh are captured and queued rather
-    /// than silently lost.
-    ///
-    /// `poll_input` should be cheap — just sample the hardware and
-    /// stash the event for later processing.  It must not trigger
-    /// rendering or access the SPI bus.
+    // full refresh with input polling between strips; captures buttons during GC wait
     pub fn render_full_progressive<F, P>(
         &mut self,
         strip: &mut StripBuffer,
@@ -305,12 +290,7 @@ where
         }
     }
 
-    /// Sync both RAM planes (RED + BW) rendering each strip chunk
-    /// only once. For each chunk the draw closure runs once; the
-    /// rendered data is sent to RED then BW via per-chunk RAM area
-    /// commands. This is 1× draw calls instead of 2× for the
-    /// step-3 sync in partial refresh (and 2N total instead of 3N
-    /// across the whole partial refresh sequence).
+    // sync RED+BW planes with 1× draw per chunk instead of 2× (2N total vs 3N)
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips_dual<F>(
         &mut self,
@@ -342,16 +322,10 @@ where
                 }
             }
 
-            // Save rendered strip so we can send it to both planes.
-            // strip.data() lives in RAM and persists after send_data,
-            // but set_partial_ram_area calls send_command/send_data
-            // internally which is fine — the strip buffer is separate.
             let data_len = strip.data().len();
             let mut replay = [0xFFu8; STRIP_BUF_SIZE];
             replay[..data_len].copy_from_slice(strip.data());
 
-            // Write to both RED and BW planes from the same rendered data.
-            // Per-chunk RAM area avoids needing a full-region streaming pass.
             for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
                 self.set_partial_ram_area(px, y, pw, rows);
                 self.send_command(ram_cmd);
@@ -495,26 +469,12 @@ where
     }
 
     // ── Split-phase partial refresh ─────────────────────────
-    //
-    // These methods decompose `render_partial` into discrete steps
-    // so the scheduler can run other jobs (input polling, prefetch)
-    // during the 400-600ms DU waveform and 200ms power-off waits.
-    //
-    //   phase1_bw     — render + send BW RAM, return RenderState
-    //   start_du      — kick DU waveform (non-blocking)
-    //   is_busy       — poll BUSY pin (non-blocking)
-    //   phase3_sync   — render + send RED & BW sync
-    //   start_power_off / finish_power_off — non-blocking power-off
-    //
-    // The caller is responsible for waiting (via scheduler loop or
-    // WFI) between start_du and phase3_sync, and between
-    // start_power_off and finish_power_off.
+    // Decomposes render_partial so the scheduler can run between the
+    // 400-600ms DU waveform and 200ms power-off: phase1_bw → start_du
+    // → (scheduler) → phase3_sync → power_off.
 
-    /// Phase 1: compute region, write new content to BW RAM,
-    /// return the region parameters needed for later phases.
-    ///
-    /// Returns `None` if the region is degenerate (zero-size) or if
-    /// `initial_refresh` is set (caller should use `render_full`).
+    /// Write new content to BW RAM; returns `None` on degenerate region
+    /// or if `initial_refresh` is set (use `render_full` instead).
     #[allow(clippy::too_many_arguments)]
     pub fn partial_phase1_bw<F>(
         &mut self,
@@ -575,13 +535,10 @@ where
         })
     }
 
-    /// Phase 2a: kick the DU partial waveform.  Returns immediately;
-    /// poll [`is_busy`](Self::is_busy) (or yield to the scheduler)
-    /// until the display controller finishes.
+    /// Kick DU waveform (non-blocking); poll `is_busy` until done.
     pub fn partial_start_du(&mut self, rs: &RenderState) {
         self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
 
-        // Same commands as update_partial(), minus wait_busy().
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
@@ -592,16 +549,13 @@ where
         self.power_is_on = true;
     }
 
-    /// Non-blocking busy check.  Returns `true` while the display
-    /// controller is still processing (BUSY pin high).
+    /// Returns `true` while the display controller is busy (BUSY pin high).
     #[inline]
     pub fn is_busy(&mut self) -> bool {
         self.busy.is_high().unwrap_or(false)
     }
 
-    /// Phase 3: sync both RAM planes (RED + BW) after the DU refresh
-    /// completes.  Must only be called once [`is_busy`](Self::is_busy)
-    /// returns `false`.
+    /// Sync both RAM planes after DU completes. Call once `is_busy` is false.
     pub fn partial_phase3_sync<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
     where
         F: Fn(&mut StripBuffer),
@@ -618,9 +572,7 @@ where
         );
     }
 
-    /// Kick the power-off sequence (non-blocking).  Poll
-    /// [`is_busy`](Self::is_busy) for completion, then call
-    /// [`finish_power_off`](Self::finish_power_off).
+    /// Kick power-off (non-blocking); poll `is_busy`, then call `finish_power_off`.
     pub fn start_power_off(&mut self) {
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
@@ -629,28 +581,19 @@ where
         }
     }
 
-    /// Mark the power-off sequence as complete.  Call after
-    /// `start_power_off()` once `is_busy()` returns `false`.
+    /// Complete power-off after `is_busy` returns false.
     pub fn finish_power_off(&mut self) {
         self.power_is_on = false;
     }
 
-    /// Returns `true` if the display still needs its first full
-    /// refresh before partial updates are allowed.
+    /// True until the first full refresh has been performed.
     pub fn needs_initial_refresh(&self) -> bool {
         self.initial_refresh
     }
 }
 
 // ── Async (non-blocking) API ────────────────────────────────────────────
-//
-// These methods replace the busy-wait spin loop with an async `.await`
-// on the BUSY pin, allowing the CPU to sleep (WFI) between polls via
-// the executor. SPI writes remain synchronous — they complete in
-// microseconds. Only the long display-update waits (200ms–1.6s) are
-// made async.
-//
-// Requires `embedded-hal-async` in your Cargo.toml.
+// BUSY-wait replaced with async .await; SPI writes remain synchronous.
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
 where
@@ -659,26 +602,16 @@ where
     RST: OutputPin,
     BUSY: InputPin + embedded_hal_async::digital::Wait,
 {
-    /// Expose the busy pin for external async waiting.
-    ///
-    /// Useful when you need to await the display outside of the
-    /// provided render methods (e.g. overlapping with other work).
+    /// Expose busy pin for external async waiting.
     pub fn busy_pin(&mut self) -> &mut BUSY {
         &mut self.busy
     }
 
-    /// Async busy wait — sleeps the CPU via the executor instead of
-    /// spin-polling. Returns when BUSY goes low (display ready).
     async fn wait_busy_async(&mut self) {
-        // SSD1677 BUSY is active-high; display ready when low.
-        // `wait_for_low` returns immediately if already low.
         let _ = self.busy.wait_for_low().await;
     }
 
-    /// Full refresh with async busy-wait.
-    ///
-    /// Identical to `render_full` except the 1.6s display-update wait
-    /// yields to the executor instead of spin-looping.
+    /// Full refresh; async wait yields CPU during 1.6s update.
     pub async fn render_full_async<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -709,19 +642,7 @@ where
         self.initial_refresh = false;
     }
 
-    /// Full refresh with async busy-wait and input polling between
-    /// strips.
-    ///
-    /// Identical to [`render_full_async`](Self::render_full_async)
-    /// except `poll_input` is called after each strip is sent over
-    /// SPI.  The 24-strip write sequence (12 strips × 2 RAM planes)
-    /// takes several milliseconds; polling between strips ensures
-    /// button presses during a GC refresh are captured and queued
-    /// rather than silently lost.
-    ///
-    /// `poll_input` should be cheap — just sample the hardware and
-    /// stash the event.  It must not trigger rendering or access the
-    /// SPI bus.
+    // full refresh (async) with input polling between strips
     pub async fn render_full_async_progressive<F, P>(
         &mut self,
         strip: &mut StripBuffer,
@@ -755,10 +676,7 @@ where
         self.initial_refresh = false;
     }
 
-    /// Partial refresh with async busy-wait.
-    ///
-    /// Identical to `render_partial` except both the DU-update wait
-    /// (~600ms) and the power-off wait (~200ms) yield to the executor.
+    /// Partial refresh; async waits yield CPU during DU (~600ms) and power-off (~200ms).
     #[allow(clippy::too_many_arguments)]
     pub async fn render_partial_async<F>(
         &mut self,
@@ -810,19 +728,17 @@ where
             right_mask,
         );
 
-        // step 2: DU partial update (async wait ~600ms)
+        // step 2: DU partial update
         self.set_partial_ram_area(px, py, pw, ph);
         self.update_partial_async().await;
 
-        // step 3: sync both planes (RED then BW)
-        // Render each strip chunk once and write to both planes,
-        // instead of rendering all chunks twice (once per plane).
+        // step 3: sync both planes
         self.write_region_strips_dual(strip, px, py, pw, ph, &draw, left_mask, right_mask);
 
         self.power_off_async().await;
     }
 
-    /// Async power-off — yields during the ~200ms power-down sequence.
+    /// Async power-off (~200ms).
     pub async fn power_off_async(&mut self) {
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
