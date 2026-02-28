@@ -27,6 +27,7 @@ use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::system::software_reset;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
@@ -349,6 +350,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         home.load_recent(&mut svc);
     }
 
+    // Tell the idle-timeout task the configured sleep duration.
+    // Must happen after settings are loaded so we use the persisted
+    // value (or the default 10 min).
+    tasks::set_idle_timeout(settings.system_settings().sleep_timeout);
+
     // ── Initial render (before tasks are spawned) ───────────────────────
 
     let cached_battery_mv_init = battery::adc_to_battery_mv(input.read_battery_mv());
@@ -356,23 +362,17 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     home.on_enter(&mut launcher.ctx);
 
-    // Write strips (polls input between strips), then kick GC.
-    board.display.epd.write_full_frame_progressive(
-        strip,
-        &mut delay,
-        &|s: &mut StripBuffer| {
+    // Single async call: write both RAM planes, kick the GC waveform,
+    // and yield the CPU for the entire ~1.6 s update.  No input
+    // processing needed during boot.
+    board
+        .display
+        .epd
+        .full_refresh_async(strip, &mut delay, &|s: &mut StripBuffer| {
             statusbar.draw(s).unwrap();
             home.draw(s);
-        },
-        || {
-            let _ = input.poll();
-        },
-    );
-    board.display.epd.start_full_update();
-
-    // CPU sleeps (WFI) during the ~1.6 s GC waveform.
-    board.display.epd.busy_pin().wait_for_low().await;
-    board.display.epd.finish_full_update();
+        })
+        .await;
 
     // Drain stale redraw left by on_enter
     let _ = launcher.ctx.take_redraw();
@@ -386,7 +386,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     spawner.spawn(tasks::input_task(input)).unwrap();
     spawner.spawn(tasks::housekeeping_task()).unwrap();
-    info!("tasks spawned (input_task, housekeeping_task).");
+    spawner.spawn(tasks::idle_timeout_task()).unwrap();
+    info!("tasks spawned (input_task, housekeeping_task, idle_timeout_task).");
     info!("kernel ready.");
 
     // ═════════════════════════════════════════════════════════════════════
@@ -587,6 +588,61 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         // Status bar refresh (every ~5 s)
         if tasks::STATUS_DUE.try_take().is_some() {
             update_statusbar(statusbar, cached_battery_mv, sd_ok);
+
+            // Re-sync the idle-sleep timeout from settings every cycle.
+            // Cheap (u16 compare + signal) and covers the case where the
+            // user just changed the "Sleep After" value in Settings.
+            if settings.is_loaded() {
+                tasks::set_idle_timeout(settings.system_settings().sleep_timeout);
+            }
+        }
+
+        // ── 4b. Idle-sleep check ────────────────────────────────────────
+        //
+        // The idle_timeout_task fires IDLE_SLEEP_DUE when the configured
+        // sleep timeout expires without any button press.  We flush
+        // state, put the e-paper into deep sleep, and halt the MCU.
+        // On wake (power button) the MCU resets and boots from scratch.
+
+        if tasks::IDLE_SLEEP_DUE.try_take().is_some() {
+            info!("idle timeout: entering sleep...");
+
+            // Flush any dirty bookmarks so reading position is preserved.
+            if bm_cache.is_dirty() {
+                bm_cache.flush(&board.storage.sd);
+            }
+
+            // Put the SSD1677 into deep-sleep mode 1 (~3 µA, image
+            // retained).  Requires a hardware reset to wake.
+            board.display.epd.enter_deep_sleep();
+            info!("display: deep sleep mode 1");
+
+            // Enter a tight WFI loop.  With the Embassy executor no
+            // longer scheduling tasks, current draw drops to ~1-2 mA
+            // (vs ~20 mA active).  The power button GPIO3 falling-edge
+            // interrupt wakes the core from WFI; we then trigger a
+            // software reset for a clean boot.
+            //
+            // NOTE: True ESP32-C3 deep sleep (~5 µA) with RTC GPIO3
+            // wake source would be even better but requires additional
+            // esp-hal sleep configuration.  WFI is sufficient for an
+            // e-reader that charges via USB.
+            info!("mcu: halting (power button to wake)");
+            loop {
+                #[cfg(target_arch = "riscv32")]
+                unsafe {
+                    core::arch::asm!("wfi", options(nomem, nostack));
+                }
+
+                // GPIO3 falling-edge interrupt woke us from WFI.
+                // If the power button is pressed, trigger a full
+                // software reset so all peripherals re-initialize.
+                if pulp_os::board::power_button_is_low() {
+                    info!("power button: resetting...");
+                    software_reset();
+                    // software_reset() is -> !; unreachable.
+                }
+            }
         }
 
         // ── 5. Render ───────────────────────────────────────────────────
@@ -716,7 +772,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
                 let active = launcher.active();
                 with_app!(active, home, files, reader, settings, |app| {
-                    board.display.epd.write_full_frame_progressive(
+                    board.display.epd.write_full_frame(
                         strip,
                         &mut delay,
                         &|s: &mut StripBuffer| {
@@ -727,9 +783,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             }
                             bumps.draw(s);
                         },
-                        // Input polling is handled by input_task; events
-                        // buffer in INPUT_EVENTS while strips are written.
-                        || {},
                     );
                 });
 

@@ -632,6 +632,37 @@ where
         }
     }
 
+    /// Write the full frame to both RED and BW RAM planes.
+    ///
+    /// No inter-strip callback — input polling is handled by the
+    /// dedicated `input_task`.  Replaces `write_full_frame_progressive`
+    /// with an empty `|| {}` closure.
+    ///
+    /// Does **not** kick the GC waveform — call [`start_full_update`]
+    /// afterwards.
+    pub fn write_full_frame<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: &F)
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        delay.delay_millis(1);
+
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
+
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+            }
+        }
+    }
+
     /// Kick the GC (full) waveform.  Non-blocking — BUSY goes high
     /// immediately and stays high for ~1.6 s.  Poll [`is_busy`] or
     /// await the BUSY pin, then call [`finish_full_update`].
@@ -652,6 +683,32 @@ where
     pub fn finish_full_update(&mut self) {
         self.power_is_on = false;
         self.initial_refresh = false;
+    }
+
+    /// Enter SSD1677 deep-sleep mode 1.
+    ///
+    /// The display retains its last image but the controller draws
+    /// near-zero current (~3 µA).  A hardware reset (`rst` low pulse)
+    /// is required to wake — call [`reset`] + [`init`] to resume.
+    ///
+    /// Intended for the idle-sleep timeout: after flushing bookmarks
+    /// and updating the status bar the main loop can call this, then
+    /// put the ESP32-C3 into deep sleep with a GPIO3 (power button)
+    /// wake source.
+    pub fn enter_deep_sleep(&mut self) {
+        // Ensure the controller is powered off before sleeping.
+        if self.power_is_on {
+            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+            self.send_data(&[0x83]);
+            self.send_command(cmd::MASTER_ACTIVATION);
+            self.wait_busy(POWER_OFF_TIME_MS);
+            self.power_is_on = false;
+        }
+
+        // Deep Sleep Mode 1: RAM content retained, <3 µA.
+        self.send_command(cmd::DEEP_SLEEP);
+        self.send_data(&[0x01]);
+        self.init_done = false;
     }
 }
 
@@ -735,6 +792,59 @@ where
             }
         }
 
+        self.update_full_async().await;
+        self.initial_refresh = false;
+    }
+
+    /// Write the full frame to both RAM planes (no inter-strip callback).
+    ///
+    /// Async counterpart of [`write_full_frame`].  Uses blocking SPI
+    /// writes (DMA handles the heavy lifting) but lives in the async
+    /// impl block so callers don't need to juggle trait bounds.
+    pub async fn write_full_frame_async<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        delay.delay_millis(1);
+
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
+
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+            }
+        }
+    }
+
+    /// Full GC refresh in one await — write both RAM planes, kick the
+    /// waveform, and yield the CPU for the entire ~1.6 s update.
+    ///
+    /// Ideal for the boot splash or any context where no input
+    /// processing is needed during the waveform.  For the normal
+    /// event loop, use the split-phase
+    /// [`write_full_frame`] + [`start_full_update`] +
+    /// busy-wait-with-input pattern instead.
+    pub async fn full_refresh_async<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        self.write_full_frame_async(strip, delay, draw).await;
         self.update_full_async().await;
         self.initial_refresh = false;
     }
