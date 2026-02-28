@@ -13,8 +13,6 @@ use embassy_time::{Duration, Ticker, Timer};
 use crate::drivers::battery;
 use crate::drivers::input::{Event, InputDriver};
 
-// ── Input task ────────────────────────────────────────────────────────
-
 // debounced events from input_task to main loop
 pub const INPUT_CHANNEL_CAP: usize = 8;
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, Event, INPUT_CHANNEL_CAP> =
@@ -53,11 +51,6 @@ pub async fn input_task(mut input: InputDriver) -> ! {
     }
 }
 
-// ── Housekeeping task ─────────────────────────────────────────────────
-//
-// Timer-only; all actual SD / bookmark I/O stays in the main loop
-// which owns those resources.
-
 pub static STATUS_DUE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static SD_CHECK_DUE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static BOOKMARK_FLUSH_DUE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -84,12 +77,6 @@ pub async fn housekeeping_task() -> ! {
         }
     }
 }
-
-// ── Idle-sleep timeout task ───────────────────────────────────────────
-//
-// IDLE_TIMEOUT_MINS ← main loop sets timeout (0 = disabled)
-// IDLE_RESET        ← input_task bumps on every button event
-// IDLE_SLEEP_DUE    → main loop: flush, sleep screen, deep sleep
 
 // set by main loop after loading settings; re-signal on change; 0 = never
 pub static IDLE_TIMEOUT_MINS: Signal<CriticalSectionRawMutex, u16> = Signal::new();

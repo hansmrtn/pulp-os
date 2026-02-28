@@ -376,6 +376,50 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 _ => {}
             }
 
+            // ── Power long-press → deep sleep ────────────────────────────
+            // Intercept before mapping so no app ever sees this event.
+            if hw_event
+                == pulp_os::drivers::input::Event::LongPress(pulp_os::board::button::Button::Power)
+            {
+                info!("power held: entering sleep...");
+
+                // flush dirty bookmarks before sleep
+                if bm_cache.is_dirty() {
+                    bm_cache.flush(&board.storage.sd);
+                }
+
+                // render sleep screen (~1.6s GC waveform)
+                board
+                    .display
+                    .epd
+                    .full_refresh_async(strip, &mut delay, &|s: &mut StripBuffer| {
+                        use embedded_graphics::mono_font::MonoTextStyle;
+                        use embedded_graphics::mono_font::ascii::FONT_6X13;
+                        use embedded_graphics::pixelcolor::BinaryColor;
+                        use embedded_graphics::prelude::*;
+                        use embedded_graphics::text::Text;
+
+                        let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
+                        let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
+                    })
+                    .await;
+                info!("display: sleep screen rendered");
+
+                // SSD1677 deep-sleep mode 1 (~3µA, image retained; hw reset to wake)
+                board.display.epd.enter_deep_sleep();
+                info!("display: deep sleep mode 1");
+
+                // ESP32-C3 deep sleep (~5µA); GPIO3 as RTC wake; MCU resets on wake
+                let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
+                let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
+                let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
+                    &mut [(&mut gpio3, WakeupLevel::Low)];
+                let rtcio = RtcioWakeupSource::new(wakeup_pins);
+
+                info!("mcu: entering deep sleep (power button to wake)");
+                rtc.sleep_deep(&[&rtcio]);
+            }
+
             let event = mapper.map_event(hw_event);
 
             // ── Quick-menu ──────────────────────────────────────────────
