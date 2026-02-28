@@ -2,6 +2,10 @@
 // Tested on GDEQ0426T82 (800x480). No framebuffer; pixels streamed
 // through a 4KB StripBuffer. Partial refresh per GxEPD2 sequence:
 // BW-only write -> DU update -> sync both planes.
+//
+// Async variants (render_full_async, render_partial_async) replace
+// the blocking busy-wait spin loop with an `embedded_hal_async::digital::Wait`
+// `.await`, allowing the CPU to sleep via WFI between polls.
 
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
@@ -60,6 +64,8 @@ pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     init_done: bool,
     initial_refresh: bool,
 }
+
+// ── Synchronous (blocking) API ──────────────────────────────────────────
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
 where
@@ -369,6 +375,184 @@ where
     fn send_data(&mut self, data: &[u8]) {
         let _ = self.dc.set_high();
         let _ = self.spi.write(data);
+    }
+}
+
+// ── Async (non-blocking) API ────────────────────────────────────────────
+//
+// These methods replace the busy-wait spin loop with an async `.await`
+// on the BUSY pin, allowing the CPU to sleep (WFI) between polls via
+// the executor. SPI writes remain synchronous — they complete in
+// microseconds. Only the long display-update waits (200ms–1.6s) are
+// made async.
+//
+// Requires `embedded-hal-async` in your Cargo.toml.
+
+impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
+where
+    SPI: SpiDevice<Error = E>,
+    DC: OutputPin,
+    RST: OutputPin,
+    BUSY: InputPin + embedded_hal_async::digital::Wait,
+{
+    /// Expose the busy pin for external async waiting.
+    ///
+    /// Useful when you need to await the display outside of the
+    /// provided render methods (e.g. overlapping with other work).
+    pub fn busy_pin(&mut self) -> &mut BUSY {
+        &mut self.busy
+    }
+
+    /// Async busy wait — sleeps the CPU via the executor instead of
+    /// spin-polling. Returns when BUSY goes low (display ready).
+    async fn wait_busy_async(&mut self) {
+        // SSD1677 BUSY is active-high; display ready when low.
+        // `wait_for_low` returns immediately if already low.
+        let _ = self.busy.wait_for_low().await;
+    }
+
+    /// Full refresh with async busy-wait.
+    ///
+    /// Identical to `render_full` except the 1.6s display-update wait
+    /// yields to the executor instead of spin-looping.
+    pub async fn render_full_async<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        delay.delay_millis(1);
+
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
+
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+            }
+        }
+
+        self.update_full_async().await;
+        self.initial_refresh = false;
+    }
+
+    /// Partial refresh with async busy-wait.
+    ///
+    /// Identical to `render_partial` except both the DU-update wait
+    /// (~600ms) and the power-off wait (~200ms) yield to the executor.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn render_partial_async<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        delay: &mut Delay,
+        draw: F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        if self.initial_refresh {
+            return self.render_full_async(strip, delay, draw).await;
+        }
+
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
+
+        // align to 8-pixel byte boundaries
+        let px = (tx & !7).min(WIDTH);
+        let py = ty.min(HEIGHT);
+        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
+        let ph = th.min(HEIGHT - py);
+
+        if pw == 0 || ph == 0 {
+            return;
+        }
+
+        let lp = (tx - px) as u32;
+        let rp = ((px + pw) - (tx + tw)) as u32;
+        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
+        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
+
+        // step 1: BW RAM only (new frame)
+        self.write_region_strips(
+            strip,
+            px,
+            py,
+            pw,
+            ph,
+            cmd::WRITE_RAM_BW,
+            &draw,
+            left_mask,
+            right_mask,
+        );
+
+        // step 2: DU partial update (async wait ~600ms)
+        self.set_partial_ram_area(px, py, pw, ph);
+        self.update_partial_async().await;
+
+        // step 3: sync both planes (RED then BW)
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.write_region_strips(strip, px, py, pw, ph, ram_cmd, &draw, left_mask, right_mask);
+        }
+
+        self.power_off_async().await;
+    }
+
+    /// Async power-off — yields during the ~200ms power-down sequence.
+    pub async fn power_off_async(&mut self) {
+        if self.power_is_on {
+            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+            self.send_data(&[0x83]);
+            self.send_command(cmd::MASTER_ACTIVATION);
+            self.wait_busy_async().await;
+            self.power_is_on = false;
+        }
+    }
+
+    // ── Async update sequences ──────────────────────────────
+
+    async fn update_full_async(&mut self) {
+        // bypass RED as 0, BW normal
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x40, 0x00]);
+
+        // Mode 1 (GC full waveform)
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0xF7]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_async().await;
+
+        self.power_is_on = false;
+    }
+
+    async fn update_partial_async(&mut self) {
+        // RED normal, BW normal
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x00, 0x00]);
+
+        // Mode 2 (DU partial waveform)
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0xFC]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_async().await;
+
+        self.power_is_on = true;
     }
 }
 

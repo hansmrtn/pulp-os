@@ -11,6 +11,11 @@
 // ActionEvents before reaching apps.  The Power button opens a
 // quick-action overlay that floats over the bottom of the screen;
 // while the overlay is open all input is routed to it.
+//
+// Display refresh uses async busy-wait via `block_on`: the CPU
+// sleeps (WFI) during the 200ms–1.6s e-paper update instead of
+// spin-polling. The scheduler and wake-flag architecture are
+// preserved; only the display wait path is async.
 
 #![no_std]
 #![no_main]
@@ -37,8 +42,8 @@ use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::{self, DirCache};
 use pulp_os::drivers::strip::StripBuffer;
-use pulp_os::kernel::wake::{self, signal_timer, try_wake};
-use pulp_os::kernel::{Job, Scheduler};
+use pulp_os::kernel::wake::{self, try_wake};
+use pulp_os::kernel::{Job, Scheduler, block_on};
 use pulp_os::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use pulp_os::ui::{
     BAR_HEIGHT, ButtonFeedback, QuickMenu, StatusBar, SystemStatus, free_stack_bytes,
@@ -70,7 +75,7 @@ fn timer0_handler() {
             timer.clear_interrupt();
         }
     });
-    signal_timer();
+    wake::signal_timer();
 }
 
 fn set_timer_period(ms: u64) {
@@ -180,10 +185,15 @@ fn main() -> ! {
 
     home.on_enter(&mut launcher.ctx);
     update_statusbar(&mut statusbar, &mut input, sd_ok);
-    board.display.epd.render_full(&mut strip, &mut delay, |s| {
-        statusbar.draw(s).unwrap();
-        home.draw(s);
-    });
+    block_on(
+        board
+            .display
+            .epd
+            .render_full_async(&mut strip, &mut delay, |s| {
+                statusbar.draw(s).unwrap();
+                home.draw(s);
+            }),
+    );
     // Boot render_full was done outside the scheduler; drain any
     // stale redraw that on_enter left behind so the first user
     // interaction doesn't trigger a redundant screen repaint.
@@ -453,14 +463,18 @@ fn main() -> ! {
                             // Explicit full refresh request — always honour it.
                             update_statusbar(&mut statusbar, &mut input, sd_ok);
                             with_app!(active, home, files, reader, settings, |app| {
-                                board.display.epd.render_full(&mut strip, &mut delay, |s| {
-                                    statusbar.draw(s).unwrap();
-                                    app.draw(s);
-                                    if quick_menu.open {
-                                        quick_menu.draw(s);
-                                    }
-                                    bumps.draw(s);
-                                });
+                                block_on(board.display.epd.render_full_async(
+                                    &mut strip,
+                                    &mut delay,
+                                    |s| {
+                                        statusbar.draw(s).unwrap();
+                                        app.draw(s);
+                                        if quick_menu.open {
+                                            quick_menu.draw(s);
+                                        }
+                                        bumps.draw(s);
+                                    },
+                                ));
                             });
                             partial_refreshes = 0;
                         }
@@ -475,14 +489,18 @@ fn main() -> ! {
                                 // clear accumulated ghosting artifacts.
                                 update_statusbar(&mut statusbar, &mut input, sd_ok);
                                 with_app!(active, home, files, reader, settings, |app| {
-                                    board.display.epd.render_full(&mut strip, &mut delay, |s| {
-                                        statusbar.draw(s).unwrap();
-                                        app.draw(s);
-                                        if quick_menu.open {
-                                            quick_menu.draw(s);
-                                        }
-                                        bumps.draw(s);
-                                    });
+                                    block_on(board.display.epd.render_full_async(
+                                        &mut strip,
+                                        &mut delay,
+                                        |s| {
+                                            statusbar.draw(s).unwrap();
+                                            app.draw(s);
+                                            if quick_menu.open {
+                                                quick_menu.draw(s);
+                                            }
+                                            bumps.draw(s);
+                                        },
+                                    ));
                                 });
                                 partial_refreshes = 0;
                                 info!("display: promoted partial to full (ghosting clear)");
@@ -490,7 +508,7 @@ fn main() -> ! {
                                 let r = r.align8();
                                 let bar_overlaps = r.y < BAR_HEIGHT;
                                 with_app!(active, home, files, reader, settings, |app| {
-                                    board.display.epd.render_partial(
+                                    block_on(board.display.epd.render_partial_async(
                                         &mut strip,
                                         r.x,
                                         r.y,
@@ -507,7 +525,7 @@ fn main() -> ! {
                                             }
                                             bumps.draw(s);
                                         },
-                                    );
+                                    ));
                                 });
                                 partial_refreshes += 1;
                             }
@@ -570,9 +588,8 @@ fn main() -> ! {
             }
         }
 
-        if wake.display {
-            // TODO: use display-BUSY-done signal to avoid polling in wait_busy()
-        }
+        // Display BUSY is now handled by async GPIO wait inside
+        // block_on(render_*_async()), so no wake.display handling needed.
     }
 }
 

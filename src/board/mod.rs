@@ -2,6 +2,10 @@
 //
 // ESP32C3, SSD1677 800x480 epaper, SD over shared SPI2.
 // RefCellDevice arbitrates bus (single threaded, no ISR access).
+//
+// Display BUSY (GPIO6) is no longer interrupt-driven here; esp-hal's
+// async `Wait` implementation manages the GPIO6 interrupt internally
+// when `Input::wait_for_low().await` is called via `block_on`.
 
 pub mod action;
 pub mod button;
@@ -41,7 +45,11 @@ static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 // power button static: ISR clears interrupt, InputDriver reads level
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// shared GPIO ISR: power button (GPIO3) + display BUSY (GPIO6)
+// GPIO ISR: power button (GPIO3) only.
+//
+// Display BUSY (GPIO6) is handled by esp-hal's async Wait
+// implementation, which registers its own interrupt handler
+// internally when `Input::wait_for_low().await` is polled.
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
@@ -52,18 +60,6 @@ fn gpio_handler() {
             wake::signal_button();
         }
     });
-
-    // display BUSY (GPIO6) -- raw register, pin owned by DisplayDriver
-    const GPIO_STATUS: *const u32 = 0x6000_4044 as *const u32;
-    const GPIO_STATUS_W1TC: *mut u32 = 0x6000_404C as *mut u32;
-    const GPIO6_MASK: u32 = 1 << 6;
-
-    unsafe {
-        if GPIO_STATUS.read_volatile() & GPIO6_MASK != 0 {
-            GPIO_STATUS_W1TC.write_volatile(GPIO6_MASK);
-            wake::signal_display();
-        }
-    }
 }
 
 pub fn power_button_is_low() -> bool {
@@ -156,10 +152,11 @@ impl Board {
         let dc = Output::new(p.GPIO4, Level::High, OutputConfig::default());
         let rst = Output::new(p.GPIO5, Level::High, OutputConfig::default());
 
-        // arm BUSY falling edge before handing pin to DisplayDriver
-        let mut busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
-        busy.listen(Event::FallingEdge);
-        info!("display BUSY: GPIO6 interrupt armed (FallingEdge)");
+        // BUSY pin — do NOT arm an interrupt here. esp-hal's async
+        // `Input::wait_for_low()` manages the GPIO6 interrupt
+        // internally when polled through `block_on`.
+        let busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
+        info!("display BUSY: GPIO6 (async wait, no pre-armed interrupt)");
 
         // GPIO12 free in DIO mode; esp_hal has no type, use raw registers
         let sd_cs = unsafe { raw_gpio::RawOutputPin::new(12) };
