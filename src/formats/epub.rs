@@ -813,7 +813,7 @@ fn toc_trim_ws(data: &[u8]) -> &[u8] {
 
 // -- path helpers --
 
-fn resolve_path(base_dir: &str, href: &str, out: &mut [u8; 512]) -> usize {
+pub fn resolve_path(base_dir: &str, href: &str, out: &mut [u8; 512]) -> usize {
     let href = href.split('#').next().unwrap_or(href);
 
     if href.starts_with('/') || base_dir.is_empty() {

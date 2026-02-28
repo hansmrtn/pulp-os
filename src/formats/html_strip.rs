@@ -19,6 +19,7 @@ pub const QUOTE_OFF: u8 = b'q';
 
 // Standalone
 pub const BREAK: u8 = b'S';
+pub const IMG_REF: u8 = b'P'; // image ref: [MARKER, IMG_REF, len, path_bytes...]
 
 #[inline]
 pub const fn is_marker(b: u8) -> bool {
@@ -30,6 +31,7 @@ const ENTITY_BUF_CAP: usize = 12;
 const BANG_BUF_CAP: usize = 8;
 const PENDING_CAP: usize = 16;
 const DEFERRED_CAP: usize = 8;
+const IMG_SRC_CAP: usize = 128; // 3-byte header + up to 125 path bytes
 
 // streaming state machine phases
 #[derive(Clone, Copy, PartialEq)]
@@ -49,6 +51,12 @@ enum Phase {
     Cdata,
     Pi,
     BangOther,
+    ImgBody,
+    ImgAttrName,
+    ImgAttrGap,
+    ImgValStart,
+    ImgSrcVal,
+    ImgSkipVal,
 }
 
 impl Default for HtmlStripStream {
@@ -104,6 +112,14 @@ pub struct HtmlStripStream {
     pending: [u8; PENDING_CAP],
     pend_w: u8,
     pend_r: u8,
+
+    // ── Image src capture (<img src="...">) ────────────────────
+    img_src: [u8; IMG_SRC_CAP],
+    img_w: u8,         // write cursor (accumulation at [3..]) / drain length
+    img_r: u8,         // drain read cursor
+    capture_img: bool, // true while inside <img> tag body
+    img_is_src: bool,  // current attribute name matched "src"
+    img_quote: u8,     // active quote char in attribute value
 }
 
 impl HtmlStripStream {
@@ -129,6 +145,12 @@ impl HtmlStripStream {
             pending: [0u8; PENDING_CAP],
             pend_w: 0,
             pend_r: 0,
+            img_src: [0u8; IMG_SRC_CAP],
+            img_w: 0,
+            img_r: 0,
+            capture_img: false,
+            img_is_src: false,
+            img_quote: 0,
         }
     }
 
@@ -151,6 +173,20 @@ impl HtmlStripStream {
             }
             self.pend_r = 0;
             self.pend_w = 0;
+
+            // ── Step 1.5: drain image reference ────────────
+            if !self.capture_img && self.img_r < self.img_w {
+                while self.img_r < self.img_w {
+                    if op >= olen {
+                        return (ip, op);
+                    }
+                    output[op] = self.img_src[self.img_r as usize];
+                    op += 1;
+                    self.img_r += 1;
+                }
+                self.img_r = 0;
+                self.img_w = 0;
+            }
 
             // ── Step 2: check for end of input ─────────────────
             if ip >= ilen {
@@ -221,7 +257,13 @@ impl HtmlStripStream {
                         self.classify_tag();
 
                         if b == b'>' {
-                            self.finish_tag();
+                            if self.capture_img {
+                                self.finish_img_tag();
+                            } else {
+                                self.finish_tag();
+                            }
+                        } else if self.capture_img {
+                            self.phase = Phase::ImgBody;
                         } else {
                             self.phase = Phase::TagBody;
                         }
@@ -240,6 +282,112 @@ impl HtmlStripStream {
                         self.finish_tag();
                     }
                     // else: consume and stay in TagBody
+                }
+
+                // ──────────────────────────────────────────────
+                //  <img> attribute parsing — capture src="..."
+                // ──────────────────────────────────────────────
+                Phase::ImgBody => {
+                    if b == b'>' {
+                        self.finish_img_tag();
+                    } else if b.is_ascii_alphabetic() || b == b'_' {
+                        self.tag_len = 0;
+                        self.tag_buf[0] = b.to_ascii_lowercase();
+                        self.tag_len = 1;
+                        self.phase = Phase::ImgAttrName;
+                    }
+                    // whitespace, '/', etc — stay
+                }
+
+                Phase::ImgAttrName => {
+                    if b == b'=' {
+                        let name = &self.tag_buf[..self.tag_len as usize];
+                        self.img_is_src = name == b"src";
+                        self.phase = Phase::ImgValStart;
+                    } else if b == b'>' {
+                        self.finish_img_tag();
+                    } else if is_html_ws(b) || b == b'/' {
+                        self.phase = Phase::ImgAttrGap;
+                    } else if (self.tag_len as usize) < TAG_BUF_CAP {
+                        self.tag_buf[self.tag_len as usize] = b.to_ascii_lowercase();
+                        self.tag_len += 1;
+                    }
+                }
+
+                Phase::ImgAttrGap => {
+                    if b == b'=' {
+                        let name = &self.tag_buf[..self.tag_len as usize];
+                        self.img_is_src = name == b"src";
+                        self.phase = Phase::ImgValStart;
+                    } else if b == b'>' {
+                        self.finish_img_tag();
+                    } else if b.is_ascii_alphabetic() || b == b'_' {
+                        self.tag_len = 0;
+                        self.tag_buf[0] = b.to_ascii_lowercase();
+                        self.tag_len = 1;
+                        self.phase = Phase::ImgAttrName;
+                    }
+                    // whitespace, '/' — stay
+                }
+
+                Phase::ImgValStart => {
+                    if b == b'"' || b == b'\'' {
+                        self.img_quote = b;
+                        self.phase = if self.img_is_src {
+                            Phase::ImgSrcVal
+                        } else {
+                            Phase::ImgSkipVal
+                        };
+                    } else if b == b'>' {
+                        self.finish_img_tag();
+                    } else if !is_html_ws(b) {
+                        // Unquoted attribute value
+                        self.img_quote = 0;
+                        if self.img_is_src {
+                            let pos = self.img_w as usize;
+                            if pos < IMG_SRC_CAP {
+                                self.img_src[pos] = b;
+                                self.img_w += 1;
+                            }
+                            self.phase = Phase::ImgSrcVal;
+                        } else {
+                            self.phase = Phase::ImgSkipVal;
+                        }
+                    }
+                }
+
+                Phase::ImgSrcVal => {
+                    let done = if self.img_quote != 0 {
+                        b == self.img_quote
+                    } else {
+                        is_html_ws(b) || b == b'>' || b == b'/'
+                    };
+                    if done {
+                        self.phase = Phase::ImgBody;
+                        if self.img_quote == 0 && b == b'>' {
+                            self.finish_img_tag();
+                        }
+                    } else {
+                        let pos = self.img_w as usize;
+                        if pos < IMG_SRC_CAP {
+                            self.img_src[pos] = b;
+                            self.img_w += 1;
+                        }
+                    }
+                }
+
+                Phase::ImgSkipVal => {
+                    let done = if self.img_quote != 0 {
+                        b == self.img_quote
+                    } else {
+                        is_html_ws(b) || b == b'>' || b == b'/'
+                    };
+                    if done {
+                        self.phase = Phase::ImgBody;
+                        if self.img_quote == 0 && b == b'>' {
+                            self.finish_img_tag();
+                        }
+                    }
                 }
 
                 // ──────────────────────────────────────────────
@@ -595,6 +743,13 @@ impl HtmlStripStream {
         if name == b"hr" && !is_close {
             self.push_deferred_marker(BREAK);
         }
+
+        // <img> — enter image-src capture mode
+        if name == b"img" && !is_close {
+            self.capture_img = true;
+            self.img_w = 3; // reserve [0..3] for marker header
+            self.img_is_src = false;
+        }
     }
 
     // transition out of TagName/TagBody on >
@@ -605,6 +760,48 @@ impl HtmlStripStream {
         } else {
             self.phase = Phase::Text;
         }
+    }
+
+    // finish <img> tag — emit image-ref marker if src was captured
+    fn finish_img_tag(&mut self) {
+        let path_len = (self.img_w as usize).saturating_sub(3);
+        self.capture_img = false;
+
+        if path_len > 0 {
+            // Block break before image
+            if self.has_output {
+                self.trailing_nl = self.trailing_nl.max(2);
+            }
+            // Emit deferred newlines
+            if self.has_output && self.trailing_nl > 0 {
+                let nl = self.trailing_nl;
+                for _ in 0..nl {
+                    self.push_pending(b'\n');
+                }
+            }
+            self.trailing_nl = 0;
+            // Flush deferred open-style markers
+            let dlen = self.deferred_len as usize;
+            for i in 0..dlen {
+                self.push_pending(self.deferred[i]);
+            }
+            self.deferred_len = 0;
+            // Fill marker header: [MARKER, IMG_REF, path_len]
+            // Path bytes are already at img_src[3..3+path_len].
+            self.img_src[0] = MARKER;
+            self.img_src[1] = IMG_REF;
+            self.img_src[2] = path_len as u8;
+            // img_w already points past the last path byte; start drain
+            self.img_r = 0;
+            // Block break after image
+            self.trailing_nl = 2;
+            self.last_was_space = true;
+            self.has_output = true;
+        } else {
+            self.img_w = 0;
+        }
+
+        self.phase = Phase::Text;
     }
 }
 

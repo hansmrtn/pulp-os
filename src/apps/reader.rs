@@ -26,8 +26,10 @@ use crate::fonts;
 use crate::formats::cache;
 use crate::formats::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use crate::formats::html_strip::{
-    BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF, QUOTE_ON,
+    BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF,
+    QUOTE_ON,
 };
+use crate::formats::png::DecodedImage;
 use crate::formats::zip::{self, ZipIndex};
 use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, CONTENT_TOP, Region};
@@ -54,6 +56,10 @@ const TEXT_W: u32 = (480 - 2 * MARGIN) as u32;
 const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
 const INDENT_PX: u32 = 24; // pixels per blockquote indent level
+
+/// Fixed display height reserved for inline images (pixels).
+/// Actual images are scaled to fit TEXT_W × IMAGE_DISPLAY_H.
+const IMAGE_DISPLAY_H: u16 = 200;
 
 // ── Chapter RAM cache ─────────────────────────────────────────────────
 // When a chapter's stripped text fits in this limit, the entire chapter
@@ -115,6 +121,21 @@ impl LineSpan {
     const FLAG_BOLD: u8 = 1 << 0;
     const FLAG_ITALIC: u8 = 1 << 1;
     const FLAG_HEADING: u8 = 1 << 2;
+    /// First line of an inline image block. `start`/`len` point to the
+    /// image src path inside `buf` (the bytes after the 3-byte marker
+    /// header).  Continuation lines have FLAG_IMAGE set with `len == 0`.
+    const FLAG_IMAGE: u8 = 1 << 3;
+
+    #[inline]
+    fn is_image(&self) -> bool {
+        self.flags & Self::FLAG_IMAGE != 0
+    }
+
+    /// True for the *first* line of an image block (carries the path).
+    #[inline]
+    fn is_image_origin(&self) -> bool {
+        self.is_image() && self.len > 0
+    }
 
     fn style(&self) -> fonts::Style {
         if self.flags & Self::FLAG_HEADING != 0 {
@@ -185,6 +206,11 @@ pub struct ReaderApp {
     // change / book exit.  Empty ⇒ fall back to paged SD reads.
     ch_cache: Vec<u8>,
 
+    // Decoded image cache for the current page.  Decoded once during
+    // load_and_prefetch / on_work so draw() (which is &self) can blit.
+    // Cleared on every page turn / chapter change.
+    page_img: Option<DecodedImage>,
+
     // table of contents
     toc: EpubToc,
     toc_source: Option<TocSource>,
@@ -248,6 +274,8 @@ impl ReaderApp {
             cache_chapter: 0,
 
             ch_cache: Vec::new(),
+
+            page_img: None,
 
             toc: EpubToc::new(),
             toc_source: None,
@@ -489,6 +517,7 @@ impl ReaderApp {
         self.line_count = 0;
         self.prefetch_page = NO_PREFETCH;
         self.prefetch_len = 0;
+        self.page_img = None;
     }
 
     fn load_and_prefetch<SPI: embedded_hal::spi::SpiDevice>(
@@ -510,6 +539,7 @@ impl ReaderApp {
             // Populate self.lines for rendering; offsets already known
             // from preindex_all_pages so the return value is unused.
             self.wrap_lines_counted(n);
+            self.decode_page_images(svc);
             return Ok(());
         }
 
@@ -587,7 +617,219 @@ impl ReaderApp {
             self.prefetch_len = 0;
         }
 
+        self.decode_page_images(svc);
         Ok(())
+    }
+
+    /// Scan the current page for image-origin lines, extract the
+    /// referenced PNG from the EPUB ZIP, and decode it into `page_img`.
+    /// Only the first image per page is decoded (keeps memory bounded).
+    fn decode_page_images<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) {
+        self.page_img = None;
+
+        if !self.is_epub || self.spine.is_empty() {
+            return;
+        }
+
+        // Find the first image-origin line and copy its src path to a
+        // local buffer (avoids borrowing self.buf across later &mut self).
+        let mut src_buf = [0u8; 128];
+        let mut src_len = 0usize;
+        for i in 0..self.line_count {
+            if self.lines[i].is_image_origin() {
+                let start = self.lines[i].start as usize;
+                let len = self.lines[i].len as usize;
+                if start + len <= self.buf_len {
+                    let n = len.min(src_buf.len());
+                    src_buf[..n].copy_from_slice(&self.buf[start..start + n]);
+                    src_len = n;
+                }
+                break;
+            }
+        }
+
+        if src_len == 0 {
+            return;
+        }
+
+        let src_str = match core::str::from_utf8(&src_buf[..src_len]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        log::info!("reader: decoding image: {}", src_str);
+
+        // Resolve the relative src path against the chapter's directory.
+        let ch_zip_idx = self.spine.items[self.chapter as usize] as usize;
+        let ch_path = self.zip.entry_name(ch_zip_idx);
+        let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+
+        let mut path_buf = [0u8; 512];
+        let path_len = epub::resolve_path(ch_dir, src_str, &mut path_buf);
+        let full_path = match core::str::from_utf8(&path_buf[..path_len]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // ── Try SD image cache first ──────────────────────────────
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let img_name = img_cache_name(cache::fnv1a(full_path.as_bytes()));
+        let img_file = img_cache_str(&img_name);
+
+        if let Ok(img) = load_cached_image(svc, dir, img_file) {
+            log::info!(
+                "reader: image cache hit {} ({}x{})",
+                img_file,
+                img.width,
+                img.height
+            );
+            self.page_img = Some(img);
+            return;
+        }
+
+        // ── Cache miss — decode from ZIP ──────────────────────────
+
+        // Look up the image in the ZIP central directory.
+        let zip_idx = match self
+            .zip
+            .find(full_path)
+            .or_else(|| self.zip.find_icase(full_path))
+        {
+            Some(idx) => idx,
+            None => {
+                log::warn!("reader: image not in ZIP: {}", full_path);
+                return;
+            }
+        };
+
+        let entry = *self.zip.entry(zip_idx);
+        let (nb, nl) = self.name_copy();
+        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        // Compute the absolute byte offset of the entry's raw data.
+        let data_offset = {
+            let mut hdr = [0u8; 30];
+            if svc
+                .read_file_chunk(epub_name, entry.local_offset, &mut hdr)
+                .is_err()
+            {
+                log::warn!("reader: failed to read ZIP local header");
+                return;
+            }
+            match zip::ZipIndex::local_header_data_skip(&hdr) {
+                Ok(skip) => entry.local_offset + skip,
+                Err(e) => {
+                    log::warn!("reader: {}", e);
+                    return;
+                }
+            }
+        };
+
+        // Detect format from file extension first (works even for
+        // DEFLATE entries where raw bytes on disk are compressed).
+        // Fall back to magic bytes for STORED entries with odd names.
+        let ext_jpeg = full_path.ends_with(".jpg")
+            || full_path.ends_with(".jpeg")
+            || full_path.ends_with(".JPG")
+            || full_path.ends_with(".JPEG");
+        let ext_png = full_path.ends_with(".png") || full_path.ends_with(".PNG");
+
+        let (is_jpeg, is_png) = if ext_jpeg || ext_png {
+            (ext_jpeg, ext_png)
+        } else if entry.method == zip::METHOD_STORED {
+            // STORED — raw bytes on disk match the file content.
+            let mut magic = [0u8; 8];
+            let n = svc
+                .read_file_chunk(epub_name, data_offset, &mut magic)
+                .unwrap_or(0);
+            (
+                n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
+                n >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
+            )
+        } else {
+            (false, false)
+        };
+
+        if !is_jpeg && !is_png {
+            log::warn!("reader: unsupported image format: {}", full_path);
+            return;
+        }
+
+        // Release chapter RAM cache to maximise heap for image decode.
+        if !self.ch_cache.is_empty() {
+            log::info!(
+                "reader: releasing {} KB chapter cache for image decode",
+                self.ch_cache.len() / 1024
+            );
+            self.ch_cache = Vec::new();
+        }
+
+        let result = if is_jpeg && entry.method == zip::METHOD_STORED {
+            // ── STORED JPEG: stream directly from SD (any size) ───
+            let svc_ref = &*svc;
+            crate::formats::jpeg::decode_jpeg_sd(
+                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                data_offset,
+                entry.uncomp_size,
+                TEXT_W as u16,
+                IMAGE_DISPLAY_H,
+            )
+        } else if is_jpeg {
+            // ── DEFLATE JPEG: stream-decompress + decode (any size)
+            let svc_ref = &*svc;
+            crate::formats::jpeg::decode_jpeg_deflate_sd(
+                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                data_offset,
+                entry.comp_size,
+                entry.uncomp_size,
+                TEXT_W as u16,
+                IMAGE_DISPLAY_H,
+            )
+        } else if entry.method == zip::METHOD_STORED {
+            // ── STORED PNG: stream directly from SD (any size) ────
+            let svc_ref = &*svc;
+            crate::formats::png::decode_png_sd(
+                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                data_offset,
+                entry.uncomp_size,
+                TEXT_W as u16,
+                IMAGE_DISPLAY_H,
+            )
+        } else {
+            // ── DEFLATE PNG: stream-decompress + decode (any size) ─
+            let svc_ref = &*svc;
+            crate::formats::png::decode_png_deflate_sd(
+                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                data_offset,
+                entry.comp_size,
+                TEXT_W as u16,
+                IMAGE_DISPLAY_H,
+            )
+        };
+
+        match result {
+            Ok(img) => {
+                log::info!(
+                    "reader: decoded {}x{} image ({} bytes 1-bit)",
+                    img.width,
+                    img.height,
+                    img.data.len()
+                );
+                if let Err(e) = save_cached_image(svc, dir, img_file, &img) {
+                    log::warn!("reader: image cache write failed: {}", e);
+                } else {
+                    log::info!("reader: cached image as {}", img_file);
+                }
+                self.page_img = Some(img);
+            }
+            Err(e) => {
+                log::warn!("reader: image decode failed: {}", e);
+            }
+        }
     }
 
     // parse ZIP EOCD + central directory; heap freed before return
@@ -1092,6 +1334,60 @@ fn wrap_proportional(
 
         // 2-byte style markers: [MARKER, tag] — zero width, update state
         if b == MARKER && i + 1 < n {
+            // ── Image reference: [MARKER, IMG_REF, len, path...] ──
+            if buf[i + 1] == IMG_REF && i + 2 < n {
+                let path_len = buf[i + 2] as usize;
+                let path_start = i + 3;
+                if path_start + path_len <= n && path_len > 0 {
+                    // Flush any text accumulated on the current line.
+                    if ls < i {
+                        emit!(ls, i);
+                        if lc >= max_l {
+                            return (i, lc);
+                        }
+                    }
+
+                    // How many text-line slots does the image occupy?
+                    let line_h = fonts.line_height(fonts::Style::Regular);
+                    let img_lines = (IMAGE_DISPLAY_H / line_h).max(1) as usize;
+
+                    // Origin line — carries the src-path location.
+                    if lc < max_l {
+                        lines[lc] = LineSpan {
+                            start: path_start as u16,
+                            len: path_len as u16,
+                            flags: LineSpan::FLAG_IMAGE,
+                            indent: 0,
+                        };
+                        lc += 1;
+                    }
+
+                    // Continuation lines (empty; just reserve vertical space).
+                    for _ in 1..img_lines {
+                        if lc >= max_l {
+                            break;
+                        }
+                        lines[lc] = LineSpan {
+                            start: 0,
+                            len: 0,
+                            flags: LineSpan::FLAG_IMAGE,
+                            indent: 0,
+                        };
+                        lc += 1;
+                    }
+
+                    i = path_start + path_len;
+                    ls = i;
+                    px = 0;
+                    sp = ls;
+                    sp_px = 0;
+                    if lc >= max_l {
+                        return (ls, lc);
+                    }
+                    continue;
+                }
+            }
+
             match buf[i + 1] {
                 BOLD_ON => bold = true,
                 BOLD_OFF => bold = false,
@@ -1254,6 +1550,84 @@ fn draw_mono_text(strip: &mut StripBuffer, region: Region, text: &str, align: Al
         .unwrap();
 }
 
+// ── Image cache helpers ───────────────────────────────────────────────
+
+/// 8.3 filename for a cached 1-bit image: `IMXXXXXX.BIN`
+/// where `XXXXXX` is the lower 24 bits of `hash` in hex.
+fn img_cache_name(hash: u32) -> [u8; 12] {
+    let h = hash & 0x00FF_FFFF;
+    let mut n = *b"IM000000.BIN";
+    for i in 0..6 {
+        let nibble = ((h >> (20 - i * 4)) & 0xF) as u8;
+        n[2 + i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+    n
+}
+
+#[inline]
+fn img_cache_str(buf: &[u8; 12]) -> &str {
+    core::str::from_utf8(buf).unwrap_or("IM000000.BIN")
+}
+
+/// Load a cached 1-bit image from SD.
+/// Format: `[u16 LE width][u16 LE height][packed 1-bit data]`.
+fn load_cached_image<SPI: embedded_hal::spi::SpiDevice>(
+    svc: &Services<'_, SPI>,
+    dir: &str,
+    name: &str,
+) -> Result<DecodedImage, &'static str> {
+    let size = svc
+        .file_size_pulp_sub(dir, name)
+        .map_err(|_| "no cache file")?;
+    if size < 5 {
+        return Err("cache file too small");
+    }
+    let mut header = [0u8; 4];
+    svc.read_pulp_sub_chunk(dir, name, 0, &mut header)
+        .map_err(|_| "read header failed")?;
+    let width = u16::from_le_bytes([header[0], header[1]]);
+    let height = u16::from_le_bytes([header[2], header[3]]);
+    if width == 0 || height == 0 {
+        return Err("zero dimensions in cache");
+    }
+    let stride = (width as usize + 7) / 8;
+    let data_len = stride * height as usize;
+    if size as usize != 4 + data_len {
+        return Err("cache size mismatch");
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(data_len)
+        .map_err(|_| "OOM for cached image")?;
+    data.resize(data_len, 0);
+    svc.read_pulp_sub_chunk(dir, name, 4, &mut data)
+        .map_err(|_| "read data failed")?;
+    Ok(DecodedImage {
+        width,
+        height,
+        data,
+        stride,
+    })
+}
+
+/// Write a decoded 1-bit image to SD cache.
+fn save_cached_image<SPI: embedded_hal::spi::SpiDevice>(
+    svc: &Services<'_, SPI>,
+    dir: &str,
+    name: &str,
+    img: &DecodedImage,
+) -> Result<(), &'static str> {
+    let mut header = [0u8; 4];
+    header[0..2].copy_from_slice(&img.width.to_le_bytes());
+    header[2..4].copy_from_slice(&img.height.to_le_bytes());
+    svc.write_pulp_sub(dir, name, &header)?;
+    svc.append_pulp_sub(dir, name, &img.data)?;
+    Ok(())
+}
+
 fn extract_zip_entry<SPI: embedded_hal::spi::SpiDevice>(
     svc: &mut Services<'_, SPI>,
     name: &str,
@@ -1304,6 +1678,7 @@ impl App for ReaderApp {
         self.prefetch_len = 0;
         self.restore_offset = None;
         self.ch_cache.clear();
+        self.page_img = None;
 
         if self.is_epub {
             self.toc.clear();
@@ -1816,6 +2191,41 @@ impl App for ReaderApp {
             let ascent = self.font_ascent as i32;
             for i in 0..self.line_count {
                 let span = self.lines[i];
+
+                // ── Inline image ──────────────────────────────────
+                if span.is_image() {
+                    if span.is_image_origin() {
+                        let y_top = TEXT_Y as i32 + i as i32 * line_h;
+                        if let Some(ref img) = self.page_img {
+                            // Centre horizontally within the text area.
+                            let img_x =
+                                MARGIN as i32 + ((TEXT_W as i32 - img.width as i32) / 2).max(0);
+                            strip.blit_1bpp(
+                                &img.data,
+                                0,
+                                img.width as usize,
+                                img.height as usize,
+                                img.stride,
+                                img_x,
+                                y_top,
+                                true,
+                            );
+                        } else {
+                            // Placeholder when image could not be decoded.
+                            let baseline = y_top + ascent;
+                            fs.draw_str(
+                                strip,
+                                "[image]",
+                                fonts::Style::Italic,
+                                MARGIN as i32,
+                                baseline,
+                            );
+                        }
+                    }
+                    // Continuation lines (and origin after blit) are blank.
+                    continue;
+                }
+
                 let start = span.start as usize;
                 let end = start + span.len as usize;
                 let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;

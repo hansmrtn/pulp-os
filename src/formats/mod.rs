@@ -11,5 +11,7 @@ pub mod cache;
 pub mod css;
 pub mod epub;
 pub mod html_strip;
+pub mod jpeg;
+pub mod png;
 pub mod xml;
 pub mod zip;

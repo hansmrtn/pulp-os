@@ -236,8 +236,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     // paint sentinel before any deep calls; measure peak later via stack_high_water_mark()
     paint_stack();
 
-    // 230KB heap; strip-buffer saves 44KB vs full framebuffer
-    esp_alloc::heap_allocator!(size: 235520);
+    // 200KB heap (was 230KB); smaller heap gives ~30KB more stack room
+    // for zune-jpeg's Huffman table construction temporaries.
+    esp_alloc::heap_allocator!(size: 204800);
 
     info!("booting...");
 
@@ -777,7 +778,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
-    const HEAP_TOTAL: usize = 235520; // matches heap_allocator!(size: ...) above
+    const HEAP_TOTAL: usize = 204800; // matches heap_allocator!(size: ...) above
     let stats = esp_alloc::HEAP.stats();
 
     let bat_pct = battery::battery_percentage(battery_mv);
