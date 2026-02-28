@@ -55,6 +55,13 @@ const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
 const EOCD_TAIL: usize = 512;
 const INDENT_PX: u32 = 24; // pixels per blockquote indent level
 
+// ── Chapter RAM cache ─────────────────────────────────────────────────
+// When a chapter's stripped text fits in this limit, the entire chapter
+// is loaded from SD into a heap Vec *once*.  Subsequent page turns are
+// just a memcpy + word-wrap — zero SD I/O.  96 KB covers virtually
+// every chapter in any novel or technical book.
+const CHAPTER_CACHE_MAX: usize = 98304;
+
 // ── Progress bar ──────────────────────────────────────────────────────
 const PROGRESS_H: u16 = 2;
 const PROGRESS_Y: u16 = 800 - PROGRESS_H - 1;
@@ -173,6 +180,11 @@ pub struct ReaderApp {
     chapters_cached: bool,
     cache_chapter: u16,
 
+    // RAM chapter cache — entire chapter text held in heap so page
+    // turns are zero-SD-I/O memcpy + word-wrap.  Cleared on chapter
+    // change / book exit.  Empty ⇒ fall back to paged SD reads.
+    ch_cache: Vec<u8>,
+
     // table of contents
     toc: EpubToc,
     toc_source: Option<TocSource>,
@@ -234,6 +246,8 @@ impl ReaderApp {
             chapter_sizes: [0u32; cache::MAX_CACHE_CHAPTERS],
             chapters_cached: false,
             cache_chapter: 0,
+
+            ch_cache: Vec::new(),
 
             toc: EpubToc::new(),
             toc_source: None,
@@ -481,6 +495,24 @@ impl ReaderApp {
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> Result<(), &'static str> {
+        // ── Fast path: chapter fully cached in RAM ────────────────
+        // Zero SD I/O — just memcpy from the heap buffer and wrap.
+        if !self.ch_cache.is_empty() {
+            let start = (self.offsets[self.page] as usize).min(self.ch_cache.len());
+            let end = (start + PAGE_BUF).min(self.ch_cache.len());
+            let n = end - start;
+            if n > 0 {
+                self.buf[..n].copy_from_slice(&self.ch_cache[start..end]);
+            }
+            self.buf_len = n;
+            self.prefetch_page = NO_PREFETCH;
+            self.prefetch_len = 0;
+            // Populate self.lines for rendering; offsets already known
+            // from preindex_all_pages so the return value is unused.
+            self.wrap_lines_counted(n);
+            return Ok(());
+        }
+
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
@@ -774,6 +806,113 @@ impl ReaderApp {
             self.spine.len(),
             self.file_size,
         );
+    }
+
+    /// Read the entire current chapter into `ch_cache` (heap Vec).
+    /// Returns true if the chapter fits and was loaded successfully.
+    /// On failure the cache is cleared and the caller should fall
+    /// back to the paged SD path.
+    fn try_cache_chapter<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> bool {
+        if !self.is_epub || !self.chapters_cached {
+            return false;
+        }
+
+        let ch = self.chapter as usize;
+        let ch_size = if ch < cache::MAX_CACHE_CHAPTERS {
+            self.chapter_sizes[ch] as usize
+        } else {
+            return false;
+        };
+
+        if ch_size == 0 || ch_size > CHAPTER_CACHE_MAX {
+            self.ch_cache.clear();
+            return false;
+        }
+
+        // Reuse existing buffer if it already holds this chapter's data
+        // (e.g. font-size change triggers NeedIndex for the same chapter).
+        if self.ch_cache.len() == ch_size {
+            log::info!("chapter cache: reusing {} bytes in RAM", ch_size);
+            return true;
+        }
+
+        // Reserve exact capacity; bail on OOM
+        self.ch_cache.clear();
+        if self.ch_cache.try_reserve_exact(ch_size).is_err() {
+            log::info!("chapter cache: OOM for {} bytes", ch_size);
+            return false;
+        }
+        self.ch_cache.resize(ch_size, 0);
+
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let ch_file = cache::chapter_file_name(self.chapter);
+        let ch_str = cache::chapter_file_str(&ch_file);
+
+        let mut pos = 0usize;
+        while pos < ch_size {
+            let chunk = (ch_size - pos).min(PAGE_BUF);
+            match svc.read_pulp_sub_chunk(
+                dir,
+                ch_str,
+                pos as u32,
+                &mut self.ch_cache[pos..pos + chunk],
+            ) {
+                Ok(n) if n > 0 => pos += n,
+                Ok(_) => break,
+                Err(e) => {
+                    log::info!("chapter cache: SD read failed at {}: {}", pos, e);
+                    self.ch_cache.clear();
+                    return false;
+                }
+            }
+        }
+
+        log::info!(
+            "chapter cache: loaded ch{} ({} bytes) into RAM",
+            self.chapter,
+            ch_size,
+        );
+        true
+    }
+
+    /// Compute ALL page offsets from the RAM-cached chapter text.
+    /// Pure CPU work, no SD I/O.  After this, `fully_indexed` is
+    /// true and the progress bar / page count are accurate from
+    /// page 1.
+    fn preindex_all_pages(&mut self) {
+        if self.ch_cache.is_empty() {
+            return;
+        }
+
+        let total = self.ch_cache.len();
+        self.offsets[0] = 0;
+        self.total_pages = 1;
+
+        let mut offset = 0usize;
+        while offset < total && self.total_pages < MAX_PAGES {
+            let end = (offset + PAGE_BUF).min(total);
+            let n = end - offset;
+            self.buf[..n].copy_from_slice(&self.ch_cache[offset..end]);
+            self.buf_len = n;
+
+            let consumed = self.wrap_lines_counted(n);
+            let next_offset = offset + consumed;
+
+            if self.line_count >= self.max_lines && next_offset < total {
+                self.offsets[self.total_pages] = next_offset as u32;
+                self.total_pages += 1;
+                offset = next_offset;
+            } else {
+                break;
+            }
+        }
+
+        self.fully_indexed = true;
+        log::info!("chapter pre-indexed: {} pages", self.total_pages);
     }
 
     fn scan_to_last_page<SPI: embedded_hal::spi::SpiDevice>(
@@ -1148,6 +1287,7 @@ impl App for ReaderApp {
         self.is_epub = epub::is_epub_filename(self.name());
         self.rebuild_quick_actions();
         self.reset_paging();
+        self.ch_cache.clear();
         self.file_size = 0;
         self.chapter = 0;
         self.error = None;
@@ -1169,6 +1309,7 @@ impl App for ReaderApp {
         self.prefetch_page = NO_PREFETCH;
         self.prefetch_len = 0;
         self.restore_offset = None;
+        self.ch_cache.clear();
 
         if self.is_epub {
             self.toc.clear();
@@ -1330,6 +1471,14 @@ impl App for ReaderApp {
                     self.goto_last_page = false;
 
                     self.epub_index_chapter();
+
+                    // Try to load the entire chapter into RAM.
+                    // If it fits, preindex all page offsets (CPU-only,
+                    // ~5 ms for a 50 KB chapter).  This makes every
+                    // subsequent page turn a zero-SD-I/O memcpy.
+                    if self.try_cache_chapter(svc) {
+                        self.preindex_all_pages();
+                    }
 
                     if want_last {
                         match self.scan_to_last_page(svc) {
