@@ -54,6 +54,21 @@ mod cmd {
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
 }
 
+/// Parameters saved between split-phase partial refresh steps.
+///
+/// Produced by [`DisplayDriver::partial_phase1_bw`], consumed by
+/// [`DisplayDriver::partial_phase3_sync`].  Stored alongside the
+/// display driver in the main loop — the scheduler carries no data.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderState {
+    pub px: u16,
+    pub py: u16,
+    pub pw: u16,
+    pub ph: u16,
+    pub left_mask: u8,
+    pub right_mask: u8,
+}
+
 pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     spi: SPI,
     dc: DC,
@@ -432,6 +447,153 @@ where
     fn send_data(&mut self, data: &[u8]) {
         let _ = self.dc.set_high();
         let _ = self.spi.write(data);
+    }
+
+    // ── Split-phase partial refresh ─────────────────────────
+    //
+    // These methods decompose `render_partial` into discrete steps
+    // so the scheduler can run other jobs (input polling, prefetch)
+    // during the 400-600ms DU waveform and 200ms power-off waits.
+    //
+    //   phase1_bw     — render + send BW RAM, return RenderState
+    //   start_du      — kick DU waveform (non-blocking)
+    //   is_busy       — poll BUSY pin (non-blocking)
+    //   phase3_sync   — render + send RED & BW sync
+    //   start_power_off / finish_power_off — non-blocking power-off
+    //
+    // The caller is responsible for waiting (via scheduler loop or
+    // WFI) between start_du and phase3_sync, and between
+    // start_power_off and finish_power_off.
+
+    /// Phase 1: compute region, write new content to BW RAM,
+    /// return the region parameters needed for later phases.
+    ///
+    /// Returns `None` if the region is degenerate (zero-size) or if
+    /// `initial_refresh` is set (caller should use `render_full`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn partial_phase1_bw<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        delay: &mut Delay,
+        draw: &F,
+    ) -> Option<RenderState>
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        if self.initial_refresh {
+            return None; // caller must use render_full instead
+        }
+
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
+
+        let px = (tx & !7).min(WIDTH);
+        let py = ty.min(HEIGHT);
+        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
+        let ph = th.min(HEIGHT - py);
+
+        if pw == 0 || ph == 0 {
+            return None;
+        }
+
+        let lp = (tx - px) as u32;
+        let rp = ((px + pw) - (tx + tw)) as u32;
+        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
+        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
+
+        self.write_region_strips(
+            strip,
+            px,
+            py,
+            pw,
+            ph,
+            cmd::WRITE_RAM_BW,
+            draw,
+            left_mask,
+            right_mask,
+        );
+
+        Some(RenderState {
+            px,
+            py,
+            pw,
+            ph,
+            left_mask,
+            right_mask,
+        })
+    }
+
+    /// Phase 2a: kick the DU partial waveform.  Returns immediately;
+    /// poll [`is_busy`](Self::is_busy) (or yield to the scheduler)
+    /// until the display controller finishes.
+    pub fn partial_start_du(&mut self, rs: &RenderState) {
+        self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
+
+        // Same commands as update_partial(), minus wait_busy().
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x00, 0x00]);
+
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0xFC]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.power_is_on = true;
+    }
+
+    /// Non-blocking busy check.  Returns `true` while the display
+    /// controller is still processing (BUSY pin high).
+    #[inline]
+    pub fn is_busy(&mut self) -> bool {
+        self.busy.is_high().unwrap_or(false)
+    }
+
+    /// Phase 3: sync both RAM planes (RED + BW) after the DU refresh
+    /// completes.  Must only be called once [`is_busy`](Self::is_busy)
+    /// returns `false`.
+    pub fn partial_phase3_sync<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        self.write_region_strips_dual(
+            strip,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            draw,
+            rs.left_mask,
+            rs.right_mask,
+        );
+    }
+
+    /// Kick the power-off sequence (non-blocking).  Poll
+    /// [`is_busy`](Self::is_busy) for completion, then call
+    /// [`finish_power_off`](Self::finish_power_off).
+    pub fn start_power_off(&mut self) {
+        if self.power_is_on {
+            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+            self.send_data(&[0x83]);
+            self.send_command(cmd::MASTER_ACTIVATION);
+        }
+    }
+
+    /// Mark the power-off sequence as complete.  Call after
+    /// `start_power_off()` once `is_busy()` returns `false`.
+    pub fn finish_power_off(&mut self) {
+        self.power_is_on = false;
+    }
+
+    /// Returns `true` if the display still needs its first full
+    /// refresh before partial updates are allowed.
+    pub fn needs_initial_refresh(&self) -> bool {
+        self.initial_refresh
     }
 }
 

@@ -12,12 +12,14 @@ use core::fmt;
 pub enum Job {
     PollInput,
     Render,
+    RenderPhase2,
+    RenderPhase3,
     AppWork,
     UpdateStatusBar,
 }
 
 impl Job {
-    /// Bit index for the pending bitmap (0..3).
+    /// Bit index for the pending bitmap (0..5).
     #[inline]
     const fn bit(self) -> u8 {
         1 << (self as u8)
@@ -29,6 +31,8 @@ impl fmt::Display for Job {
         match self {
             Job::PollInput => write!(f, "PollInput"),
             Job::Render => write!(f, "Render"),
+            Job::RenderPhase2 => write!(f, "RenderPhase2"),
+            Job::RenderPhase3 => write!(f, "RenderPhase3"),
             Job::AppWork => write!(f, "AppWork"),
             Job::UpdateStatusBar => write!(f, "UpdateStatusBar"),
         }
@@ -46,7 +50,9 @@ impl Job {
     pub const fn priority(&self) -> Priority {
         match self {
             Job::PollInput | Job::Render => Priority::High,
-            Job::AppWork | Job::UpdateStatusBar => Priority::Normal,
+            Job::RenderPhase2 | Job::RenderPhase3 | Job::AppWork | Job::UpdateStatusBar => {
+                Priority::Normal
+            }
         }
     }
 }

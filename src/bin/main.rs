@@ -42,6 +42,7 @@ use pulp_os::board::Board;
 use pulp_os::board::action::{Action, ActionEvent, ButtonMapper};
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
+use pulp_os::drivers::ssd1677::RenderState;
 use pulp_os::drivers::storage::{self, DirCache};
 use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::wake::{self, try_wake};
@@ -176,6 +177,8 @@ fn main() -> ! {
     let mut sd_check_counter: u32 = 0;
     let mut battery_read_counter: u32 = 0;
     let mut cached_battery_mv: u16 = battery::adc_to_battery_mv(input.read_battery_mv());
+    let mut render_state: Option<RenderState> = None;
+    let mut render_bar_overlaps: bool = false;
 
     // Load bookmarks from SD into the RAM cache before anything else
     // touches them. ensure_loaded takes &SdStorage directly.
@@ -465,6 +468,12 @@ fn main() -> ! {
                 }
 
                 Job::Render => {
+                    // Guard: don't start a new render while a split-phase
+                    // partial refresh is in progress. The pending redraw
+                    // will be picked up after RenderPhase3 completes.
+                    if render_state.is_some() {
+                        continue;
+                    }
                     let active = launcher.active();
                     match launcher.ctx.take_redraw() {
                         Redraw::Full => {
@@ -513,18 +522,25 @@ fn main() -> ! {
                                 partial_refreshes = 0;
                                 info!("display: promoted partial to full (ghosting clear)");
                             } else {
+                                // Split-phase partial refresh: write BW
+                                // RAM, kick DU waveform, then yield to
+                                // the scheduler during the 400-600ms
+                                // display update so input stays responsive
+                                // and background work can run.
                                 let r = r.align8();
-                                let bar_overlaps = r.y < BAR_HEIGHT;
-                                with_app!(active, home, files, reader, settings, |app| {
-                                    block_on(board.display.epd.render_partial_async(
+                                render_bar_overlaps = r.y < BAR_HEIGHT;
+                                idle_polls = 0; // keep active timer during refresh
+
+                                let rs = with_app!(active, home, files, reader, settings, |app| {
+                                    board.display.epd.partial_phase1_bw(
                                         &mut strip,
                                         r.x,
                                         r.y,
                                         r.w,
                                         r.h,
                                         &mut delay,
-                                        |s| {
-                                            if bar_overlaps {
+                                        &|s: &mut StripBuffer| {
+                                            if render_bar_overlaps {
                                                 statusbar.draw(s).unwrap();
                                             }
                                             app.draw(s);
@@ -533,12 +549,91 @@ fn main() -> ! {
                                             }
                                             bumps.draw(s);
                                         },
-                                    ));
+                                    )
                                 });
-                                partial_refreshes += 1;
+
+                                if let Some(rs) = rs {
+                                    // Kick DU waveform — returns immediately
+                                    board.display.epd.partial_start_du(&rs);
+                                    render_state = Some(rs);
+                                    partial_refreshes += 1;
+                                    // Yield to scheduler; RenderPhase2 is
+                                    // Normal priority so PollInput (High)
+                                    // runs first on each wake.
+                                    let _ = sched.push_unique(Job::RenderPhase2);
+                                } else if board.display.epd.needs_initial_refresh() {
+                                    // First refresh must be full GC
+                                    update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
+                                    with_app!(active, home, files, reader, settings, |app| {
+                                        block_on(board.display.epd.render_full_async(
+                                            &mut strip,
+                                            &mut delay,
+                                            |s| {
+                                                statusbar.draw(s).unwrap();
+                                                app.draw(s);
+                                                if quick_menu.open {
+                                                    quick_menu.draw(s);
+                                                }
+                                                bumps.draw(s);
+                                            },
+                                        ));
+                                    });
+                                    partial_refreshes = 0;
+                                }
+                                // else: degenerate region (zero-size), skip
                             }
                         }
                         Redraw::None => {}
+                    }
+                }
+
+                Job::RenderPhase2 => {
+                    // Poll display BUSY during the 400-600ms DU waveform.
+                    // This job is Normal priority, so any PollInput (High)
+                    // that arrives from a button press runs first — making
+                    // the UI responsive during the e-paper refresh.
+                    if board.display.epd.is_busy() {
+                        let _ = sched.push_unique(Job::RenderPhase2);
+                        // Break out of the job-drain loop so the outer
+                        // loop can WFI until the next interrupt (timer
+                        // tick or button press) instead of spin-polling.
+                        break;
+                    }
+                    // DU refresh complete — proceed to sync phase
+                    let _ = sched.push_unique(Job::RenderPhase3);
+                }
+
+                Job::RenderPhase3 => {
+                    // Phase 3: write identical content to both RED and BW
+                    // RAM planes (sync) so the next partial refresh has a
+                    // clean differential baseline, then power off.
+                    if let Some(rs) = render_state.take() {
+                        let active = launcher.active();
+                        with_app!(active, home, files, reader, settings, |app| {
+                            board.display.epd.partial_phase3_sync(
+                                &mut strip,
+                                &rs,
+                                &|s: &mut StripBuffer| {
+                                    if render_bar_overlaps {
+                                        statusbar.draw(s).unwrap();
+                                    }
+                                    app.draw(s);
+                                    if quick_menu.open {
+                                        quick_menu.draw(s);
+                                    }
+                                    bumps.draw(s);
+                                },
+                            );
+                        });
+                        // Blocking power-off (~200ms). Acceptable: short
+                        // duration and CPU sleeps via WFI inside wait_busy.
+                        board.display.epd.power_off();
+                    }
+                    // A new redraw may have arrived during the DU wait
+                    // (user pressed a button, app updated state). Pick
+                    // it up now that the display is free.
+                    if launcher.ctx.has_redraw() {
+                        let _ = sched.push_unique(Job::Render);
                     }
                 }
 
