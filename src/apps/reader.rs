@@ -76,8 +76,10 @@ pub const RECENT_FILE: &str = "RECENT";
 enum State {
     NeedBookmark,
     NeedInit,
+    NeedOpf,
     NeedToc,
     NeedCache,
+    NeedCacheChapter,
     NeedIndex,
     NeedPage,
     Ready,
@@ -169,6 +171,7 @@ pub struct ReaderApp {
     epub_file_size: u32,
     chapter_sizes: [u32; cache::MAX_CACHE_CHAPTERS],
     chapters_cached: bool,
+    cache_chapter: u16,
 
     // table of contents
     toc: EpubToc,
@@ -230,6 +233,7 @@ impl ReaderApp {
             epub_file_size: 0,
             chapter_sizes: [0u32; cache::MAX_CACHE_CHAPTERS],
             chapters_cached: false,
+            cache_chapter: 0,
 
             toc: EpubToc::new(),
             toc_source: None,
@@ -560,7 +564,11 @@ impl ReaderApp {
         Ok(())
     }
 
-    fn epub_init<SPI: embedded_hal::spi::SpiDevice>(
+    /// EPUB init phase 1: file size, EOCD, central directory.
+    ///
+    /// Heap allocation (~cd_size) is freed before return.
+    /// Caller transitions to `NeedOpf` on success.
+    fn epub_init_zip<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> Result<(), &'static str> {
@@ -597,6 +605,23 @@ impl ReaderApp {
         drop(cd_buf);
 
         log::info!("epub: {} entries in ZIP", self.zip.count());
+
+        Ok(())
+    }
+
+    /// EPUB init phase 2: container.xml → OPF → spine + metadata.
+    ///
+    /// Runs after `epub_init_zip` with the ZIP index populated.
+    /// Two heap allocations (container_data, opf_data) are each
+    /// freed before the next, keeping peak usage lower than the
+    /// original monolithic `epub_init`.
+    /// Caller transitions to `NeedToc` on success.
+    fn epub_init_opf<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<(), &'static str> {
+        let (nb, nl) = self.name_copy();
+        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
         // 4. Read container.xml
         let container_idx = self
@@ -656,12 +681,16 @@ impl ReaderApp {
         Ok(())
     }
 
-    // validate or build SD chapter cache for the entire book.
-    // ~47KB temp heap per chapter (freed on return).
-    fn epub_ensure_cache<SPI: embedded_hal::spi::SpiDevice>(
+    /// Validate existing SD chapter cache.
+    ///
+    /// Returns `Ok(true)` on cache hit (chapters_cached set, ready to
+    /// proceed to NeedIndex).  Returns `Ok(false)` on cache miss
+    /// (subdir created, cache_chapter reset to 0, caller should
+    /// transition to NeedCacheChapter).
+    fn epub_check_cache<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<bool, &'static str> {
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
 
@@ -679,43 +708,85 @@ impl ReaderApp {
                 .copy_from_slice(&info.chapter_sizes[..info.chapter_count]);
             self.chapters_cached = true;
             log::info!("epub: cache hit ({} chapters)", info.chapter_count);
-            return Ok(());
+            return Ok(true);
         }
 
-        // Cache miss — stream each chapter to SD
+        // Cache miss — prepare for per-chapter streaming
         log::info!("epub: building cache for {} chapters", self.spine.len());
         svc.ensure_pulp_subdir(dir)?;
+        self.cache_chapter = 0;
+        Ok(false)
+    }
+
+    /// Cache a single chapter to SD.
+    ///
+    /// Processes `self.cache_chapter`, increments it, and returns
+    /// `Ok(true)` if more chapters remain or `Ok(false)` when all
+    /// chapters have been cached (META.BIN written).
+    ///
+    /// ~47KB temporary heap per call (DecompressorOxide + window);
+    /// freed on return so the scheduler can run between chapters
+    /// without holding peak memory.
+    fn epub_cache_one_chapter<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<bool, &'static str> {
+        let ch = self.cache_chapter as usize;
+        let spine_len = self.spine.len();
+
+        if ch >= spine_len {
+            // All chapters done — should not happen, but handle gracefully
+            return self.epub_finish_cache(svc);
+        }
+
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
 
         let (nb, nl) = self.name_copy();
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
-        let spine_len = self.spine.len();
-        for ch in 0..spine_len {
-            let entry_idx = self.spine.items[ch] as usize;
-            let entry = *self.zip.entry(entry_idx);
+        let entry_idx = self.spine.items[ch] as usize;
+        let entry = *self.zip.entry(entry_idx);
 
-            let ch_file = cache::chapter_file_name(ch as u16);
-            let ch_str = cache::chapter_file_str(&ch_file);
+        let ch_file = cache::chapter_file_name(ch as u16);
+        let ch_str = cache::chapter_file_str(&ch_file);
 
-            // Create empty file (truncate if stale)
-            svc.write_pulp_sub(dir, ch_str, &[])?;
+        // Create empty file (truncate if stale)
+        svc.write_pulp_sub(dir, ch_str, &[])?;
 
-            // Stream: decompress → HTML strip → append to cache file.
-            // Temporary heap (~47 KB) is allocated inside stream_strip_entry
-            // and freed when it returns.
-            let svc_ref = &*svc;
-            let text_size = cache::stream_strip_entry(
-                &entry,
-                entry.local_offset,
-                |offset, buf| svc_ref.read_file_chunk(epub_name, offset, buf),
-                |chunk| svc_ref.append_pulp_sub(dir, ch_str, chunk),
-            )?;
+        // Stream: decompress → HTML strip → append to cache file.
+        // Temporary heap (~47 KB) is allocated inside stream_strip_entry
+        // and freed when it returns.
+        let svc_ref = &*svc;
+        let text_size = cache::stream_strip_entry(
+            &entry,
+            entry.local_offset,
+            |offset, buf| svc_ref.read_file_chunk(epub_name, offset, buf),
+            |chunk| svc_ref.append_pulp_sub(dir, ch_str, chunk),
+        )?;
 
-            self.chapter_sizes[ch] = text_size;
-            log::info!("epub: cached ch{} = {} bytes", ch, text_size);
+        self.chapter_sizes[ch] = text_size;
+        log::info!("epub: cached ch{}/{} = {} bytes", ch, spine_len, text_size);
+
+        self.cache_chapter += 1;
+
+        if (self.cache_chapter as usize) < spine_len {
+            Ok(true) // more chapters remain
+        } else {
+            self.epub_finish_cache(svc)
         }
+    }
 
-        // Write META.BIN so subsequent opens skip decompression
+    /// Write META.BIN after all chapters have been cached.
+    fn epub_finish_cache<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<bool, &'static str> {
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let spine_len = self.spine.len();
+
+        let mut meta_buf = [0u8; cache::META_MAX_SIZE];
         let meta_len = cache::encode_cache_meta(
             self.epub_file_size,
             self.epub_name_hash,
@@ -726,7 +797,7 @@ impl ReaderApp {
 
         self.chapters_cached = true;
         log::info!("epub: cache complete");
-        Ok(())
+        Ok(false) // no more chapters
     }
 
     // reset paging for current chapter from SD cache; no I/O
@@ -1138,8 +1209,10 @@ impl App for ReaderApp {
             self.state,
             State::NeedBookmark
                 | State::NeedInit
+                | State::NeedOpf
                 | State::NeedToc
                 | State::NeedCache
+                | State::NeedCacheChapter
                 | State::NeedIndex
                 | State::NeedPage
         )
@@ -1171,13 +1244,28 @@ impl App for ReaderApp {
                     continue;
                 }
 
-                State::NeedInit => match self.epub_init(svc) {
+                State::NeedInit => match self.epub_init_zip(svc) {
                     Ok(()) => {
-                        self.state = State::NeedToc;
-                        continue;
+                        self.state = State::NeedOpf;
+                        // Yield to scheduler — CD heap is freed,
+                        // input can be processed before OPF extraction.
                     }
                     Err(e) => {
-                        log::info!("reader: epub init failed: {}", e);
+                        log::info!("reader: epub init (zip) failed: {}", e);
+                        self.error = Some(e);
+                        self.state = State::Error;
+                        ctx.mark_dirty(PAGE_REGION);
+                    }
+                },
+
+                State::NeedOpf => match self.epub_init_opf(svc) {
+                    Ok(()) => {
+                        self.state = State::NeedToc;
+                        // Yield to scheduler — OPF heap is freed
+                        // before TOC extraction allocates.
+                    }
+                    Err(e) => {
+                        log::info!("reader: epub init (opf) failed: {}", e);
                         self.error = Some(e);
                         self.state = State::Error;
                         ctx.mark_dirty(PAGE_REGION);
@@ -1226,13 +1314,39 @@ impl App for ReaderApp {
                     continue;
                 }
 
-                State::NeedCache => match self.epub_ensure_cache(svc) {
-                    Ok(()) => {
+                State::NeedCache => match self.epub_check_cache(svc) {
+                    Ok(true) => {
+                        // Cache hit — skip straight to indexing.
+                        self.state = State::NeedIndex;
+                        continue;
+                    }
+                    Ok(false) => {
+                        // Cache miss — build one chapter at a time.
+                        self.state = State::NeedCacheChapter;
+                        // Yield to scheduler so input can be polled
+                        // between chapters and a loading indicator
+                        // could be shown in the future.
+                    }
+                    Err(e) => {
+                        log::info!("reader: cache check failed: {}", e);
+                        self.error = Some(e);
+                        self.state = State::Error;
+                        ctx.mark_dirty(PAGE_REGION);
+                    }
+                },
+
+                State::NeedCacheChapter => match self.epub_cache_one_chapter(svc) {
+                    Ok(true) => {
+                        // More chapters — stay in NeedCacheChapter
+                        // but yield to scheduler between chapters.
+                    }
+                    Ok(false) => {
+                        // All chapters cached — proceed to indexing.
                         self.state = State::NeedIndex;
                         continue;
                     }
                     Err(e) => {
-                        log::info!("reader: cache build failed: {}", e);
+                        log::info!("reader: cache ch{} failed: {}", self.cache_chapter, e);
                         self.error = Some(e);
                         self.state = State::Error;
                         ctx.mark_dirty(PAGE_REGION);

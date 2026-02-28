@@ -1,6 +1,8 @@
 // XTEink X4 board support package
 //
 // ESP32C3, SSD1677 800x480 epaper, SD over shared SPI2.
+// DMA-backed SPI (GDMA CH0) — hardware pushes/pulls buffers over
+// SPI autonomously, freeing the CPU from FIFO babysitting.
 // RefCellDevice arbitrates bus (single threaded, no ISR access).
 //
 // Display BUSY (GPIO6) is no longer interrupt-driven here; esp-hal's
@@ -25,6 +27,7 @@ use esp_hal::{
     Blocking,
     analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation},
     delay::Delay,
+    dma::{DmaRxBuf, DmaTxBuf},
     gpio::{Event, Input, InputConfig, Io, Level, Output, OutputConfig, Pull},
     peripherals::{ADC1, GPIO0, GPIO1, GPIO2, Peripherals},
     spi,
@@ -35,7 +38,7 @@ use static_cell::StaticCell;
 
 use crate::kernel::wake;
 
-pub type SpiBus = spi::master::Spi<'static, Blocking>;
+pub type SpiBus = spi::master::SpiDmaBus<'static, Blocking>;
 pub type SharedSpiDevice = RefCellDevice<'static, SpiBus, Output<'static>, Delay>;
 pub type SdSpiDevice = RefCellDevice<'static, SpiBus, raw_gpio::RawOutputPin, Delay>;
 pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, Input<'static>>;
@@ -146,7 +149,7 @@ impl Board {
         }
     }
 
-    // 400kHz -> SD probe -> 20MHz
+    // 400kHz -> SD probe -> 20MHz, DMA-backed
     fn init_spi_peripherals(p: Peripherals) -> (DisplayHw, StorageHw) {
         let epd_cs = Output::new(p.GPIO21, Level::High, OutputConfig::default());
         let dc = Output::new(p.GPIO4, Level::High, OutputConfig::default());
@@ -163,17 +166,37 @@ impl Board {
 
         let slow_cfg = spi::master::Config::default().with_frequency(Rate::from_khz(400));
 
-        let mut spi_bus = spi::master::Spi::new(p.SPI2, slow_cfg)
+        let mut spi_raw = spi::master::Spi::new(p.SPI2, slow_cfg)
             .unwrap()
             .with_sck(p.GPIO8)
             .with_mosi(p.GPIO10)
             .with_miso(p.GPIO7);
 
-        // 80 clocks with CS high (SD spec init)
-        let _ = spi_bus.write(&[0xFF; 10]);
+        // 80 clocks with CS high (SD spec init) — done on raw SPI
+        // before DMA conversion since it's a one-shot init sequence.
+        let _ = spi_raw.write(&[0xFF; 10]);
 
-        let spi_ref: &'static RefCell<SpiBus> = SPI_BUS.init(RefCell::new(spi_bus));
+        // Allocate DMA descriptors and buffers (4096 bytes each
+        // direction).  Strip data is max 4000 bytes per SPI write;
+        // SD sectors are 512 bytes.  The macro creates static arrays
+        // so they live for 'static and satisfy DMA alignment.
+        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(4096);
+        let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
+        let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
 
+        // Convert to DMA-backed SPI bus.  The GDMA controller
+        // autonomously pushes/pulls memory buffers over SPI, freeing
+        // the CPU from babysitting the 64-byte SPI FIFO on every
+        // transfer.  SpiDmaBus implements SpiBus so RefCellDevice
+        // and everything above is unchanged.
+        let spi_dma_bus = spi_raw
+            .with_dma(p.DMA_CH0)
+            .with_buffers(dma_rx_buf, dma_tx_buf);
+
+        let spi_ref: &'static RefCell<SpiBus> = SPI_BUS.init(RefCell::new(spi_dma_bus));
+        info!("SPI bus: DMA enabled (CH0, 4096B TX+RX)");
+
+        // SD card init happens at 400kHz through the DMA bus
         let sd_spi = RefCellDevice::new(spi_ref, sd_cs, Delay::new()).unwrap();
         let sd = SdStorage::new(sd_spi);
 

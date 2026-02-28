@@ -143,6 +143,51 @@ where
         self.initial_refresh = false;
     }
 
+    /// Full refresh with input polling between strips.
+    ///
+    /// Identical to [`render_full`](Self::render_full) except that
+    /// `poll_input` is called after each strip is sent over SPI.
+    /// The 24-strip write sequence (12 strips × 2 RAM planes) takes
+    /// several milliseconds; polling between strips ensures button
+    /// presses during a GC refresh are captured and queued rather
+    /// than silently lost.
+    ///
+    /// `poll_input` should be cheap — just sample the hardware and
+    /// stash the event for later processing.  It must not trigger
+    /// rendering or access the SPI bus.
+    pub fn render_full_progressive<F, P>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: F,
+        mut poll_input: P,
+    ) where
+        F: Fn(&mut StripBuffer),
+        P: FnMut(),
+    {
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        delay.delay_millis(1);
+
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
+
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+                poll_input();
+            }
+        }
+
+        self.update_full();
+        self.initial_refresh = false;
+    }
+
     // partial refresh (DU waveform): BW only -> DU -> sync both planes
     #[allow(clippy::too_many_arguments)]
     pub fn render_partial<F>(
@@ -657,6 +702,52 @@ where
                 strip.begin_strip(self.rotation, i);
                 draw(strip);
                 self.send_data(strip.data());
+            }
+        }
+
+        self.update_full_async().await;
+        self.initial_refresh = false;
+    }
+
+    /// Full refresh with async busy-wait and input polling between
+    /// strips.
+    ///
+    /// Identical to [`render_full_async`](Self::render_full_async)
+    /// except `poll_input` is called after each strip is sent over
+    /// SPI.  The 24-strip write sequence (12 strips × 2 RAM planes)
+    /// takes several milliseconds; polling between strips ensures
+    /// button presses during a GC refresh are captured and queued
+    /// rather than silently lost.
+    ///
+    /// `poll_input` should be cheap — just sample the hardware and
+    /// stash the event.  It must not trigger rendering or access the
+    /// SPI bus.
+    pub async fn render_full_async_progressive<F, P>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: F,
+        mut poll_input: P,
+    ) where
+        F: Fn(&mut StripBuffer),
+        P: FnMut(),
+    {
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        delay.delay_millis(1);
+
+        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
+            self.send_command(ram_cmd);
+            delay.delay_millis(1);
+
+            for i in 0..STRIP_COUNT {
+                strip.begin_strip(self.rotation, i);
+                draw(strip);
+                self.send_data(strip.data());
+                poll_input();
             }
         }
 

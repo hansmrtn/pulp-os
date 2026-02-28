@@ -122,7 +122,7 @@ fn main() -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
-    esp_alloc::heap_allocator!(size: 256720);
+    esp_alloc::heap_allocator!(size: 246480);
 
     info!("booting...");
 
@@ -201,15 +201,17 @@ fn main() -> ! {
 
     home.on_enter(&mut launcher.ctx);
     update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
-    block_on(
-        board
-            .display
-            .epd
-            .render_full_async(&mut strip, &mut delay, |s| {
-                statusbar.draw(s).unwrap();
-                home.draw(s);
-            }),
-    );
+    block_on(board.display.epd.render_full_async_progressive(
+        &mut strip,
+        &mut delay,
+        |s| {
+            statusbar.draw(s).unwrap();
+            home.draw(s);
+        },
+        || {
+            let _ = input.poll();
+        },
+    ));
     // Boot render_full was done outside the scheduler; drain any
     // stale redraw that on_enter left behind so the first user
     // interaction doesn't trigger a redundant screen repaint.
@@ -480,7 +482,7 @@ fn main() -> ! {
                             // Explicit full refresh request — always honour it.
                             update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                             with_app!(active, home, files, reader, settings, |app| {
-                                block_on(board.display.epd.render_full_async(
+                                block_on(board.display.epd.render_full_async_progressive(
                                     &mut strip,
                                     &mut delay,
                                     |s| {
@@ -490,6 +492,9 @@ fn main() -> ! {
                                             quick_menu.draw(s);
                                         }
                                         bumps.draw(s);
+                                    },
+                                    || {
+                                        let _ = input.poll();
                                     },
                                 ));
                             });
@@ -506,7 +511,7 @@ fn main() -> ! {
                                 // clear accumulated ghosting artifacts.
                                 update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                                 with_app!(active, home, files, reader, settings, |app| {
-                                    block_on(board.display.epd.render_full_async(
+                                    block_on(board.display.epd.render_full_async_progressive(
                                         &mut strip,
                                         &mut delay,
                                         |s| {
@@ -516,6 +521,9 @@ fn main() -> ! {
                                                 quick_menu.draw(s);
                                             }
                                             bumps.draw(s);
+                                        },
+                                        || {
+                                            let _ = input.poll();
                                         },
                                     ));
                                 });
@@ -565,7 +573,7 @@ fn main() -> ! {
                                     // First refresh must be full GC
                                     update_statusbar(&mut statusbar, cached_battery_mv, sd_ok);
                                     with_app!(active, home, files, reader, settings, |app| {
-                                        block_on(board.display.epd.render_full_async(
+                                        block_on(board.display.epd.render_full_async_progressive(
                                             &mut strip,
                                             &mut delay,
                                             |s| {
@@ -575,6 +583,9 @@ fn main() -> ! {
                                                     quick_menu.draw(s);
                                                 }
                                                 bumps.draw(s);
+                                            },
+                                            || {
+                                                let _ = input.poll();
                                             },
                                         ));
                                     });
