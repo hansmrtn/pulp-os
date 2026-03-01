@@ -21,21 +21,6 @@ impl<const N: usize> StackFmt<N> {
     }
 
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -68,18 +53,8 @@ impl<'a> BorrowedFmt<'a> {
     }
 
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.pos]
-    }
-
-    #[inline]
     pub fn len(&self) -> usize {
         self.pos
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.pos == 0
     }
 }
 

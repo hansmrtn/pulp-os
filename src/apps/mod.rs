@@ -180,26 +180,8 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::file_size(self.sd, name)
     }
 
-    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        storage::write_file(self.sd, name, data)
-    }
-
     pub fn save_title(&self, filename: &str, title: &str) -> Result<(), &'static str> {
         storage::save_title(self.sd, filename, title)
-    }
-
-    // subdirectory ops (EPUB chapter cache)
-
-    pub fn ensure_dir(&self, name: &str) -> Result<(), &'static str> {
-        storage::ensure_dir(self.sd, name)
-    }
-
-    pub fn write_in_dir(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        storage::write_file_in_dir(self.sd, dir, name, data)
-    }
-
-    pub fn append_in_dir(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        storage::append_file_in_dir(self.sd, dir, name, data)
     }
 
     pub fn read_chunk_in_dir(
@@ -210,14 +192,6 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         buf: &mut [u8],
     ) -> Result<usize, &'static str> {
         storage::read_file_chunk_in_dir(self.sd, dir, name, offset, buf)
-    }
-
-    pub fn file_size_in_dir(&self, dir: &str, name: &str) -> Result<u32, &'static str> {
-        storage::file_size_in_dir(self.sd, dir, name)
-    }
-
-    pub fn delete_in_dir(&self, dir: &str, name: &str) -> Result<(), &'static str> {
-        storage::delete_file_in_dir(self.sd, dir, name)
     }
 
     // _PULP app-data directory

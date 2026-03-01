@@ -58,7 +58,7 @@ pub struct DirPage {
     pub count: usize,
 }
 
-pub const MAX_DIR_ENTRIES: usize = 128;
+const MAX_DIR_ENTRIES: usize = 128;
 
 // with_dir!: open volume -> root, optionally descend 1 or 2 subdirs
 macro_rules! with_dir {

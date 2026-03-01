@@ -5,7 +5,7 @@
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
-use super::bitmap_label::BitmapDynLabel;
+use super::stack_fmt::StackFmt;
 use super::widget::{Alignment, Region, wrap_next, wrap_prev};
 use crate::board::action::Action;
 use crate::drivers::strip::StripBuffer;
@@ -318,8 +318,8 @@ impl QuickMenu {
         Region::new(OVERLAY_X + 12, below_last, OVERLAY_W - 24, HELP_H)
     }
 
-    fn format_value(&self, i: usize, buf: &mut BitmapDynLabel<20>) {
-        buf.clear_text();
+    fn format_value(&self, i: usize, buf: &mut StackFmt<20>) {
+        buf.clear();
         match &self.items[i].kind {
             MenuItemKind::AppCycle { value, options, .. } => {
                 let idx = *value as usize;
@@ -359,7 +359,7 @@ impl QuickMenu {
                 .unwrap();
         }
 
-        let mut val_buf = BitmapDynLabel::<20>::new(Region::new(0, 0, 1, 1), font);
+        let mut val_buf = StackFmt::<20>::new();
 
         for i in 0..self.count {
             let selected = i == self.selected;
@@ -399,7 +399,7 @@ impl QuickMenu {
             // draw value text
             if value_region.intersects(strip.logical_window()) {
                 self.format_value(i, &mut val_buf);
-                font.draw_aligned(strip, value_region, val_buf.text(), Alignment::Center, fg);
+                font.draw_aligned(strip, value_region, val_buf.as_str(), Alignment::Center, fg);
             }
         }
 

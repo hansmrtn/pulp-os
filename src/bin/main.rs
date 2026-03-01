@@ -44,8 +44,6 @@ use pulp_os::ui::{
 };
 use static_cell::StaticCell;
 
-extern crate alloc;
-
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // on_work cadence: lets multi-step ops (EPUB init, caching) progress between events
@@ -58,6 +56,21 @@ struct Apps {
     files: &'static mut FilesApp,
     reader: &'static mut ReaderApp,
     settings: &'static mut SettingsApp,
+}
+
+impl Apps {
+    fn propagate_fonts(&mut self, quick_menu: &mut QuickMenu, bumps: &mut ButtonFeedback) {
+        let ui_idx = self.settings.system_settings().ui_font_size_idx;
+        let book_idx = self.settings.system_settings().book_font_size_idx;
+        self.home.set_ui_font_size(ui_idx);
+        self.files.set_ui_font_size(ui_idx);
+        self.settings.set_ui_font_size(ui_idx);
+        self.reader.set_book_font_size(book_idx);
+        let chrome = fonts::chrome_font(ui_idx);
+        self.reader.set_chrome_font(chrome);
+        quick_menu.set_chrome_font(chrome);
+        bumps.set_chrome_font(chrome);
+    }
 }
 
 macro_rules! with_app {
@@ -86,21 +99,6 @@ macro_rules! with_app {
     };
 }
 
-macro_rules! propagate_font_settings {
-    ($apps:expr, $quick_menu:expr, $bumps:expr) => {{
-        let ui_idx = $apps.settings.system_settings().ui_font_size_idx;
-        let book_idx = $apps.settings.system_settings().book_font_size_idx;
-        $apps.home.set_ui_font_size(ui_idx);
-        $apps.files.set_ui_font_size(ui_idx);
-        $apps.settings.set_ui_font_size(ui_idx);
-        $apps.reader.set_book_font_size(book_idx);
-        let chrome = fonts::chrome_font(ui_idx);
-        $quick_menu.set_chrome_font(chrome);
-        $bumps.set_chrome_font(chrome);
-        $apps.reader.set_chrome_font(chrome);
-    }};
-}
-
 macro_rules! apply_transition {
     ($nav:expr, $launcher:expr, $apps:expr, $bm_cache:expr,
      $quick_menu:expr, $bumps:expr) => {{
@@ -124,7 +122,7 @@ macro_rules! apply_transition {
         }
 
         // propagate persisted prefs before lifecycle callbacks
-        propagate_font_settings!($apps, $quick_menu, $bumps);
+        $apps.propagate_fonts($quick_menu, $bumps);
 
         if nav.to != AppId::Upload {
             if nav.resume {
@@ -350,7 +348,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     {
         let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
         apps.settings.load_eager(&mut svc);
-        propagate_font_settings!(apps, quick_menu, bumps);
+        apps.propagate_fonts(quick_menu, bumps);
         apps.home.load_recent(&mut svc);
     }
 
