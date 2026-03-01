@@ -920,5 +920,3 @@ async fn render_screen(
             .await;
     }
 }
-
-// stack-based fmt helper

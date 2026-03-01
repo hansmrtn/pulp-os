@@ -17,6 +17,7 @@ use embedded_graphics::primitives::PrimitiveStyle;
 #[cfg(debug_assertions)]
 use embedded_graphics::text::Text;
 
+#[cfg(debug_assertions)]
 use super::stack_fmt::BorrowedFmt;
 use super::widget::Region;
 

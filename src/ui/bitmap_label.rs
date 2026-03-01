@@ -142,16 +142,7 @@ fn draw_bitmap_text(
         .into_styled(PrimitiveStyle::with_fill(bg))
         .draw(strip)?;
 
-    if text.is_empty() {
-        return Ok(());
-    }
-
-    let text_w = font.measure_str(text) as u32;
-    let text_h = font.line_height as u32;
-    let top_left = alignment.position(region, Size::new(text_w, text_h));
-    let baseline = top_left.y + font.ascent as i32;
-
-    font.draw_str_fg(strip, text, fg, top_left.x, baseline);
+    font.draw_aligned(strip, region, text, alignment, fg);
 
     Ok(())
 }

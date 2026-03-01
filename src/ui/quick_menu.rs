@@ -379,41 +379,27 @@ impl QuickMenu {
                 }
             }
 
+            let fg = if selected {
+                BinaryColor::Off
+            } else {
+                BinaryColor::On
+            };
+
             // draw label text
             if label_region.intersects(strip.logical_window()) {
-                let fg = if selected {
-                    BinaryColor::Off
-                } else {
-                    BinaryColor::On
-                };
-                let text = self.items[i].label;
-                if !text.is_empty() {
-                    let text_w = font.measure_str(text) as u32;
-                    let text_h = font.line_height as u32;
-                    let top_left =
-                        Alignment::CenterLeft.position(label_region, Size::new(text_w, text_h));
-                    let baseline = top_left.y + font.ascent as i32;
-                    font.draw_str_fg(strip, text, fg, top_left.x, baseline);
-                }
+                font.draw_aligned(
+                    strip,
+                    label_region,
+                    self.items[i].label,
+                    Alignment::CenterLeft,
+                    fg,
+                );
             }
 
             // draw value text
             if value_region.intersects(strip.logical_window()) {
                 self.format_value(i, &mut val_buf);
-                let vtext = val_buf.text();
-                if !vtext.is_empty() {
-                    let fg = if selected {
-                        BinaryColor::Off
-                    } else {
-                        BinaryColor::On
-                    };
-                    let text_w = font.measure_str(vtext) as u32;
-                    let text_h = font.line_height as u32;
-                    let top_left =
-                        Alignment::Center.position(value_region, Size::new(text_w, text_h));
-                    let baseline = top_left.y + font.ascent as i32;
-                    font.draw_str_fg(strip, vtext, fg, top_left.x, baseline);
-                }
+                font.draw_aligned(strip, value_region, val_buf.text(), Alignment::Center, fg);
             }
         }
 
@@ -425,11 +411,7 @@ impl QuickMenu {
 
         let help_region = self.help_region();
         if help_region.intersects(strip.logical_window()) {
-            let text_w = font.measure_str(help) as u32;
-            let text_h = font.line_height as u32;
-            let top_left = Alignment::Center.position(help_region, Size::new(text_w, text_h));
-            let baseline = top_left.y + font.ascent as i32;
-            font.draw_str_fg(strip, help, BinaryColor::On, top_left.x, baseline);
+            font.draw_aligned(strip, help_region, help, Alignment::Center, BinaryColor::On);
         }
     }
 }

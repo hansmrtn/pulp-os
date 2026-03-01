@@ -1,10 +1,7 @@
-// Unified no-alloc fmt::Write buffers.
-//
-// StackFmt<N>   – owns a [u8; N], replaces FmtBuf / BitmapDynLabel's inner buffer logic.
-// BorrowedFmt   – borrows &mut [u8], replaces StackWriter / BufWriter.
-// stack_fmt()   – convenience: format into a borrowed slice, return (len, &str).
+// No-alloc fmt::Write buffers.
+// StackFmt<N> owns a [u8; N]; BorrowedFmt wraps &mut [u8].
+// Both silently truncate on overflow.
 
-/// Owned fixed-size format buffer. Implements `fmt::Write`; silently truncates on overflow.
 pub struct StackFmt<const N: usize> {
     buf: [u8; N],
     len: usize,
@@ -20,7 +17,6 @@ impl<const N: usize> StackFmt<N> {
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        // all writes come from fmt::Write which only provides valid UTF-8
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 
@@ -55,7 +51,6 @@ impl<const N: usize> core::fmt::Write for StackFmt<N> {
     }
 }
 
-/// Borrowed format buffer. Wraps an external `&mut [u8]`; implements `fmt::Write`.
 pub struct BorrowedFmt<'a> {
     buf: &'a mut [u8],
     pos: usize,
@@ -99,13 +94,7 @@ impl core::fmt::Write for BorrowedFmt<'_> {
     }
 }
 
-/// Format into a borrowed buffer via a closure; returns the number of bytes written.
-///
-/// ```ignore
-/// let mut buf = [0u8; 64];
-/// let n = stack_fmt(&mut buf, |w| { let _ = write!(w, "hello {}", 42); });
-/// let msg = core::str::from_utf8(&buf[..n]).unwrap();
-/// ```
+// format into a borrowed slice via closure; returns bytes written
 #[inline]
 pub fn stack_fmt(buf: &mut [u8], f: impl FnOnce(&mut BorrowedFmt<'_>)) -> usize {
     let mut w = BorrowedFmt::new(buf);

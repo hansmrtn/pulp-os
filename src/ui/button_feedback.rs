@@ -4,7 +4,7 @@
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
-use super::widget::Region;
+use super::widget::{Alignment, Region};
 use crate::board::action::{Action, ButtonMapper};
 use crate::board::button::Button;
 use crate::drivers::strip::StripBuffer;
@@ -14,7 +14,7 @@ use crate::fonts::font_data;
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;
 
-/// Total height reserved at the bottom of the screen for button labels.
+// total height reserved at bottom of screen for button labels
 pub const BUTTON_BAR_H: u16 = TAB_H + BOTTOM_INSET;
 
 const RIDGE_W: u16 = 22;
@@ -171,15 +171,7 @@ impl ButtonFeedback {
                 continue;
             }
 
-            let text_w = font.measure_str(label) as i32;
-            let lh = font.line_height as i32;
-            let asc = font.ascent as i32;
-
-            let text_x = r.x as i32 + (r.w as i32 - text_w) / 2;
-            let text_top = r.y as i32 + (r.h as i32 - lh) / 2;
-            let baseline = text_top + asc;
-
-            font.draw_str_fg(strip, label, BinaryColor::On, text_x, baseline);
+            font.draw_aligned(strip, r, label, Alignment::Center, BinaryColor::On);
         }
     }
 }

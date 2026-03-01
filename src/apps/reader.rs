@@ -1507,8 +1507,6 @@ fn read_full<SPI: embedded_hal::spi::SpiDevice>(
     Ok(())
 }
 
-// tiny stack buffer for formatted text
-
 // draw text with bitmap font (FONT_6X13 fallback), clearing region background
 fn draw_chrome_text(
     strip: &mut StripBuffer,
@@ -1526,11 +1524,7 @@ fn draw_chrome_text(
         return;
     }
     if let Some(f) = font {
-        let tw = f.measure_str(text) as u32;
-        let th = f.line_height as u32;
-        let pos = align.position(region, Size::new(tw, th));
-        let baseline = pos.y + f.ascent as i32;
-        f.draw_str(strip, text, pos.x, baseline);
+        f.draw_aligned(strip, region, text, align, BinaryColor::On);
     } else {
         let tw = text.len() as u32 * 6;
         let pos = align.position(region, Size::new(tw, 13));
@@ -2398,11 +2392,13 @@ impl App for ReaderApp {
                     .unwrap();
                 let text = pbuf.as_str();
                 if let Some(f) = cf {
-                    let tw = f.measure_str(text) as u32;
-                    let th = f.line_height as u32;
-                    let pos = Alignment::Center.position(POSITION_OVERLAY, Size::new(tw, th));
-                    let baseline = pos.y + f.ascent as i32;
-                    f.draw_str_fg(strip, text, BinaryColor::Off, pos.x, baseline);
+                    f.draw_aligned(
+                        strip,
+                        POSITION_OVERLAY,
+                        text,
+                        Alignment::Center,
+                        BinaryColor::Off,
+                    );
                 } else {
                     let tw = text.len() as u32 * 6;
                     let pos = Alignment::Center.position(POSITION_OVERLAY, Size::new(tw, 13));

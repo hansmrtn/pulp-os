@@ -1,19 +1,16 @@
 // SD card file operations and directory cache.
-// DirCache reads all entries once into RAM, serves pages from there.
-// Subdirectory ops support the EPUB chapter cache pipeline.
+// with_dir! opens volume/root/subdirs; do_*! macros handle file ops.
+// DirCache reads root entries once into RAM, serves pages from there.
 
 use embedded_sdmmc::{Mode, VolumeIdx};
 
 use crate::drivers::sdcard::SdStorage;
 
-// all app data lives under this directory on the SD root
 pub const PULP_DIR: &str = "_PULP";
 
-// title index file inside _PULP; maps 8.3 filenames to parsed titles.
-// format: append-only lines of "FILENAME.EXT\tTitle Text\n".
+// title index: append-only lines of "FILENAME.EXT\tTitle Text\n"
 pub const TITLES_FILE: &str = "TITLES.BIN";
 
-// max length for a parsed display title
 pub const TITLE_CAP: usize = 48;
 
 #[derive(Clone, Copy)]
@@ -22,8 +19,7 @@ pub struct DirEntry {
     pub name_len: u8,
     pub is_dir: bool,
     pub size: u32,
-    // parsed display title (e.g. from EPUB OPF metadata).
-    // if title_len == 0, no parsed title is available.
+    // parsed display title from EPUB OPF metadata; empty = unavailable
     pub title: [u8; TITLE_CAP],
     pub title_len: u8,
 }
@@ -38,12 +34,10 @@ impl DirEntry {
         title_len: 0,
     };
 
-    // raw 8.3 filename
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
     }
 
-    // parsed title if available, otherwise the 8.3 filename
     pub fn display_name(&self) -> &str {
         if self.title_len > 0 {
             core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or(self.name_str())
@@ -52,7 +46,6 @@ impl DirEntry {
         }
     }
 
-    // set the parsed display title from a byte slice
     pub fn set_title(&mut self, s: &[u8]) {
         let n = s.len().min(TITLE_CAP);
         self.title[..n].copy_from_slice(&s[..n]);
@@ -66,6 +59,129 @@ pub struct DirPage {
 }
 
 pub const MAX_DIR_ENTRIES: usize = 128;
+
+// with_dir!: open volume -> root, optionally descend 1 or 2 subdirs
+macro_rules! with_dir {
+    // root only
+    ($sd:expr, |$dir:ident| $body:expr) => {{
+        let volume = $sd
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| "open volume failed")?;
+        let $dir = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+        $body
+    }};
+    // one subdirectory
+    ($sd:expr, $d1:expr, |$dir:ident| $body:expr) => {{
+        let volume = $sd
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| "open volume failed")?;
+        let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+        let $dir = root.open_dir($d1).map_err(|_| "open dir failed")?;
+        $body
+    }};
+    // two subdirectories
+    ($sd:expr, $d1:expr, $d2:expr, |$dir:ident| $body:expr) => {{
+        let volume = $sd
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| "open volume failed")?;
+        let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+        let mid = root.open_dir($d1).map_err(|_| "open dir failed")?;
+        let $dir = mid.open_dir($d2).map_err(|_| "open dir failed")?;
+        $body
+    }};
+}
+
+macro_rules! read_loop {
+    ($file:expr, $buf:expr) => {{
+        let mut total = 0usize;
+        while !$file.is_eof() && total < $buf.len() {
+            let n = $file.read(&mut $buf[total..]).map_err(|_| "read failed")?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        total
+    }};
+}
+
+macro_rules! write_flush {
+    ($file:expr, $data:expr) => {{
+        if !$data.is_empty() {
+            $file.write($data).map_err(|_| "write failed")?;
+        }
+        $file.flush().map_err(|_| "flush failed")?;
+    }};
+}
+
+macro_rules! do_read_chunk {
+    ($dir:expr, $name:expr, $offset:expr, $buf:expr) => {{
+        let file = $dir
+            .open_file_in_dir($name, Mode::ReadOnly)
+            .map_err(|_| "open file failed")?;
+        file.seek_from_start($offset).map_err(|_| "seek failed")?;
+        Ok(read_loop!(file, $buf))
+    }};
+}
+
+macro_rules! do_read_start {
+    ($dir:expr, $name:expr, $buf:expr) => {{
+        let file = $dir
+            .open_file_in_dir($name, Mode::ReadOnly)
+            .map_err(|_| "open file failed")?;
+        let size = file.length();
+        let n = read_loop!(file, $buf);
+        Ok((size, n))
+    }};
+}
+
+macro_rules! do_write {
+    ($dir:expr, $name:expr, $data:expr) => {{
+        let file = $dir
+            .open_file_in_dir($name, Mode::ReadWriteCreateOrTruncate)
+            .map_err(|_| "create file failed")?;
+        write_flush!(file, $data);
+        Ok(())
+    }};
+}
+
+macro_rules! do_append {
+    ($dir:expr, $name:expr, $data:expr) => {{
+        let file = $dir
+            .open_file_in_dir($name, Mode::ReadWriteCreateOrAppend)
+            .map_err(|_| "open file for append failed")?;
+        write_flush!(file, $data);
+        Ok(())
+    }};
+}
+
+macro_rules! do_file_size {
+    ($dir:expr, $name:expr) => {{
+        let file = $dir
+            .open_file_in_dir($name, Mode::ReadOnly)
+            .map_err(|_| "open file failed")?;
+        Ok(file.length())
+    }};
+}
+
+macro_rules! do_delete {
+    ($dir:expr, $name:expr) => {{
+        let _ = $dir.delete_file_in_dir($name);
+        Ok(())
+    }};
+}
+
+macro_rules! do_ensure_subdir {
+    ($dir:expr, $name:expr) => {{
+        if $dir.open_dir($name).is_err() {
+            $dir.make_dir_in_dir($name).map_err(|_| "make dir failed")?;
+        }
+        Ok(())
+    }};
+}
 
 pub struct DirCache {
     entries: [DirEntry; MAX_DIR_ENTRIES],
@@ -96,45 +212,42 @@ impl DirCache {
             return Ok(());
         }
 
-        let volume = sd
-            .volume_mgr
-            .open_volume(VolumeIdx(0))
-            .map_err(|_| "open volume failed")?;
-        let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+        // volume/root handles must be dropped before load_titles opens its own
+        with_dir!(sd, |root| {
+            let mut count = 0usize;
+            root.iterate_dir(|entry| {
+                if matches!(entry.name.base_name()[0], b'.' | b'_') {
+                    return;
+                }
+                if count < MAX_DIR_ENTRIES {
+                    let mut name_buf = [0u8; 13];
+                    let name_len = format_83_name(&entry.name, &mut name_buf);
+                    self.entries[count] = DirEntry {
+                        name: name_buf,
+                        name_len: name_len as u8,
+                        is_dir: entry.attributes.is_directory(),
+                        size: entry.size,
+                        title: [0u8; TITLE_CAP],
+                        title_len: 0,
+                    };
+                    count += 1;
+                }
+            })
+            .map_err(|_| "iterate dir failed")?;
 
-        let mut count = 0usize;
-        root.iterate_dir(|entry| {
-            if matches!(entry.name.base_name()[0], b'.' | b'_') {
-                return;
-            }
-            if count < MAX_DIR_ENTRIES {
-                let mut name_buf = [0u8; 13];
-                let name_len = format_83_name(&entry.name, &mut name_buf);
-                self.entries[count] = DirEntry {
-                    name: name_buf,
-                    name_len: name_len as u8,
-                    is_dir: entry.attributes.is_directory(),
-                    size: entry.size,
-                    title: [0u8; TITLE_CAP],
-                    title_len: 0,
-                };
-                count += 1;
-            }
-        })
-        .map_err(|_| "iterate dir failed")?;
+            self.count = count;
+            sort_entries(&mut self.entries[..count]);
+            self.valid = true;
+            Ok(())
+        })?;
 
-        self.count = count;
-        sort_entries(&mut self.entries[..count]);
-        self.valid = true;
-
-        // try to load parsed titles from _PULP/TITLES.BIN
         self.load_titles(sd);
 
         Ok(())
     }
 
-    // read _PULP/TITLES.BIN and apply parsed titles to matching entries.
-    // append-only: later lines override earlier ones for the same name.
+    // read _PULP/TITLES.BIN and apply parsed titles to matching entries;
+    // append-only so later lines override earlier ones for the same name
     fn load_titles<SPI>(&mut self, sd: &SdStorage<SPI>)
     where
         SPI: embedded_hal::spi::SpiDevice,
@@ -146,7 +259,7 @@ impl DirCache {
         loop {
             let space = buf.len() - leftover;
             if space == 0 {
-                // line longer than buffer — skip bytes until next newline
+                // line longer than buffer; skip to next newline
                 leftover = 0;
                 loop {
                     let n = match read_pulp_file_chunk(sd, TITLES_FILE, offset, &mut buf) {
@@ -158,7 +271,6 @@ impl DirCache {
                     }
                     offset += n as u32;
                     if let Some(nl) = buf[..n].iter().position(|&b| b == b'\n') {
-                        // found end of oversized line; keep bytes after newline
                         let rest = n - (nl + 1);
                         if rest > 0 {
                             buf.copy_within(nl + 1..n, 0);
@@ -175,7 +287,6 @@ impl DirCache {
                 Err(_) => break,
             };
             if n == 0 {
-                // process remaining leftover as final line
                 if leftover > 0 {
                     self.apply_title_line(&buf[..leftover]);
                 }
@@ -185,7 +296,6 @@ impl DirCache {
             offset += n as u32;
             let total = leftover + n;
 
-            // process complete lines
             let mut start = 0;
             for i in 0..total {
                 if buf[i] == b'\n' {
@@ -196,7 +306,6 @@ impl DirCache {
                 }
             }
 
-            // move leftover to front of buf
             if start < total {
                 buf.copy_within(start..total, 0);
                 leftover = total - start;
@@ -206,8 +315,7 @@ impl DirCache {
         }
     }
 
-    // parse a single title line ("FILENAME.EXT\tTitle Text") and apply to
-    // matching DirEntry; last-writer-wins for duplicate names
+    // parse "FILENAME.EXT\tTitle Text"; last-writer-wins for duplicate names
     fn apply_title_line(&mut self, line: &[u8]) {
         let tab_pos = match line.iter().position(|&b| b == b'\t') {
             Some(p) => p,
@@ -276,126 +384,6 @@ fn entry_gt(a: &DirEntry, b: &DirEntry) -> bool {
     an.len() > bn.len()
 }
 
-pub fn file_size<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<u32, &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let file = root
-        .open_file_in_dir(name, Mode::ReadOnly)
-        .map_err(|_| "open file failed")?;
-
-    Ok(file.length())
-}
-
-pub fn read_file_chunk<SPI>(
-    sd: &SdStorage<SPI>,
-    name: &str,
-    offset: u32,
-    buf: &mut [u8],
-) -> Result<usize, &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let file = root
-        .open_file_in_dir(name, Mode::ReadOnly)
-        .map_err(|_| "open file failed")?;
-
-    file.seek_from_start(offset).map_err(|_| "seek failed")?;
-
-    let mut total = 0;
-    while !file.is_eof() && total < buf.len() {
-        let n = file.read(&mut buf[total..]).map_err(|_| "read failed")?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-
-    Ok(total)
-}
-
-// open file, return (size, bytes_read) from offset 0
-pub fn read_file_start<SPI>(
-    sd: &SdStorage<SPI>,
-    name: &str,
-    buf: &mut [u8],
-) -> Result<(u32, usize), &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let file = root
-        .open_file_in_dir(name, Mode::ReadOnly)
-        .map_err(|_| "open file failed")?;
-
-    let file_size = file.length();
-
-    let mut total = 0;
-    while !file.is_eof() && total < buf.len() {
-        let n = file.read(&mut buf[total..]).map_err(|_| "read failed")?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-
-    Ok((file_size, total))
-}
-
-// open volume → root → subdir, execute body with the subdir handle
-macro_rules! with_subdir {
-    ($sd:expr, $dir:expr, |$sub:ident| $body:expr) => {{
-        let volume = $sd
-            .volume_mgr
-            .open_volume(VolumeIdx(0))
-            .map_err(|_| "open volume failed")?;
-        let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-        let $sub = root.open_dir($dir).map_err(|_| "open dir failed")?;
-        $body
-    }};
-}
-
-// open file inside a subdir, return (size, bytes_read) from offset 0
-pub fn read_file_start_in_dir<SPI>(
-    sd: &SdStorage<SPI>,
-    dir: &str,
-    name: &str,
-    buf: &mut [u8],
-) -> Result<(u32, usize), &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    with_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadOnly)
-            .map_err(|_| "open file failed")?;
-        let file_size = file.length();
-        let mut total = 0;
-        while !file.is_eof() && total < buf.len() {
-            let n = file.read(&mut buf[total..]).map_err(|_| "read failed")?;
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        Ok((file_size, total))
-    })
-}
-
 fn format_83_name(sfn: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> usize {
     let base = sfn.base_name();
     let ext = sfn.extension();
@@ -423,29 +411,46 @@ fn format_83_name(sfn: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> us
     pos
 }
 
+// root file operations
+
+pub fn file_size<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<u32, &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, |root| do_file_size!(root, name))
+}
+
+pub fn read_file_chunk<SPI>(
+    sd: &SdStorage<SPI>,
+    name: &str,
+    offset: u32,
+    buf: &mut [u8],
+) -> Result<usize, &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, |root| do_read_chunk!(root, name, offset, buf))
+}
+
+pub fn read_file_start<SPI>(
+    sd: &SdStorage<SPI>,
+    name: &str,
+    buf: &mut [u8],
+) -> Result<(u32, usize), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, |root| do_read_start!(root, name, buf))
+}
+
 pub fn write_file<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Result<(), &'static str>
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-
-    // ReadWriteCreateOrTruncate handles both creation and updates
-    let file = root
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| "open file for write failed")?;
-
-    file.write(data).map_err(|_| "write failed")?;
-    file.flush().map_err(|_| "flush failed")?;
-
-    Ok(())
+    with_dir!(sd, |root| do_write!(root, name, data))
 }
 
-// create (or truncate) a file in the SD root and write an initial chunk;
-// use append_root_file for subsequent chunks
+// create-or-truncate then write; use append_root_file for subsequent chunks
 pub fn create_or_truncate_root<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -457,8 +462,6 @@ where
     write_file(sd, name, data)
 }
 
-// append a chunk to an existing file in the SD root;
-// file must already exist (created via create_or_truncate_root)
 pub fn append_root_file<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -467,48 +470,18 @@ pub fn append_root_file<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-
-    let file = root
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
-        .map_err(|_| "open file for append failed")?;
-
-    if !data.is_empty() {
-        file.write(data).map_err(|_| "append write failed")?;
-    }
-    file.flush().map_err(|_| "append flush failed")?;
-
-    Ok(())
+    with_dir!(sd, |root| do_append!(root, name, data))
 }
 
-// subdirectory operations (EPUB chapter cache)
+// subdirectory operations
 
-// create dir in root if it doesn't already exist
 pub fn ensure_dir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-
-    // already exists; done
-    if root.open_dir(name).is_ok() {
-        return Ok(());
-    }
-
-    root.make_dir_in_dir(name).map_err(|_| "make dir failed")?;
-
-    Ok(())
+    with_dir!(sd, |root| do_ensure_subdir!(root, name))
 }
 
-// write (create-or-truncate) file inside a subdirectory of root
 pub fn write_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -518,19 +491,9 @@ pub fn write_file_in_dir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-            .map_err(|_| "create file in dir failed")?;
-        if !data.is_empty() {
-            file.write(data).map_err(|_| "write in dir failed")?;
-        }
-        file.flush().map_err(|_| "flush in dir failed")?;
-        Ok(())
-    })
+    with_dir!(sd, dir, |sub| do_write!(sub, name, data))
 }
 
-// append to file (or create) inside a subdirectory of root
 pub fn append_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -540,19 +503,9 @@ pub fn append_file_in_dir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
-            .map_err(|_| "open file for append failed")?;
-        if !data.is_empty() {
-            file.write(data).map_err(|_| "append write failed")?;
-        }
-        file.flush().map_err(|_| "append flush failed")?;
-        Ok(())
-    })
+    with_dir!(sd, dir, |sub| do_append!(sub, name, data))
 }
 
-// read chunk from file in subdir at offset
 pub fn read_file_chunk_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -563,27 +516,21 @@ pub fn read_file_chunk_in_dir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadOnly)
-            .map_err(|_| "open file in dir failed")?;
-        file.seek_from_start(offset)
-            .map_err(|_| "seek in dir failed")?;
-        let mut total = 0;
-        while !file.is_eof() && total < buf.len() {
-            let n = file
-                .read(&mut buf[total..])
-                .map_err(|_| "read in dir failed")?;
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        Ok(total)
-    })
+    with_dir!(sd, dir, |sub| do_read_chunk!(sub, name, offset, buf))
 }
 
-// file size in subdir; Err if not found
+pub fn read_file_start_in_dir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+    buf: &mut [u8],
+) -> Result<(u32, usize), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, dir, |sub| do_read_start!(sub, name, buf))
+}
+
 pub fn file_size_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -592,15 +539,9 @@ pub fn file_size_in_dir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadOnly)
-            .map_err(|_| "open file in dir for size failed")?;
-        Ok(file.length())
-    })
+    with_dir!(sd, dir, |sub| do_file_size!(sub, name))
 }
 
-// delete file in subdir; no-op if absent
 pub fn delete_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -609,15 +550,11 @@ pub fn delete_file_in_dir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_subdir!(sd, dir, |sub| {
-        let _ = sub.delete_file_in_dir(name);
-        Ok(())
-    })
+    with_dir!(sd, dir, |sub| do_delete!(sub, name))
 }
 
 // _PULP app-data directory
 
-// create _PULP in root if it doesn't already exist
 pub fn ensure_pulp_dir<SPI>(sd: &SdStorage<SPI>) -> Result<(), &'static str>
 where
     SPI: embedded_hal::spi::SpiDevice,
@@ -625,7 +562,6 @@ where
     ensure_dir(sd, PULP_DIR)
 }
 
-// write (create-or-truncate) file directly inside _PULP/
 pub fn write_pulp_file<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -637,7 +573,6 @@ where
     write_file_in_dir(sd, PULP_DIR, name, data)
 }
 
-// read chunk from file directly inside _PULP/
 pub fn read_pulp_file_chunk<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -650,7 +585,6 @@ where
     read_file_chunk_in_dir(sd, PULP_DIR, name, offset, buf)
 }
 
-// open file in _PULP/, return (size, bytes_read) from offset 0
 pub fn read_pulp_file_start<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -662,34 +596,15 @@ where
     read_file_start_in_dir(sd, PULP_DIR, name, buf)
 }
 
-// nested subdirectory operations (_PULP/<sub>/)
+// _PULP subdirectory operations
 
-// open _PULP/<dir>/ and execute body with the subdir handle
-macro_rules! with_pulp_subdir {
-    ($sd:expr, $dir:expr, |$sub:ident| $body:expr) => {{
-        with_subdir!($sd, PULP_DIR, |pulp| {
-            let $sub = pulp.open_dir($dir).map_err(|_| "open cache dir failed")?;
-            $body
-        })
-    }};
-}
-
-// create _PULP/<name>/ (ensures _PULP exists first)
 pub fn ensure_pulp_subdir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_subdir!(sd, PULP_DIR, |pulp| {
-        if pulp.open_dir(name).is_ok() {
-            return Ok(());
-        }
-        pulp.make_dir_in_dir(name)
-            .map_err(|_| "make subdir failed")?;
-        Ok(())
-    })
+    with_dir!(sd, PULP_DIR, |pulp| do_ensure_subdir!(pulp, name))
 }
 
-// write (create-or-truncate) file inside _PULP/<dir>/
 pub fn write_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -699,19 +614,9 @@ pub fn write_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_pulp_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-            .map_err(|_| "create file in dir failed")?;
-        if !data.is_empty() {
-            file.write(data).map_err(|_| "write in dir failed")?;
-        }
-        file.flush().map_err(|_| "flush in dir failed")?;
-        Ok(())
-    })
+    with_dir!(sd, PULP_DIR, dir, |sub| do_write!(sub, name, data))
 }
 
-// append to file (or create) inside _PULP/<dir>/
 pub fn append_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -721,19 +626,9 @@ pub fn append_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_pulp_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
-            .map_err(|_| "open file for append failed")?;
-        if !data.is_empty() {
-            file.write(data).map_err(|_| "append write failed")?;
-        }
-        file.flush().map_err(|_| "append flush failed")?;
-        Ok(())
-    })
+    with_dir!(sd, PULP_DIR, dir, |sub| do_append!(sub, name, data))
 }
 
-// read chunk from _PULP/<dir>/<name> at given offset
 pub fn read_chunk_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -744,27 +639,11 @@ pub fn read_chunk_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_pulp_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadOnly)
-            .map_err(|_| "open file in dir failed")?;
-        file.seek_from_start(offset)
-            .map_err(|_| "seek in dir failed")?;
-        let mut total = 0;
-        while !file.is_eof() && total < buf.len() {
-            let n = file
-                .read(&mut buf[total..])
-                .map_err(|_| "read in dir failed")?;
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        Ok(total)
-    })
+    with_dir!(sd, PULP_DIR, dir, |sub| do_read_chunk!(
+        sub, name, offset, buf
+    ))
 }
 
-// file size inside _PULP/<dir>/<name>; Err if not found
 pub fn file_size_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -773,15 +652,21 @@ pub fn file_size_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    with_pulp_subdir!(sd, dir, |sub| {
-        let file = sub
-            .open_file_in_dir(name, Mode::ReadOnly)
-            .map_err(|_| "open file for size failed")?;
-        Ok(file.length())
-    })
+    with_dir!(sd, PULP_DIR, dir, |sub| do_file_size!(sub, name))
 }
 
-// append a title mapping line to _PULP/TITLES.BIN; format: "FILENAME.EXT\tTitle Text\n"
+pub fn delete_in_pulp_subdir<SPI>(
+    sd: &SdStorage<SPI>,
+    dir: &str,
+    name: &str,
+) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, PULP_DIR, dir, |sub| do_delete!(sub, name))
+}
+
+// append title mapping line to _PULP/TITLES.BIN
 pub fn save_title<SPI>(sd: &SdStorage<SPI>, filename: &str, title: &str) -> Result<(), &'static str>
 where
     SPI: embedded_hal::spi::SpiDevice,
@@ -800,27 +685,5 @@ where
         .copy_from_slice(&title_bytes[..title_len]);
     line[name_bytes.len() + 1 + title_len] = b'\n';
 
-    append_in_pulp_dir(sd, TITLES_FILE, &line[..line_len])
-}
-
-// append data to a file inside _PULP/ (creates if it doesn't exist)
-fn append_in_pulp_dir<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Result<(), &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    append_file_in_dir(sd, PULP_DIR, name, data)
-}
-
-pub fn delete_in_pulp_subdir<SPI>(
-    sd: &SdStorage<SPI>,
-    dir: &str,
-    name: &str,
-) -> Result<(), &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    with_pulp_subdir!(sd, dir, |sub| {
-        let _ = sub.delete_file_in_dir(name);
-        Ok(())
-    })
+    append_file_in_dir(sd, PULP_DIR, TITLES_FILE, &line[..line_len])
 }

@@ -53,24 +53,30 @@ const TICK_MS: u64 = 10;
 
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
 
+struct Apps {
+    home: &'static mut HomeApp,
+    files: &'static mut FilesApp,
+    reader: &'static mut ReaderApp,
+    settings: &'static mut SettingsApp,
+}
+
 macro_rules! with_app {
-    ($id:expr, $home:expr, $files:expr, $reader:expr, $settings:expr,
-     |$app:ident| $body:expr) => {
+    ($id:expr, $apps:expr, |$app:ident| $body:expr) => {
         match $id {
             AppId::Home => {
-                let $app = &mut *$home;
+                let $app = &mut *$apps.home;
                 $body
             }
             AppId::Files => {
-                let $app = &mut *$files;
+                let $app = &mut *$apps.files;
                 $body
             }
             AppId::Reader => {
-                let $app = &mut *$reader;
+                let $app = &mut *$apps.reader;
                 $body
             }
             AppId::Settings => {
-                let $app = &mut *$settings;
+                let $app = &mut *$apps.settings;
                 $body
             }
             AppId::Upload => {
@@ -81,54 +87,52 @@ macro_rules! with_app {
 }
 
 macro_rules! propagate_font_settings {
-    ($settings:expr, $home:expr, $files:expr, $reader:expr,
-     $quick_menu:expr, $bumps:expr) => {{
-        let ui_idx = $settings.system_settings().ui_font_size_idx;
-        let book_idx = $settings.system_settings().book_font_size_idx;
-        $home.set_ui_font_size(ui_idx);
-        $files.set_ui_font_size(ui_idx);
-        $settings.set_ui_font_size(ui_idx);
-        $reader.set_book_font_size(book_idx);
+    ($apps:expr, $quick_menu:expr, $bumps:expr) => {{
+        let ui_idx = $apps.settings.system_settings().ui_font_size_idx;
+        let book_idx = $apps.settings.system_settings().book_font_size_idx;
+        $apps.home.set_ui_font_size(ui_idx);
+        $apps.files.set_ui_font_size(ui_idx);
+        $apps.settings.set_ui_font_size(ui_idx);
+        $apps.reader.set_book_font_size(book_idx);
         let chrome = fonts::chrome_font(ui_idx);
         $quick_menu.set_chrome_font(chrome);
         $bumps.set_chrome_font(chrome);
-        $reader.set_chrome_font(chrome);
+        $apps.reader.set_chrome_font(chrome);
     }};
 }
 
 macro_rules! apply_transition {
-    ($nav:expr, $launcher:expr, $home:expr, $files:expr,
-     $reader:expr, $settings:expr, $bm_cache:expr,
+    ($nav:expr, $launcher:expr, $apps:expr, $bm_cache:expr,
      $quick_menu:expr, $bumps:expr) => {{
         let nav = $nav;
         info!("app: {:?} -> {:?}", nav.from, nav.to);
 
         if nav.from == AppId::Reader {
-            $reader.save_position($bm_cache);
+            $apps.reader.save_position($bm_cache);
         }
 
         if nav.from != AppId::Upload {
             if nav.suspend {
-                with_app!(nav.from, $home, $files, $reader, $settings, |app| {
+                with_app!(nav.from, $apps, |app| {
                     app.on_suspend();
                 });
             } else {
-                with_app!(nav.from, $home, $files, $reader, $settings, |app| {
+                with_app!(nav.from, $apps, |app| {
                     app.on_exit();
                 });
             }
         }
 
         // propagate persisted prefs before lifecycle callbacks
-        propagate_font_settings!($settings, $home, $files, $reader, $quick_menu, $bumps);
+        propagate_font_settings!($apps, $quick_menu, $bumps);
 
         if nav.to != AppId::Upload {
             if nav.resume {
-                with_app!(nav.to, $home, $files, $reader, $settings, |app| {
+                with_app!(nav.to, $apps, |app| {
                     app.on_resume(&mut $launcher.ctx);
                 });
             } else {
-                with_app!(nav.to, $home, $files, $reader, $settings, |app| {
+                with_app!(nav.to, $apps, |app| {
                     app.on_enter(&mut $launcher.ctx);
                 });
             }
@@ -142,8 +146,7 @@ macro_rules! apply_transition {
 // non-trivial transitions (Back, Home) deferred until waveform ends.
 macro_rules! busy_wait_with_input {
     ($epd:expr, $mapper:expr,
-     $quick_menu:expr, $launcher:expr,
-     $home:expr, $files:expr, $reader:expr, $settings:expr,
+     $quick_menu:expr, $launcher:expr, $apps:expr,
      $dir_cache:expr, $bm_cache:expr, $sd:expr) => {{
         let mut _deferred: Option<Transition> = None;
         let mut _work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
@@ -172,8 +175,7 @@ macro_rules! busy_wait_with_input {
                     }
 
                     let active = $launcher.active();
-                    let t = with_app!(active, $home, $files, $reader, $settings, |app| app
-                        .on_event(event, &mut $launcher.ctx));
+                    let t = with_app!(active, $apps, |app| app.on_event(event, &mut $launcher.ctx));
                     if !matches!(t, Transition::None) && _deferred.is_none() {
                         _deferred = Some(t);
                     }
@@ -185,11 +187,10 @@ macro_rules! busy_wait_with_input {
 
             // pre-load next page while waveform runs
             let active = $launcher.active();
-            let needs = with_app!(active, $home, $files, $reader, $settings, |app| app
-                .needs_work());
+            let needs = with_app!(active, $apps, |app| app.needs_work());
             if needs {
                 let mut svc = Services::new($dir_cache, $bm_cache, &$sd);
-                with_app!(active, $home, $files, $reader, $settings, |app| app
+                with_app!(active, $apps, |app| app
                     .on_work(&mut svc, &mut $launcher.ctx));
             }
         }
@@ -235,6 +236,22 @@ macro_rules! enter_sleep {
         info!("mcu: entering deep sleep (power button to wake)");
         rtc.sleep_deep(&[&rtcio]);
     }};
+}
+
+// draw all layers for a strip: optional statusbar, active app, quick-menu overlay, button labels.
+macro_rules! draw_scene {
+    ($app:expr, $statusbar:expr, $quick_menu:expr, $bumps:expr, $draw_bar:expr) => {
+        |s: &mut StripBuffer| {
+            if $draw_bar {
+                $statusbar.draw(s).unwrap();
+            }
+            $app.draw(s);
+            if $quick_menu.open {
+                $quick_menu.draw(s);
+            }
+            $bumps.draw(s);
+        }
+    };
 }
 
 // heavy statics kept out of async future so Embassy's state machine stays ~200B.
@@ -313,10 +330,12 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut input = InputDriver::new(board.input);
     let mapper = ButtonMapper::new();
 
-    let home = HOME.init(HomeApp::new());
-    let files = FILES.init(FilesApp::new());
-    let reader = READER.as_static_mut();
-    let settings = SETTINGS.init(SettingsApp::new());
+    let mut apps = Apps {
+        home: HOME.init(HomeApp::new()),
+        files: FILES.init(FilesApp::new()),
+        reader: READER.as_static_mut(),
+        settings: SETTINGS.init(SettingsApp::new()),
+    };
 
     let launcher = LAUNCHER.as_static_mut();
     let quick_menu = QUICK_MENU.as_static_mut();
@@ -330,18 +349,18 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     // load settings + recent book before first render
     {
         let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
-        settings.load_eager(&mut svc);
-        propagate_font_settings!(settings, home, files, reader, quick_menu, bumps);
-        home.load_recent(&mut svc);
+        apps.settings.load_eager(&mut svc);
+        propagate_font_settings!(apps, quick_menu, bumps);
+        apps.home.load_recent(&mut svc);
     }
 
     // signal idle timeout after settings load so persisted value is used
-    tasks::set_idle_timeout(settings.system_settings().sleep_timeout);
+    tasks::set_idle_timeout(apps.settings.system_settings().sleep_timeout);
 
     let cached_battery_mv_init = battery::adc_to_battery_mv(input.read_battery_mv());
     update_statusbar(statusbar, cached_battery_mv_init, sd_ok);
 
-    home.on_enter(&mut launcher.ctx);
+    apps.home.on_enter(&mut launcher.ctx);
 
     // write both RAM planes, kick GC waveform, yield ~1.6s
     board
@@ -349,7 +368,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .epd
         .full_refresh_async(strip, &mut delay, &|s: &mut StripBuffer| {
             statusbar.draw(s).unwrap();
-            home.draw(s);
+            apps.home.draw(s);
         })
         .await;
 
@@ -383,17 +402,15 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 strip,
                 &mut delay,
                 &board.storage.sd,
-                settings.system_settings().ui_font_size_idx,
+                apps.settings.system_settings().ui_font_size_idx,
                 bumps,
-                settings.wifi_config(),
+                apps.settings.wifi_config(),
             )
             .await;
 
             // pop back and re-render
             if let Some(nav) = launcher.apply(Transition::Pop) {
-                apply_transition!(
-                    nav, launcher, home, files, reader, settings, bm_cache, quick_menu, bumps
-                );
+                apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
             }
             launcher.ctx.request_full_redraw();
             continue;
@@ -447,10 +464,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             sync_quick_menu(
                                 quick_menu,
                                 launcher.active(),
-                                home,
-                                files,
-                                reader,
-                                settings,
+                                &mut apps,
                                 &mut launcher.ctx,
                             );
                             launcher.ctx.mark_dirty(region);
@@ -459,10 +473,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             sync_quick_menu(
                                 quick_menu,
                                 launcher.active(),
-                                home,
-                                files,
-                                reader,
-                                settings,
+                                &mut apps,
                                 &mut launcher.ctx,
                             );
                             launcher.ctx.request_full_redraw();
@@ -471,37 +482,23 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             sync_quick_menu(
                                 quick_menu,
                                 launcher.active(),
-                                home,
-                                files,
-                                reader,
-                                settings,
+                                &mut apps,
                                 &mut launcher.ctx,
                             );
                             let transition = Transition::Home;
                             if let Some(nav) = launcher.apply(transition) {
-                                apply_transition!(
-                                    nav, launcher, home, files, reader, settings, bm_cache,
-                                    quick_menu, bumps
-                                );
+                                apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
                             }
                         }
                         QuickMenuResult::AppTrigger(id) => {
                             let active = launcher.active();
                             let region = quick_menu.region();
-                            sync_quick_menu(
-                                quick_menu,
-                                active,
-                                home,
-                                files,
-                                reader,
-                                settings,
-                                &mut launcher.ctx,
-                            );
-                            with_app!(active, home, files, reader, settings, |app| {
+                            sync_quick_menu(quick_menu, active, &mut apps, &mut launcher.ctx);
+                            with_app!(active, apps, |app| {
                                 app.on_quick_trigger(id, &mut launcher.ctx);
                             });
                             if active == AppId::Reader {
-                                reader.save_position(bm_cache);
+                                apps.reader.save_position(bm_cache);
                             }
                             launcher.ctx.mark_dirty(region);
                         }
@@ -511,23 +508,19 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             // menu toggle
             else if matches!(event, ActionEvent::Press(Action::Menu)) {
                 let active = launcher.active();
-                let actions: &[_] = with_app!(active, home, files, reader, settings, |app| {
-                    app.quick_actions()
-                });
+                let actions: &[_] = with_app!(active, apps, |app| app.quick_actions());
                 quick_menu.show(actions);
                 launcher.ctx.mark_dirty(quick_menu.region());
             }
             // app dispatch
             else {
                 let active = launcher.active();
-                let transition = with_app!(active, home, files, reader, settings, |app| {
+                let transition = with_app!(active, apps, |app| {
                     app.on_event(event, &mut launcher.ctx)
                 });
 
                 if let Some(nav) = launcher.apply(transition) {
-                    apply_transition!(
-                        nav, launcher, home, files, reader, settings, bm_cache, quick_menu, bumps
-                    );
+                    apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
                 }
             }
         }
@@ -540,12 +533,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         // 3. app work: one step per iteration; multi-step ops yield between SD reads
         {
             let active = launcher.active();
-            let needs = with_app!(active, home, files, reader, settings, |app| {
-                app.needs_work()
-            });
+            let needs = with_app!(active, apps, |app| app.needs_work());
             if needs {
                 let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
-                with_app!(active, home, files, reader, settings, |app| {
+                with_app!(active, apps, |app| {
                     app.on_work(&mut svc, &mut launcher.ctx);
                 });
             }
@@ -578,8 +569,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             update_statusbar(statusbar, cached_battery_mv, sd_ok);
 
             // re-sync idle timeout in case settings changed
-            if settings.is_loaded() {
-                tasks::set_idle_timeout(settings.system_settings().sleep_timeout);
+            if apps.settings.is_loaded() {
+                tasks::set_idle_timeout(apps.settings.system_settings().sleep_timeout);
             }
         }
 
@@ -598,8 +589,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         // try partial; fall through to full on ghost-clear, initial refresh, or explicit Full
         'render: {
             if let Redraw::Partial(r) = redraw {
-                let ghost_clear_every = if settings.is_loaded() {
-                    settings.system_settings().ghost_clear_every as u32
+                let ghost_clear_every = if apps.settings.is_loaded() {
+                    apps.settings.system_settings().ghost_clear_every as u32
                 } else {
                     DEFAULT_GHOST_CLEAR_EVERY
                 };
@@ -610,17 +601,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
                     // phase 1: write BW; if red_stale also write RED=!BW so DU drives all pixels
                     let active = launcher.active();
-                    let rs = with_app!(active, home, files, reader, settings, |app| {
-                        let draw = |s: &mut StripBuffer| {
-                            if render_bar_overlaps {
-                                statusbar.draw(s).unwrap();
-                            }
-                            app.draw(s);
-                            if quick_menu.open {
-                                quick_menu.draw(s);
-                            }
-                            bumps.draw(s);
-                        };
+                    let rs = with_app!(active, apps, |app| {
+                        let draw =
+                            draw_scene!(app, statusbar, quick_menu, bumps, render_bar_overlaps);
                         if red_stale {
                             board.display.epd.partial_phase1_bw_inv_red(
                                 strip, r.x, r.y, r.w, r.h, &mut delay, &draw,
@@ -643,10 +626,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             mapper,
                             quick_menu,
                             launcher,
-                            home,
-                            files,
-                            reader,
-                            settings,
+                            apps,
                             dir_cache,
                             bm_cache,
                             board.storage.sd
@@ -665,21 +645,15 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             // stable; sync planes, power off
                             red_stale = false;
                             let active = launcher.active();
-                            with_app!(active, home, files, reader, settings, |app| {
-                                board.display.epd.partial_phase3_sync(
-                                    strip,
-                                    &rs,
-                                    &|s: &mut StripBuffer| {
-                                        if render_bar_overlaps {
-                                            statusbar.draw(s).unwrap();
-                                        }
-                                        app.draw(s);
-                                        if quick_menu.open {
-                                            quick_menu.draw(s);
-                                        }
-                                        bumps.draw(s);
-                                    },
+                            with_app!(active, apps, |app| {
+                                let draw = draw_scene!(
+                                    app,
+                                    statusbar,
+                                    quick_menu,
+                                    bumps,
+                                    render_bar_overlaps
                                 );
+                                board.display.epd.partial_phase3_sync(strip, &rs, &draw);
                             });
                             partial_refreshes += 1;
                             board.display.epd.power_off_async().await;
@@ -689,10 +663,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                         if let Some(transition) = deferred
                             && let Some(nav) = launcher.apply(transition)
                         {
-                            apply_transition!(
-                                nav, launcher, home, files, reader, settings, bm_cache, quick_menu,
-                                bumps
-                            );
+                            apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
                         }
 
                         break 'render;
@@ -717,19 +688,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 update_statusbar(statusbar, cached_battery_mv, sd_ok);
 
                 let active = launcher.active();
-                with_app!(active, home, files, reader, settings, |app| {
-                    board.display.epd.write_full_frame(
-                        strip,
-                        &mut delay,
-                        &|s: &mut StripBuffer| {
-                            statusbar.draw(s).unwrap();
-                            app.draw(s);
-                            if quick_menu.open {
-                                quick_menu.draw(s);
-                            }
-                            bumps.draw(s);
-                        },
-                    );
+                with_app!(active, apps, |app| {
+                    let draw = draw_scene!(app, statusbar, quick_menu, bumps, true);
+                    board.display.epd.write_full_frame(strip, &mut delay, &draw);
                 });
 
                 board.display.epd.start_full_update();
@@ -740,10 +701,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     mapper,
                     quick_menu,
                     launcher,
-                    home,
-                    files,
-                    reader,
-                    settings,
+                    apps,
                     dir_cache,
                     bm_cache,
                     board.storage.sd
@@ -756,9 +714,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 if let Some(transition) = deferred
                     && let Some(nav) = launcher.apply(transition)
                 {
-                    apply_transition!(
-                        nav, launcher, home, files, reader, settings, bm_cache, quick_menu, bumps
-                    );
+                    apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
                 }
             }
         } // 'render
@@ -787,22 +743,14 @@ fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
 }
 
 // push quick-menu cycle changes into active app; persist settings-owned values
-fn sync_quick_menu(
-    qm: &QuickMenu,
-    active: AppId,
-    home: &mut HomeApp,
-    files: &mut FilesApp,
-    reader: &mut ReaderApp,
-    settings: &mut SettingsApp,
-    ctx: &mut AppContext,
-) {
+fn sync_quick_menu(qm: &QuickMenu, active: AppId, apps: &mut Apps, ctx: &mut AppContext) {
     for id in 0..MAX_APP_ACTIONS as u8 {
         if let Some(value) = qm.app_cycle_value(id) {
             match active {
-                AppId::Home => home.on_quick_cycle_update(id, value, ctx),
-                AppId::Files => files.on_quick_cycle_update(id, value, ctx),
-                AppId::Reader => reader.on_quick_cycle_update(id, value, ctx),
-                AppId::Settings => settings.on_quick_cycle_update(id, value, ctx),
+                AppId::Home => apps.home.on_quick_cycle_update(id, value, ctx),
+                AppId::Files => apps.files.on_quick_cycle_update(id, value, ctx),
+                AppId::Reader => apps.reader.on_quick_cycle_update(id, value, ctx),
+                AppId::Settings => apps.settings.on_quick_cycle_update(id, value, ctx),
                 AppId::Upload => {}
             }
         }
@@ -812,10 +760,10 @@ fn sync_quick_menu(
     if active == AppId::Reader
         && let Some(font_idx) = qm.app_cycle_value(1)
     {
-        let ss = settings.system_settings_mut();
+        let ss = apps.settings.system_settings_mut();
         if ss.book_font_size_idx != font_idx {
             ss.book_font_size_idx = font_idx;
-            settings.mark_save_needed();
+            apps.settings.mark_save_needed();
         }
     }
 }

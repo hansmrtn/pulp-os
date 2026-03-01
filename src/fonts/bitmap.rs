@@ -1,9 +1,11 @@
 // Pre-rasterised 1-bit bitmap font types.
 // Data in flash via &'static refs from build.rs. Packed MSB-first, row-major.
 
+use embedded_graphics_core::geometry::Size;
 use embedded_graphics_core::pixelcolor::BinaryColor;
 
 use crate::drivers::strip::StripBuffer;
+use crate::ui::{Alignment, Region};
 
 pub const FIRST_CHAR: u8 = 0x20;
 pub const LAST_CHAR: u8 = 0x7E;
@@ -119,6 +121,25 @@ impl BitmapFont {
             x += self.draw_char(strip, ch, x, baseline) as i32;
         }
         x
+    }
+
+    // measure, align, and draw text; does not clear background
+    pub fn draw_aligned(
+        &self,
+        strip: &mut StripBuffer,
+        region: Region,
+        text: &str,
+        alignment: Alignment,
+        fg: BinaryColor,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let text_w = self.measure_str(text) as u32;
+        let text_h = self.line_height as u32;
+        let top_left = alignment.position(region, Size::new(text_w, text_h));
+        let baseline = top_left.y + self.ascent as i32;
+        self.draw_str_fg(strip, text, fg, top_left.x, baseline);
     }
 }
 
