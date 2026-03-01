@@ -1,81 +1,170 @@
-pulp-os
-=======
+ABOUT
+    pulp-os - bare-metal e-reader firmware for the XTEink X4
 
-Bare-metal e-reader firmware for the XTEink X4 (ESP32-C3, SSD1677 e-paper).
-Written in Rust. No OS, no std, no framebuffer.
+    Embedded e-reader operating system targeting the XTEink X4 board
+    (ESP32-C3 + SSD1677 e-paper).  Written in Rust.  No OS, no std,
+    no framebuffer.  Async runtime provided by Embassy via esp-rtos.
 
 HARDWARE
---------
-  MCU      ESP32-C3, single-core RISC-V RV32IMC, up to 160 MHz
-  RAM      400 KB DRAM; ~250 KB available to the app
-  Display  800×480 SSD1677 monochrome e-paper (GDEQ0426T82)
-  Storage  MicroSD via SPI
-  Input    4 front buttons (dual ADC ladder) + 1 power button (GPIO IRQ)
-  Battery  Li-ion, read via ADC with 100K/100K divider
+    MCU         ESP32-C3, single-core RISC-V RV32IMC, 160 MHz
+    RAM         400 KB DRAM; 140 KB heap, rest for stack + radio
+    Display     800x480 SSD1677 mono e-paper, DMA-backed SPI, portrait
+    Storage     MicroSD over shared SPI bus (400 kHz probe, 20 MHz run)
+    Input       2 ADC ladders (GPIO1, GPIO2) + power button (GPIO3 IRQ)
+    Battery     Li-ion via ADC, 100K/100K divider on GPIO0
+
+    Pin map:
+      GPIO0   battery ADC          GPIO6   EPD BUSY
+      GPIO1   button row 1 ADC     GPIO7   SPI MISO
+      GPIO2   button row 2 ADC     GPIO8   SPI SCK
+      GPIO3   power button         GPIO10  SPI MOSI
+      GPIO4   EPD DC               GPIO12  SD CS (raw register GPIO)
+      GPIO5   EPD RST              GPIO21  EPD CS
 
 BUILDING
---------
-  Requires stable Rust and the riscv32imc-unknown-none-elf target.
-  rust-toolchain.toml handles both automatically.
+    Requires stable Rust >= 1.88 and the riscv32imc-unknown-none-elf
+    target.  rust-toolchain.toml handles both automatically.
 
-  cargo build --release
-
-  Flash with espflash or cargo-espflash:
-
-  cargo espflash flash --release --monitor
+        cargo build --release
+        cargo espflash flash --release --monitor
 
 FEATURES
---------
-  - Plain text (.txt) reader with lazy page indexing and read-ahead prefetch
-  - EPUB reader (ZIP + OPF + HTML strip + proportional font rendering)
-  - Bookmarks: position saved to BOOKMARKS on SD card on exit; restored on open
-  - Proportional bitmap fonts rasterised at build time from Bookerly TTFs
-  - Cooperative scheduler (High / Normal / Low priority job queues)
-  - Partial e-paper refresh for fast page turns; periodic full refresh for ghosting
-  - Persistent settings written to settings.bin on SD card
-
-SD CARD LAYOUT
---------------
-  /                 root — place .txt and .epub files here
-  /settings.bin     saved preferences (8 bytes, little-endian struct)
-  /BOOKMARKS        saved reading positions (32 slots × 12 bytes)
+    txt reader      lazy page-indexed, read-ahead prefetch
+    epub reader     ZIP/OPF/HTML-strip, chapter cache on SD,
+                    proportional fonts, inline PNG/JPEG (dithered 1-bit)
+    bookmarks       16-slot LRU in RAM, flushed to SD every 30s
+    wifi upload     HTTP file upload + mDNS (pulp.local)
+    fonts           regular/bold/italic TTFs rasterised at build time
+                    via fontdue; three sizes (small/medium/large)
+    display         partial DU refresh (~400 ms page turn),
+                    periodic full GC refresh (configurable interval)
+    quick menu      per-app actions + screen refresh + go home
+    status bar      battery, uptime, heap current/peak/total, stack HWM
+    settings        sleep timeout, contrast, ghost clear interval,
+                    book font size, UI font size
+    sleep           idle timeout + power long-press; EPD deep sleep
+                    (~3 uA) + ESP32-C3 deep sleep (~5 uA); GPIO3 wake
 
 CONTROLS
---------
-  Prev / Next       scroll selection or turn page
-  PrevJump / NextJump   page jump (files: full page; reader: ±10 pages or chapter)
-  Select            open highlighted item
-  Back              go back; long-press returns to home
-  Menu (Power)      open quick-action overlay
+    Prev / Next         scroll or turn page
+    PrevJump / NextJump page skip (files: full page; reader: chapter)
+    Select              open item
+    Back                go back; long-press goes home
+    Power (short)       open quick-action menu
+    Power (long)        deep sleep
+
+SD CARD LAYOUT
+    /                       root; place .txt and .epub files here
+    /_PULP/                 app data (created at boot)
+    /_PULP/SETTINGS.BIN     settings (8 bytes, repr(C), little-endian)
+    /_PULP/BKMK.BIN         bookmarks (16 slots x 48 bytes)
+    /_PULP/TITLES.BIN       title index (append-only, tab-separated)
+    /_PULP/RECENT.BIN       last opened filename
+    /_PULP/<hash>/          epub chapter cache directories
+
+    Settings record layout (offset : size : field):
+      0:2   sleep_timeout       minutes; 0 = never
+      2:1   contrast            SSD1677 VCOM
+      3:1   ghost_clear_every   partial refreshes before full GC
+      4:1   book_font_size_idx  0=S  1=M  2=L
+      5:1   ui_font_size_idx    0=S  1=M  2=L
+      6:2   reserved
+
+    Bookmark slot layout (48 bytes each):
+      0:4   name_hash       FNV-1a of filename
+      4:4   byte_offset     file/chapter position
+      8:2   chapter         epub chapter; 0 for txt
+     10:2   flags           bit 0 = valid
+     12:2   generation      LRU counter
+     14:1   name_len
+     15:1   pad
+     16:32  filename
 
 SOURCE LAYOUT
--------------
-  src/bin/main.rs       entry point, main loop, job dispatch
-  src/kernel/           scheduler and wake/ISR signalling
-  src/board/            SPI init, GPIO, display, SD card
-  src/drivers/          input debounce, storage helpers, battery ADC
-  src/fonts/            bitmap font structs and build-time glyph tables
-  src/formats/          ZIP, EPUB/OPF, XML scanner, HTML stripper
-  src/ui/               widget toolkit (Region, Button, Label, StatusBar)
-  src/apps/             Home, Files, Reader, Settings
-  build.rs              host-side TTF rasterisation via fontdue
+    src/
+      bin/main.rs           async entry point, event loop, rendering
+      lib.rs                crate root
+      kernel/
+        tasks.rs            spawned tasks (input, housekeeping, idle)
+        wake.rs             uptime helper
+      board/
+        mod.rs              SPI/DMA init, peripheral wiring
+        action.rs           semantic actions, button-to-action mapper
+        button.rs           button enum, ADC ladder decode
+        pins.rs             GPIO pin map (reference)
+        raw_gpio.rs         register-level GPIO for unmapped pins
+      drivers/
+        ssd1677.rs          e-paper controller driver
+        strip.rs            4 KB strip render buffer (no framebuffer)
+        input.rs            debounced ADC + GPIO input, long press, repeat
+        sdcard.rs           SD card over SPI, FAT volume manager
+        storage.rs          file ops, directory cache, _PULP helpers
+        battery.rs          ADC-to-mV, discharge curve LUT
+      fonts/
+        mod.rs              font selection, FontSet (regular/bold/italic)
+        bitmap.rs           1-bit glyph blit, string measurement
+      ui/
+        widget.rs           Region, Alignment, wrap helpers
+        bitmap_label.rs     proportional-font label widgets
+        statusbar.rs        top bar, stack painting, heap stats
+        quick_menu.rs       overlay menu (cycle + trigger actions)
+        button_feedback.rs  edge button labels
+      apps/
+        mod.rs              App trait, Launcher nav stack, Services
+        home.rs             launcher menu + bookmark browser
+        files.rs            paginated SD file browser
+        reader.rs           txt + epub reader
+        settings.rs         persistent settings editor
+        upload.rs           wifi HTTP upload server
+        bookmarks.rs        RAM-resident bookmark cache
+
+    smol-epub/              no_std epub parser crate
+      src/
+        zip.rs              ZIP central directory, streaming DEFLATE
+        xml.rs              minimal XML tag/attribute scanner
+        css.rs              CSS property parser
+        epub.rs             container.xml, OPF spine, NCX/NAV TOC
+        html_strip.rs       streaming HTML-to-styled-text converter
+        cache.rs            chapter decompress + strip pipeline
+        png.rs              PNG decoder, Floyd-Steinberg dither
+        jpeg.rs             JPEG decoder, Floyd-Steinberg dither
+
+    build.rs                TTF rasterisation, linker config
+    assets/fonts/           source TTFs (Regular, Bold, Italic)
+
+RUNTIME ARCHITECTURE
+    Embassy async executor on esp-rtos.  Four concurrent tasks:
+
+    main            event loop: input dispatch, app work, rendering
+    input_task      10 ms ADC poll, debounce, battery read (30 s)
+    housekeeping    status bar (5 s), SD check (30 s), bookmark flush (30 s)
+    idle_timeout    configurable idle timer, signals deep sleep
+
+    CPU sleeps (WFI) whenever all tasks are waiting.
 
 DESIGN NOTES
-------------
-  Jobs are signals, not data carriers. State lives in the subsystem that
-  handles the job; the scheduler carries only the job variant.
+    No dyn dispatch.  The with_app!() macro statically dispatches to
+    each concrete app struct.  No vtable, no heap indirection.
 
-  No dyn dispatch in the app framework. The with_app! macro statically
-  dispatches to each concrete app struct; no vtable, no heap indirection.
+    Apps never touch hardware.  All I/O goes through the Services
+    handle passed to on_work().  Clean syscall boundary.
 
-  Apps never touch hardware directly. All I/O goes through the Services
-  handle passed into on_work(). The kernel and apps are decoupled at a
-  clean syscall boundary.
+    Strip-buffered rendering.  The display is driven in 4 KB horizontal
+    strips (40 rows each, 12 strips total) instead of a 48 KB
+    framebuffer.  Widgets draw to logical coordinates; the strip
+    buffer handles rotation and clipping.
 
-  Partial refresh owns the render path. Apps call mark_dirty(region)
-  rather than requesting full redraws. A full GC refresh is forced
-  periodically (configurable) and on screen transitions.
+    Heavy statics in .bss.  Large structs (ReaderApp, StripBuffer,
+    BookmarkCache) are placed in static storage via ConstStaticCell
+    so the async future stays small (~200 B).
 
-  Stack allocation by default. The four app structs live on the stack in
-  main(). Heap is used only where size is unknown at compile time
-  (EPUB chapter text).
+    Partial refresh owns the render path.  Apps call mark_dirty(region)
+    for targeted updates.  Full GC refresh is forced periodically and
+    on screen transitions.  DU waveform runs concurrently with input
+    processing and page prefetch.
+
+    Heap is used only for EPUB chapter text and image decode buffers
+    (alloc::vec).  Everything else is stack or static.
+
+LICENSE
+    MIT
