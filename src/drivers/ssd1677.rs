@@ -1,8 +1,16 @@
 // SSD1677 e-paper driver (board-independent).
 // Tested on GDEQ0426T82 (800x480). No framebuffer; pixels streamed
-// through a 4KB StripBuffer. Partial refresh per GxEPD2 sequence:
-// BW-only write -> DU update -> sync both planes.
-// Async variants replace the blocking busy-wait with .await (WFI between polls).
+// through a 4KB StripBuffer.
+//
+// Partial refresh (3-phase):
+//   phase1_bw   -- write new content to BW RAM
+//   start_du    -- kick DU waveform; caller handles input while BUSY
+//   phase3_sync -- sync RED+BW; skipped on rapid nav (red_stale)
+//   power_off   -- shut down analog
+//
+// When phase3 is skipped, use phase1_bw_inv_red next: writes RED=!BW
+// so DU drives every pixel to the correct BW target without a full GC.
+// Async variants replace blocking busy-wait with .await.
 
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
@@ -144,6 +152,62 @@ where
                 }
             }
             self.send_data(strip.data());
+            y += rows;
+        }
+    }
+
+    // write BW normal + RED inverted; DU drives all pixels to BW target; corrects stale RED
+    #[allow(clippy::too_many_arguments)]
+    fn write_region_strips_bw_inv_red<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        px: u16,
+        py: u16,
+        pw: u16,
+        ph: u16,
+        draw: &F,
+        left_mask: u8,
+        right_mask: u8,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        let max_rows = StripBuffer::max_rows_for_width(pw);
+        let row_bytes = (pw / 8) as usize;
+        let needs_mask = left_mask != 0 || right_mask != 0;
+
+        let mut y = py;
+        while y < py + ph {
+            let rows = max_rows.min(py + ph - y);
+            strip.begin_window(self.rotation, px, y, pw, rows);
+            draw(strip);
+
+            if needs_mask && row_bytes > 0 {
+                for row in strip.data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+            }
+
+            // BW: normal
+            self.set_partial_ram_area(px, y, pw, rows);
+            self.send_command(cmd::WRITE_RAM_BW);
+            self.send_data(strip.data());
+
+            // RED: inverted; forces all pixels into DU diff
+            for byte in strip.data_mut().iter_mut() {
+                *byte = !*byte;
+            }
+            // re-apply edge masks
+            if needs_mask && row_bytes > 0 {
+                for row in strip.data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+            }
+            self.set_partial_ram_area(px, y, pw, rows);
+            self.send_command(cmd::WRITE_RAM_RED);
+            self.send_data(strip.data());
+
             y += rows;
         }
     }
@@ -296,6 +360,7 @@ where
 
     // split-phase partial refresh:
     // phase1_bw -> start_du -> (busy wait / input) -> phase3_sync -> power_off_async
+    // use phase1_bw_inv_red when red_stale (phase 3 was skipped last cycle)
 
     // write new content to BW RAM; returns None on degenerate region or initial_refresh set
     #[allow(clippy::too_many_arguments)]
@@ -347,6 +412,57 @@ where
             left_mask,
             right_mask,
         );
+
+        Some(RenderState {
+            px,
+            py,
+            pw,
+            ph,
+            left_mask,
+            right_mask,
+        })
+    }
+
+    // write BW + inverted RED; use after skipped phase 3 to fix stale RED
+    #[allow(clippy::too_many_arguments)]
+    pub fn partial_phase1_bw_inv_red<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        delay: &mut Delay,
+        draw: &F,
+    ) -> Option<RenderState>
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        if self.initial_refresh {
+            return None;
+        }
+
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
+
+        let px = (tx & !7).min(WIDTH);
+        let py = ty.min(HEIGHT);
+        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
+        let ph = th.min(HEIGHT - py);
+
+        if pw == 0 || ph == 0 {
+            return None;
+        }
+
+        let lp = (tx - px) as u32;
+        let rp = ((px + pw) - (tx + tw)) as u32;
+        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
+        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
+
+        self.write_region_strips_bw_inv_red(strip, px, py, pw, ph, draw, left_mask, right_mask);
 
         Some(RenderState {
             px,

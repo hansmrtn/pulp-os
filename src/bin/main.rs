@@ -51,7 +51,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // on_work cadence: lets multi-step ops (EPUB init, caching) progress between events
 const TICK_MS: u64 = 10;
 
-const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
+const DEFAULT_GHOST_CLEAR_EVERY: u32 = 6;
 
 macro_rules! with_app {
     ($id:expr, $home:expr, $files:expr, $reader:expr, $settings:expr,
@@ -335,6 +335,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     let mut partial_refreshes: u32 = 0;
     let mut cached_battery_mv: u16 = cached_battery_mv_init;
+    let mut red_stale: bool = false;
     #[allow(unused_assignments)]
     let mut render_bar_overlaps: bool = false;
 
@@ -645,27 +646,29 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     let r = r.align8();
                     render_bar_overlaps = r.y < BAR_HEIGHT;
 
-                    // phase 1: write new content to BW RAM
+                    // phase 1: write BW; if red_stale also write RED=!BW so DU drives all pixels
                     let active = launcher.active();
                     let rs = with_app!(active, home, files, reader, settings, |app| {
-                        board.display.epd.partial_phase1_bw(
-                            strip,
-                            r.x,
-                            r.y,
-                            r.w,
-                            r.h,
-                            &mut delay,
-                            &|s: &mut StripBuffer| {
-                                if render_bar_overlaps {
-                                    statusbar.draw(s).unwrap();
-                                }
-                                app.draw(s);
-                                if quick_menu.open {
-                                    quick_menu.draw(s);
-                                }
-                                bumps.draw(s);
-                            },
-                        )
+                        let draw = |s: &mut StripBuffer| {
+                            if render_bar_overlaps {
+                                statusbar.draw(s).unwrap();
+                            }
+                            app.draw(s);
+                            if quick_menu.open {
+                                quick_menu.draw(s);
+                            }
+                            bumps.draw(s);
+                        };
+                        if red_stale {
+                            board.display.epd.partial_phase1_bw_inv_red(
+                                strip, r.x, r.y, r.w, r.h, &mut delay, &draw,
+                            )
+                        } else {
+                            board
+                                .display
+                                .epd
+                                .partial_phase1_bw(strip, r.x, r.y, r.w, r.h, &mut delay, &draw)
+                        }
                     });
 
                     if let Some(rs) = rs {
@@ -687,28 +690,38 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             board.storage.sd
                         );
 
-                        // phase 3: sync both RAM planes
-                        let active = launcher.active();
-                        with_app!(active, home, files, reader, settings, |app| {
-                            board.display.epd.partial_phase3_sync(
-                                strip,
-                                &rs,
-                                &|s: &mut StripBuffer| {
-                                    if render_bar_overlaps {
-                                        statusbar.draw(s).unwrap();
-                                    }
-                                    app.draw(s);
-                                    if quick_menu.open {
-                                        quick_menu.draw(s);
-                                    }
-                                    bumps.draw(s);
-                                },
-                            );
-                        });
-
-                        // phase 4: power off (~200ms)
-                        board.display.epd.power_off_async().await;
-                        partial_refreshes += 1;
+                        // phase 3: sync RED+BW; skip if content changed during DU (rapid nav).
+                        // draw() now produces the next page; writing it to both planes ghosts.
+                        // leave RED stale; next render uses inv-red to correct it.
+                        // merge region so the inv-red pass covers pixels this DU changed.
+                        if launcher.ctx.has_redraw() {
+                            // content changed; skip sync, mark region for inv-red pass
+                            launcher.ctx.mark_dirty(r);
+                            red_stale = true;
+                            partial_refreshes += 1;
+                        } else {
+                            // stable; sync planes, power off
+                            red_stale = false;
+                            let active = launcher.active();
+                            with_app!(active, home, files, reader, settings, |app| {
+                                board.display.epd.partial_phase3_sync(
+                                    strip,
+                                    &rs,
+                                    &|s: &mut StripBuffer| {
+                                        if render_bar_overlaps {
+                                            statusbar.draw(s).unwrap();
+                                        }
+                                        app.draw(s);
+                                        if quick_menu.open {
+                                            quick_menu.draw(s);
+                                        }
+                                        bumps.draw(s);
+                                    },
+                                );
+                            });
+                            partial_refreshes += 1;
+                            board.display.epd.power_off_async().await;
+                        }
 
                         // apply deferred transition from busy wait
                         if let Some(transition) = deferred
@@ -736,6 +749,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
             // full GC refresh: explicit Full, ghost-clear, or initial-refresh fallback
             if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
+                // ensure analog off; no-op normally, required after skipped power-off
+                board.display.epd.power_off_async().await;
+
                 update_statusbar(statusbar, cached_battery_mv, sd_ok);
 
                 let active = launcher.active();
@@ -773,6 +789,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
                 board.display.epd.finish_full_update();
                 partial_refreshes = 0;
+                red_stale = false;
 
                 if let Some(transition) = deferred
                     && let Some(nav) = launcher.apply(transition)
