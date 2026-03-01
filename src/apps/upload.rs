@@ -115,7 +115,7 @@ pub async fn run_upload_mode<SPI>(
             let _ = write!(w, "Connecting to '{}'...", SSID);
         });
         let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
-        render_screen(epd, strip, delay, heading, body, &[msg], None, bumps).await;
+        render_screen(epd, strip, delay, heading, body, &[msg], None, bumps, true).await;
     }
 
     let radio = match esp_radio::init() {
@@ -131,6 +131,7 @@ pub async fn run_upload_mode<SPI>(
                 &["Radio init failed!"],
                 Some("Press BACK to exit"),
                 bumps,
+                false,
             )
             .await;
             drain_until_back().await;
@@ -151,6 +152,7 @@ pub async fn run_upload_mode<SPI>(
                 &["WiFi init failed!"],
                 Some("Press BACK to exit"),
                 bumps,
+                false,
             )
             .await;
             drain_until_back().await;
@@ -173,6 +175,7 @@ pub async fn run_upload_mode<SPI>(
             &["WiFi config error!"],
             Some("Press BACK to exit"),
             bumps,
+            false,
         )
         .await;
         drain_until_back().await;
@@ -190,6 +193,7 @@ pub async fn run_upload_mode<SPI>(
             &["WiFi start failed!"],
             Some("Press BACK to exit"),
             bumps,
+            false,
         )
         .await;
         drain_until_back().await;
@@ -209,6 +213,7 @@ pub async fn run_upload_mode<SPI>(
             &["Connection failed!"],
             Some("Press BACK to exit"),
             bumps,
+            false,
         )
         .await;
         drain_until_back().await;
@@ -274,6 +279,7 @@ pub async fn run_upload_mode<SPI>(
         &["http://pulp.local/", ip_str],
         Some("Press BACK to exit"),
         bumps,
+        false,
     )
     .await;
 
@@ -840,6 +846,7 @@ async fn render_screen(
     lines: &[&str],
     footer: Option<&str>,
     bumps: &ButtonFeedback,
+    full_refresh: bool,
 ) {
     let heading_h = heading.line_height;
     let body_h = body.line_height;
@@ -859,7 +866,7 @@ async fn render_screen(
 
     let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
 
-    epd.full_refresh_async(strip, delay, &|s: &mut StripBuffer| {
+    let draw = |s: &mut StripBuffer| {
         BitmapLabel::new(heading_region, "Upload", heading)
             .alignment(Alignment::CenterLeft)
             .draw(s)
@@ -885,8 +892,14 @@ async fn render_screen(
         }
 
         bumps.draw(s);
-    })
-    .await;
+    };
+
+    if full_refresh {
+        epd.full_refresh_async(strip, delay, &draw).await;
+    } else {
+        epd.partial_refresh_async(strip, delay, 0, 0, SCREEN_W, SCREEN_H, &draw)
+            .await;
+    }
 }
 
 // stack-based fmt helper

@@ -626,6 +626,77 @@ where
         }
     }
 
+    // partial DU refresh in one await (~500ms); falls back to full GC on initial_refresh.
+    // runs phase1 (SPI writes), kicks DU, awaits BUSY low, then syncs both RAM planes.
+    pub async fn partial_refresh_async<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        if self.initial_refresh {
+            self.full_refresh_async(strip, delay, draw).await;
+            return;
+        }
+
+        if !self.init_done {
+            self.init_display(delay);
+        }
+
+        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
+
+        let px = (tx & !7).min(WIDTH);
+        let py = ty.min(HEIGHT);
+        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
+        let ph = th.min(HEIGHT - py);
+
+        if pw == 0 || ph == 0 {
+            return;
+        }
+
+        let lp = (tx - px) as u32;
+        let rp = ((px + pw) - (tx + tw)) as u32;
+        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
+        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
+
+        let rs = RenderState {
+            px,
+            py,
+            pw,
+            ph,
+            left_mask,
+            right_mask,
+        };
+
+        // phase 1: write BW RAM
+        self.write_region_strips(
+            strip,
+            px,
+            py,
+            pw,
+            ph,
+            cmd::WRITE_RAM_BW,
+            draw,
+            left_mask,
+            right_mask,
+        );
+
+        // phase 2: kick DU waveform and await completion
+        self.partial_start_du(&rs);
+        self.wait_busy_async().await;
+
+        // phase 3: sync both RAM planes
+        self.write_region_strips_dual(strip, px, py, pw, ph, draw, left_mask, right_mask);
+
+        self.power_off_async().await;
+    }
+
     // full GC refresh in one await (~1.6s); prefer split-phase in event loops
     pub async fn full_refresh_async<F>(
         &mut self,
