@@ -2027,16 +2027,6 @@ impl App for ReaderApp {
         }
     }
 
-    fn help_text(&self) -> &'static str {
-        if self.state == State::ShowToc {
-            "Prev/Next: move  Jump: select  Back: close"
-        } else if self.is_epub {
-            "Prev/Next: page  Jump: chapter  Menu: options"
-        } else {
-            "Prev/Next: page  Jump: +/-10  Menu: options"
-        }
-    }
-
     fn quick_actions(&self) -> &[QuickAction] {
         &self.qa_buf[..self.qa_count]
     }

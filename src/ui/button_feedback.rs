@@ -135,14 +135,6 @@ impl ButtonFeedback {
         self.font = Some(font);
     }
 
-    pub fn on_press(&mut self, _button: Button) -> Option<Region> {
-        None
-    }
-
-    pub fn on_release(&mut self) -> Option<Region> {
-        None
-    }
-
     // draw bottom-edge labels only; no side indicators or inversion
     pub fn draw(&self, strip: &mut StripBuffer) {
         let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);

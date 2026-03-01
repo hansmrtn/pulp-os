@@ -17,15 +17,6 @@ impl Region {
         Self { x, y, w, h }
     }
 
-    pub fn from_rect(rect: Rectangle) -> Self {
-        Self {
-            x: rect.top_left.x.max(0) as u16,
-            y: rect.top_left.y.max(0) as u16,
-            w: rect.size.width as u16,
-            h: rect.size.height as u16,
-        }
-    }
-
     pub fn to_rect(self) -> Rectangle {
         Rectangle::new(
             Point::new(self.x as i32, self.y as i32),
@@ -35,10 +26,6 @@ impl Region {
 
     pub fn top_left(self) -> Point {
         Point::new(self.x as i32, self.y as i32)
-    }
-
-    pub fn center(self) -> Point {
-        Point::new((self.x + self.w / 2) as i32, (self.y + self.h / 2) as i32)
     }
 
     pub fn align8(self) -> Self {
@@ -70,31 +57,6 @@ impl Region {
             && self.x + self.w > other.x
             && self.y < other.y + other.h
             && self.y + self.h > other.y
-    }
-
-    pub fn contains(self, point: Point) -> bool {
-        point.x >= self.x as i32
-            && point.x < (self.x + self.w) as i32
-            && point.y >= self.y as i32
-            && point.y < (self.y + self.h) as i32
-    }
-
-    pub fn inset(self, margin: u16) -> Self {
-        Self {
-            x: self.x + margin,
-            y: self.y + margin,
-            w: self.w.saturating_sub(margin * 2),
-            h: self.h.saturating_sub(margin * 2),
-        }
-    }
-
-    pub fn expand(self, margin: u16) -> Self {
-        Self {
-            x: self.x.saturating_sub(margin),
-            y: self.y.saturating_sub(margin),
-            w: self.w + margin * 2,
-            h: self.h + margin * 2,
-        }
     }
 }
 

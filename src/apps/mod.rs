@@ -264,10 +264,6 @@ pub trait App {
     }
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition;
 
-    fn help_text(&self) -> &'static str {
-        ""
-    }
-
     fn quick_actions(&self) -> &[QuickAction] {
         &[]
     }

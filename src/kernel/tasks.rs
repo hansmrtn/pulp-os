@@ -89,11 +89,6 @@ pub fn set_idle_timeout(minutes: u16) {
     IDLE_TIMEOUT_MINS.signal(minutes);
 }
 
-#[inline]
-pub fn reset_idle_timer() {
-    IDLE_RESET.signal(());
-}
-
 #[embassy_executor::task]
 pub async fn idle_timeout_task() -> ! {
     let mut timeout_mins = IDLE_TIMEOUT_MINS.wait().await;

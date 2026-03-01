@@ -22,7 +22,7 @@ pub fn body_font(idx: u8) -> &'static BitmapFont {
 
 // chrome font (button labels, quick-menu items, loading text, etc.);
 // always returns the small body font regardless of the size setting
-pub fn chrome_font(_idx: u8) -> &'static BitmapFont {
+pub fn chrome_font() -> &'static BitmapFont {
     body_font(0)
 }
 

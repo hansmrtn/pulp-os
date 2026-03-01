@@ -868,12 +868,7 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
                     last_was_space = false;
                     trailing_nl = 0;
                 }
-                DecodedInplace::Unicode => {
-                    buf[w] = b'?';
-                    w += 1;
-                    last_was_space = false;
-                    trailing_nl = 0;
-                }
+
                 DecodedInplace::None => {
                     buf[w] = b'&';
                     w += 1;
@@ -1067,12 +1062,9 @@ fn codepoint_to_byte(cp: u32) -> Option<u8> {
     }
 }
 
-// in-place entity decoding; separate from resolve_entity to preserve
-// existing stripper behaviour (DecodedInplace::Unicode vs Some(b'?'))
+// in-place entity decoding; separate from resolve_entity
 enum DecodedInplace {
     Byte(u8),
-    #[allow(dead_code)]
-    Unicode,
     None,
 }
 
@@ -1135,7 +1127,7 @@ fn codepoint_to_decoded_inplace(cp: u32) -> DecodedInplace {
         0x201C..=0x201E => DecodedInplace::Byte(b'"'),
         0x2022 => DecodedInplace::Byte(b'*'),
         0x2026 => DecodedInplace::Byte(b'.'),
-        _ => DecodedInplace::Unicode,
+        _ => DecodedInplace::Byte(b'?'),
     }
 }
 

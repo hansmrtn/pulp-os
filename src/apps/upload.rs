@@ -102,7 +102,7 @@ pub async fn run_upload_mode<SPI>(
     SPI: embedded_hal::spi::SpiDevice,
 {
     let heading = fonts::heading_font(ui_font_size_idx);
-    let body = fonts::chrome_font(ui_font_size_idx);
+    let body = fonts::chrome_font();
 
     if !wifi_cfg.has_credentials() {
         render_screen(
@@ -546,7 +546,7 @@ where
     info!("upload: receiving file '{}'", name_str);
 
     // create (or truncate) file on SD
-    storage::create_or_truncate_root(sd, name_str, &[])?;
+    storage::write_file(sd, name_str, &[])?;
 
     // phase B: stream file data to SD.
     // keep last end_marker.len() bytes unwritten (holdback) to detect

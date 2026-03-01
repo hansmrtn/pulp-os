@@ -16,6 +16,16 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
 pub use smol_epub::cache::fnv1a;
 
+// case-insensitive FNV-1a; FAT filenames are case-insensitive
+fn fnv1a_icase(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in data {
+        h ^= b.to_ascii_lowercase() as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
 pub const RECORD_LEN: usize = 48;
@@ -90,7 +100,8 @@ impl BookmarkSlot {
     }
 
     fn matches_name(&self, name: &[u8]) -> bool {
-        self.name_len as usize == name.len() && self.filename[..self.name_len as usize] == *name
+        self.name_len as usize == name.len()
+            && self.filename[..self.name_len as usize].eq_ignore_ascii_case(name)
     }
 }
 
@@ -184,7 +195,7 @@ impl BookmarkCache {
             return None;
         }
 
-        let key = fnv1a(filename);
+        let key = fnv1a_icase(filename);
         for i in 0..self.count {
             let slot = &self.slots[i];
             if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
@@ -245,7 +256,7 @@ impl BookmarkCache {
             return;
         }
 
-        let key = fnv1a(filename);
+        let key = fnv1a_icase(filename);
 
         // scan for: target slot, max generation, first free, LRU
         let mut max_gen: u16 = 0;

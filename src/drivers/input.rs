@@ -22,6 +22,7 @@ pub enum Event {
     Repeat(Button),
 }
 
+// max 2: one debounce cycle pushes at most Release(old) + Press(new)
 struct EventQueue {
     buf: [Option<Event>; 2],
 }
@@ -165,9 +166,5 @@ impl InputDriver {
             sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.battery)).unwrap() as u32;
         }
         (sum / ADC_OVERSAMPLE) as u16
-    }
-
-    pub fn is_debouncing(&self) -> bool {
-        self.candidate.is_some() && self.candidate != self.stable
     }
 }

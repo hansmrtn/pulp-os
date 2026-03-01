@@ -66,7 +66,7 @@ impl Apps {
         self.files.set_ui_font_size(ui_idx);
         self.settings.set_ui_font_size(ui_idx);
         self.reader.set_book_font_size(book_idx);
-        let chrome = fonts::chrome_font(ui_idx);
+        let chrome = fonts::chrome_font();
         self.reader.set_chrome_font(chrome);
         quick_menu.set_chrome_font(chrome);
         bumps.set_chrome_font(chrome);
@@ -139,6 +139,7 @@ macro_rules! apply_transition {
 }
 
 // busy-wait loop with input processing.
+// macro because it borrows multiple locals and .awaits inside the main async fn.
 // runs during full and partial waveforms; selects on BUSY pin, input channel,
 // and work ticker so page pre-loads happen concurrently.
 // non-trivial transitions (Back, Home) deferred until waveform ends.
@@ -263,6 +264,7 @@ impl<T> ConstStaticCell<T> {
     const fn new(val: T) -> Self {
         Self(core::cell::UnsafeCell::new(val))
     }
+    // safety: called once per static before task spawn; single-core, single-thread
     #[allow(clippy::mut_from_ref)]
     fn as_static_mut(&self) -> &'static mut T {
         unsafe { &mut *self.0.get() }
@@ -387,8 +389,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut partial_refreshes: u32 = 0;
     let mut cached_battery_mv: u16 = cached_battery_mv_init;
     let mut red_stale: bool = false;
-    #[allow(unused_assignments)]
-    let mut render_bar_overlaps: bool = false;
 
     loop {
         // 0. upload mode intercept: bypasses App trait, runs own async loop
@@ -422,21 +422,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
         // 2. input event
         if let Some(hw_event) = hw_event {
-            // button feedback (edge labels)
-            match hw_event {
-                pulp_os::drivers::input::Event::Press(btn) => {
-                    if let Some(r) = bumps.on_press(btn) {
-                        launcher.ctx.mark_dirty(r);
-                    }
-                }
-                pulp_os::drivers::input::Event::Release(_) => {
-                    if let Some(r) = bumps.on_release() {
-                        launcher.ctx.mark_dirty(r);
-                    }
-                }
-                _ => {}
-            }
-
             // power long-press: intercept before mapping so no app sees it
             if hw_event
                 == pulp_os::drivers::input::Event::LongPress(pulp_os::board::button::Button::Power)
@@ -595,7 +580,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
                 if partial_refreshes < ghost_clear_every {
                     let r = r.align8();
-                    render_bar_overlaps = r.y < BAR_HEIGHT;
+                    let render_bar_overlaps = r.y < BAR_HEIGHT;
 
                     // phase 1: write BW; if red_stale also write RED=!BW so DU drives all pixels
                     let active = launcher.active();
@@ -740,7 +725,8 @@ fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
     });
 }
 
-// push quick-menu cycle changes into active app; persist settings-owned values
+// push quick-menu cycle changes into active app; persist settings-owned values.
+// hand-written match (not with_app!) because we also borrow apps.settings below.
 fn sync_quick_menu(qm: &QuickMenu, active: AppId, apps: &mut Apps, ctx: &mut AppContext) {
     for id in 0..MAX_APP_ACTIONS as u8 {
         if let Some(value) = qm.app_cycle_value(id) {

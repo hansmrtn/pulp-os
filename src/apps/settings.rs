@@ -7,9 +7,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::ui::{
-    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region, wrap_next, wrap_prev,
-};
+use crate::ui::{Alignment, BitmapLabel, CONTENT_TOP, Region, StackFmt, wrap_next, wrap_prev};
 
 const ROW_H: u16 = 40;
 const ROW_GAP: u16 = 6;
@@ -354,8 +352,8 @@ impl SettingsApp {
         }
     }
 
-    fn format_value<const N: usize>(&self, i: usize, buf: &mut BitmapDynLabel<N>) {
-        buf.clear_text();
+    fn format_value(&self, i: usize, buf: &mut StackFmt<20>) {
+        buf.clear();
         match i {
             0 => {
                 if self.settings.sleep_timeout == 0 {
@@ -521,10 +519,6 @@ impl App for SettingsApp {
         }
     }
 
-    fn help_text(&self) -> &'static str {
-        "Prev/Next: select  Jump: adjust  Back: exit"
-    }
-
     fn needs_work(&self) -> bool {
         !self.loaded || self.save_needed
     }
@@ -561,7 +555,7 @@ impl App for SettingsApp {
             return;
         }
 
-        let mut val_buf = BitmapDynLabel::<20>::new(Region::new(0, 0, 1, 1), self.body_font);
+        let mut val_buf = StackFmt::<20>::new();
 
         for i in 0..NUM_ITEMS {
             let selected = i == self.selected;
@@ -573,7 +567,7 @@ impl App for SettingsApp {
                 .unwrap();
 
             self.format_value(i, &mut val_buf);
-            BitmapLabel::new(self.value_region(i), val_buf.text(), self.body_font)
+            BitmapLabel::new(self.value_region(i), val_buf.as_str(), self.body_font)
                 .alignment(Alignment::Center)
                 .inverted(selected)
                 .draw(strip)

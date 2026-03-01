@@ -72,7 +72,7 @@ impl FilesApp {
         self.list_y = CONTENT_TOP + 8 + self.heading_font.line_height + HEADER_LIST_GAP;
     }
 
-    pub fn selected_entry(&self) -> Option<&DirEntry> {
+    fn selected_entry(&self) -> Option<&DirEntry> {
         if self.selected < self.count {
             Some(&self.entries[self.selected])
         } else {
@@ -166,10 +166,8 @@ impl FilesApp {
             self.scroll += PAGE_SIZE.min(remaining + self.count - 1);
             self.selected = 0;
             self.needs_load = true;
-        } else {
-            if self.count > 0 {
-                self.selected = self.count - 1;
-            }
+        } else if self.count > 0 {
+            self.selected = self.count - 1;
         }
     }
 }
@@ -271,10 +269,6 @@ impl App for FilesApp {
 
             _ => Transition::None,
         }
-    }
-
-    fn help_text(&self) -> &'static str {
-        "Prev/Next: scroll  Jump: page  Sel: open  Back: exit"
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

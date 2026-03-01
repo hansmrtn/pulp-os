@@ -265,13 +265,6 @@ impl App for HomeApp {
         }
     }
 
-    fn help_text(&self) -> &'static str {
-        match self.state {
-            HomeState::Menu => "Prev/Next: select    Confirm: open",
-            HomeState::ShowBookmarks => "Prev/Next: scroll  Sel: open  Back: menu",
-        }
-    }
-
     fn draw(&self, strip: &mut StripBuffer) {
         match self.state {
             HomeState::Menu => self.draw_menu(strip),

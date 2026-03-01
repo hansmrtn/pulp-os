@@ -139,14 +139,6 @@ fn generate_bitmap_fonts() {
 
     let has_regular = regular.is_some();
     writeln!(out, "pub const HAS_REGULAR: bool = {};", has_regular).unwrap();
-    for (_px, suffix) in &BODY_SIZES {
-        writeln!(
-            out,
-            "pub const HAS_REGULAR_{suffix}: bool = {};",
-            has_regular
-        )
-        .unwrap();
-    }
     writeln!(out).unwrap();
 
     // regular
@@ -267,7 +259,6 @@ fn find_ttf(dir: &Path, keywords: &[&str]) -> Option<PathBuf> {
     None
 }
 
-// rasterise ASCII glyphs and emit static Rust tables for one font + size
 fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
     // line metrics
     let lm = font
@@ -374,7 +365,6 @@ fn emit_font(out: &mut fs::File, font: &fontdue::Font, name: &str, px: f32) {
     writeln!(out).unwrap();
 }
 
-// emit a zero-width stub BitmapFont for a missing font file
 fn emit_stub(out: &mut fs::File, name: &str) {
     writeln!(
         out,

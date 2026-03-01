@@ -94,6 +94,8 @@ macro_rules! with_dir {
     }};
 }
 
+// inner-op macros; always invoked inside with_dir!
+
 macro_rules! read_loop {
     ($file:expr, $buf:expr) => {{
         let mut total = 0usize;
@@ -448,18 +450,6 @@ where
     SPI: embedded_hal::spi::SpiDevice,
 {
     with_dir!(sd, |root| do_write!(root, name, data))
-}
-
-// create-or-truncate then write; use append_root_file for subsequent chunks
-pub fn create_or_truncate_root<SPI>(
-    sd: &SdStorage<SPI>,
-    name: &str,
-    data: &[u8],
-) -> Result<(), &'static str>
-where
-    SPI: embedded_hal::spi::SpiDevice,
-{
-    write_file(sd, name, data)
 }
 
 pub fn append_root_file<SPI>(

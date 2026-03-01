@@ -1,10 +1,8 @@
 // XTEink X4 board support (ESP32-C3, SSD1677 800x480, SD over SPI2).
 // DMA-backed SPI (GDMA CH0); RefCellDevice arbitrates bus.
-// BUSY (GPIO6) handled by esp-hal async Wait, not a pre-armed IRQ.
 
 pub mod action;
 pub mod button;
-pub mod pins;
 pub mod raw_gpio;
 
 pub use crate::drivers::sdcard::SdStorage;
@@ -36,10 +34,9 @@ pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, 
 
 static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 
-// ISR clears interrupt flag; InputDriver reads level via is_low()
+// ISR clears interrupt flag; any interrupt wakes the Embassy executor
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// GPIO3 only; BUSY handled by esp-hal async Wait; any IRQ exits WFI
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
