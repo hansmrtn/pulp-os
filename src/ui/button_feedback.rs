@@ -14,6 +14,9 @@ use crate::fonts::font_data;
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;
 
+/// Total height reserved at the bottom of the screen for button labels.
+pub const BUTTON_BAR_H: u16 = TAB_H + BOTTOM_INSET;
+
 const RIDGE_W: u16 = 22;
 const RIDGE_H: u16 = 36;
 

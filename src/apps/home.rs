@@ -15,7 +15,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
+use crate::ui::{Alignment, BUTTON_BAR_H, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 // menu layout constants
 const ITEM_W: u16 = 280;
@@ -29,7 +29,7 @@ const MAX_ITEMS: usize = 5;
 // bookmark list layout
 const BM_MARGIN: u16 = 8;
 const BM_HEADER_GAP: u16 = 4;
-const BM_BOTTOM: u16 = 790;
+const BM_BOTTOM: u16 = 800 - BUTTON_BAR_H;
 const SCREEN_W: u16 = 480;
 
 fn compute_item_regions(heading_line_h: u16) -> [Region; MAX_ITEMS] {

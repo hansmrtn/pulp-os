@@ -21,7 +21,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = 296; // reaches x = 472
 
-const NUM_ITEMS: usize = 5;
+const NUM_ITEMS: usize = 4;
 const HEADING_ITEMS_GAP: u16 = 8; // gap between heading bottom and first row
 
 // persistent settings
@@ -30,7 +30,6 @@ const SETTINGS_FILE: &str = "SETTINGS.TXT";
 #[derive(Clone, Copy)]
 pub struct SystemSettings {
     pub sleep_timeout: u16,     // minutes idle before sleep; 0 = never
-    pub contrast: u8,           // SSD1677 VCOM 0x2C; higher = darker
     pub ghost_clear_every: u8,  // partial refreshes before a forced full refresh
     pub book_font_size_idx: u8, // 0 = Small, 1 = Medium, 2 = Large
     pub ui_font_size_idx: u8,   // 0 = Small, 1 = Medium, 2 = Large
@@ -46,7 +45,6 @@ impl SystemSettings {
     pub const fn defaults() -> Self {
         Self {
             sleep_timeout: 10,
-            contrast: 150,
             ghost_clear_every: 10,
             book_font_size_idx: 1,
             ui_font_size_idx: 1,
@@ -141,11 +139,6 @@ fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiCon
                 s.sleep_timeout = v;
             }
         }
-        b"contrast" => {
-            if let Some(v) = parse_u16(val) {
-                s.contrast = v as u8;
-            }
-        }
         b"ghost_clear" => {
             if let Some(v) = parse_u16(val) {
                 s.ghost_clear_every = v as u8;
@@ -238,7 +231,6 @@ fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) -> usi
     wr.put(b"# pulp-os settings\n");
     wr.put(b"# lines starting with # are ignored\n\n");
     wr.kv_num(b"sleep_timeout", s.sleep_timeout);
-    wr.kv_num(b"contrast", s.contrast as u16);
     wr.kv_num(b"ghost_clear", s.ghost_clear_every as u16);
     wr.kv_num(b"book_font", s.book_font_size_idx as u16);
     wr.kv_num(b"ui_font", s.ui_font_size_idx as u16);
@@ -355,10 +347,9 @@ impl SettingsApp {
     fn item_label(i: usize) -> &'static str {
         match i {
             0 => "Sleep After",
-            1 => "Contrast",
-            2 => "Ghost Clear",
-            3 => "Book Font",
-            4 => "UI Font",
+            1 => "Ghost Clear",
+            2 => "Book Font",
+            3 => "UI Font",
             _ => "",
         }
     }
@@ -374,12 +365,9 @@ impl SettingsApp {
                 }
             }
             1 => {
-                let _ = write!(buf, "{}", self.settings.contrast);
-            }
-            2 => {
                 let _ = write!(buf, "Every {}", self.settings.ghost_clear_every);
             }
-            3 => {
+            2 => {
                 let s = match self.settings.book_font_size_idx {
                     1 => "Medium",
                     2 => "Large",
@@ -387,7 +375,7 @@ impl SettingsApp {
                 };
                 let _ = write!(buf, "{}", s);
             }
-            4 => {
+            3 => {
                 let s = match self.settings.ui_font_size_idx {
                     1 => "Medium",
                     2 => "Large",
@@ -409,18 +397,15 @@ impl SettingsApp {
                 };
             }
             1 => {
-                self.settings.contrast = self.settings.contrast.saturating_add(16);
-            }
-            2 => {
                 self.settings.ghost_clear_every =
                     self.settings.ghost_clear_every.saturating_add(5).min(50);
             }
-            3 => {
+            2 => {
                 if self.settings.book_font_size_idx < 2 {
                     self.settings.book_font_size_idx += 1;
                 }
             }
-            4 => {
+            3 => {
                 if self.settings.ui_font_size_idx < 2 {
                     self.settings.ui_font_size_idx += 1;
                 }
@@ -439,18 +424,15 @@ impl SettingsApp {
                 };
             }
             1 => {
-                self.settings.contrast = self.settings.contrast.saturating_sub(16);
-            }
-            2 => {
                 self.settings.ghost_clear_every =
                     self.settings.ghost_clear_every.saturating_sub(5).max(1);
             }
-            3 => {
+            2 => {
                 if self.settings.book_font_size_idx > 0 {
                     self.settings.book_font_size_idx -= 1;
                 }
             }
-            4 => {
+            3 => {
                 if self.settings.ui_font_size_idx > 0 {
                     self.settings.ui_font_size_idx -= 1;
                 }

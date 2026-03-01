@@ -24,7 +24,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::ui::quick_menu::QuickAction;
-use crate::ui::{Alignment, CONTENT_TOP, Region};
+use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -52,7 +52,7 @@ const PAGE_REGION: Region = Region::new(0, HEADER_Y, 480, 800 - HEADER_Y);
 const NO_PREFETCH: usize = usize::MAX;
 
 const TEXT_W: u32 = (480 - 2 * MARGIN) as u32;
-const TEXT_AREA_H: u16 = 800 - TEXT_Y - MARGIN;
+const TEXT_AREA_H: u16 = 800 - TEXT_Y - BUTTON_BAR_H;
 const EOCD_TAIL: usize = 512;
 const INDENT_PX: u32 = 24; // px per blockquote indent level
 

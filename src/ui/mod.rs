@@ -9,7 +9,7 @@ pub mod statusbar;
 mod widget;
 
 pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
-pub use button_feedback::ButtonFeedback;
+pub use button_feedback::{BUTTON_BAR_H, ButtonFeedback};
 pub use quick_menu::QuickMenu;
 pub use statusbar::{
     BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes, paint_stack,

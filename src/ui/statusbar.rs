@@ -1,18 +1,28 @@
-// Persistent status bar at top of screen.
+// Debug status bar at top of screen (debug builds only).
 // Shows battery, uptime, heap (current/peak/total), stack, SD state.
+// In release builds BAR_HEIGHT is 0 and draw/update are no-ops,
+// so apps reclaim the full screen without any code changes.
 
+#[cfg(debug_assertions)]
 use core::fmt::Write;
 
+#[cfg(debug_assertions)]
 use embedded_graphics::mono_font::MonoTextStyle;
+#[cfg(debug_assertions)]
 use embedded_graphics::mono_font::ascii::FONT_6X13;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
+#[cfg(debug_assertions)]
 use embedded_graphics::primitives::PrimitiveStyle;
+#[cfg(debug_assertions)]
 use embedded_graphics::text::Text;
 
 use super::widget::Region;
 
+#[cfg(debug_assertions)]
 pub const BAR_HEIGHT: u16 = 18;
+#[cfg(not(debug_assertions))]
+pub const BAR_HEIGHT: u16 = 4;
 
 pub const CONTENT_TOP: u16 = BAR_HEIGHT;
 
@@ -31,7 +41,9 @@ pub struct SystemStatus {
 }
 
 pub struct StatusBar {
+    #[cfg(debug_assertions)]
     buf: [u8; 112],
+    #[cfg(debug_assertions)]
     len: usize,
 }
 
@@ -44,77 +56,86 @@ impl Default for StatusBar {
 impl StatusBar {
     pub const fn new() -> Self {
         Self {
+            #[cfg(debug_assertions)]
             buf: [0u8; 112],
+            #[cfg(debug_assertions)]
             len: 0,
         }
     }
 
-    pub fn update(&mut self, s: &SystemStatus) {
-        self.len = 0;
+    pub fn update(&mut self, _s: &SystemStatus) {
+        #[cfg(debug_assertions)]
+        {
+            let s = _s;
+            self.len = 0;
 
-        let secs = s.uptime_secs % 60;
-        let mins = (s.uptime_secs / 60) % 60;
-        let hrs = s.uptime_secs / 3600;
+            let secs = s.uptime_secs % 60;
+            let mins = (s.uptime_secs / 60) % 60;
+            let hrs = s.uptime_secs / 3600;
 
-        let mut w = BufWriter {
-            buf: &mut self.buf,
-            pos: 0,
-        };
+            let mut w = BufWriter {
+                buf: &mut self.buf,
+                pos: 0,
+            };
 
-        if s.battery_mv > 0 {
-            let _ = write!(
-                w,
-                "BAT {}% {}.{}V",
-                s.battery_pct,
-                s.battery_mv / 1000,
-                (s.battery_mv % 1000) / 100
-            );
-        } else {
-            let _ = write!(w, "BAT --");
+            if s.battery_mv > 0 {
+                let _ = write!(
+                    w,
+                    "BAT {}% {}.{}V",
+                    s.battery_pct,
+                    s.battery_mv / 1000,
+                    (s.battery_mv % 1000) / 100
+                );
+            } else {
+                let _ = write!(w, "BAT --");
+            }
+
+            if hrs > 0 {
+                let _ = write!(w, "  {}:{:02}:{:02}", hrs, mins, secs);
+            } else {
+                let _ = write!(w, "  {:02}:{:02}", mins, secs);
+            }
+
+            if s.heap_total > 0 {
+                let _ = write!(
+                    w,
+                    "  H:{}/{}/{}K",
+                    s.heap_used / 1024,
+                    s.heap_peak / 1024,
+                    s.heap_total / 1024
+                );
+            }
+
+            if s.stack_free > 0 {
+                let _ = write!(w, "  S:{}K/{}K", s.stack_free / 1024, s.stack_hwm / 1024);
+            }
+
+            let _ = write!(w, "  SD:{}", if s.sd_ok { "OK" } else { "--" });
+
+            self.len = w.pos;
         }
-
-        if hrs > 0 {
-            let _ = write!(w, "  {}:{:02}:{:02}", hrs, mins, secs);
-        } else {
-            let _ = write!(w, "  {:02}:{:02}", mins, secs);
-        }
-
-        if s.heap_total > 0 {
-            // current / peak / total in KB
-            let _ = write!(
-                w,
-                "  H:{}/{}/{}K",
-                s.heap_used / 1024,
-                s.heap_peak / 1024,
-                s.heap_total / 1024
-            );
-        }
-
-        if s.stack_free > 0 {
-            // free / high-water-mark in KB
-            let _ = write!(w, "  S:{}K/{}K", s.stack_free / 1024, s.stack_hwm / 1024);
-        }
-
-        let _ = write!(w, "  SD:{}", if s.sd_ok { "OK" } else { "--" });
-
-        self.len = w.pos;
     }
 
+    #[cfg(debug_assertions)]
     fn text(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 
-    pub fn draw<D>(&self, display: &mut D) -> Result<(), D::Error>
+    pub fn draw<D>(&self, _display: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = BinaryColor>,
     {
-        BAR_REGION
-            .to_rect()
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(display)?;
+        #[cfg(debug_assertions)]
+        {
+            let display = _display;
+            BAR_REGION
+                .to_rect()
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(display)?;
 
-        let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::Off);
-        Text::new(self.text(), Point::new(4, 14), style).draw(display)?;
+            let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::Off);
+            Text::new(self.text(), Point::new(4, 14), style).draw(display)?;
+        }
 
         Ok(())
     }
@@ -225,11 +246,13 @@ pub fn stack_high_water_mark() -> usize {
     }
 }
 
+#[cfg(debug_assertions)]
 struct BufWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
 }
 
+#[cfg(debug_assertions)]
 impl<'a> Write for BufWriter<'a> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();

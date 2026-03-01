@@ -39,9 +39,9 @@ FEATURES
     display         partial DU refresh (~400 ms page turn),
                     periodic full GC refresh (configurable interval)
     quick menu      per-app actions + screen refresh + go home
-    status bar      battery, uptime, heap current/peak/total, stack HWM
-    settings        sleep timeout, contrast, ghost clear interval,
-                    book font size, UI font size
+    status bar      battery, uptime, heap, stack (debug builds only)
+    settings        sleep timeout, ghost clear interval,
+                    book font size, UI font size, wifi credentials
     sleep           idle timeout + power long-press; EPD deep sleep
                     (~3 uA) + ESP32-C3 deep sleep (~5 uA); GPIO3 wake
 
@@ -56,19 +56,19 @@ CONTROLS
 SD CARD LAYOUT
     /                       root; place .txt and .epub files here
     /_PULP/                 app data (created at boot)
-    /_PULP/SETTINGS.BIN     settings (8 bytes, repr(C), little-endian)
+    /_PULP/SETTINGS.TXT     settings (key=value text, editable)
     /_PULP/BKMK.BIN         bookmarks (16 slots x 48 bytes)
     /_PULP/TITLES.BIN       title index (append-only, tab-separated)
     /_PULP/RECENT.BIN       last opened filename
     /_PULP/<hash>/          epub chapter cache directories
 
-    Settings record layout (offset : size : field):
-      0:2   sleep_timeout       minutes; 0 = never
-      2:1   contrast            SSD1677 VCOM
-      3:1   ghost_clear_every   partial refreshes before full GC
-      4:1   book_font_size_idx  0=S  1=M  2=L
-      5:1   ui_font_size_idx    0=S  1=M  2=L
-      6:2   reserved
+    SETTINGS.TXT format (lines starting with # are ignored):
+      sleep_timeout=10      minutes idle before sleep; 0 = never
+      ghost_clear=10        partial refreshes before full GC
+      book_font=1           0=Small  1=Medium  2=Large
+      ui_font=1             0=Small  1=Medium  2=Large
+      wifi_ssid=MyNetwork   SSID for upload mode
+      wifi_pass=secret      password for upload mode
 
     Bookmark slot layout (48 bytes each):
       0:4   name_hash       FNV-1a of filename
