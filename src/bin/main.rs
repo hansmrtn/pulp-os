@@ -78,6 +78,9 @@ macro_rules! with_app {
                 let $app = &mut *$settings;
                 $body
             }
+            AppId::Upload => {
+                unreachable!("Upload mode is handled outside the app dispatch loop");
+            }
         }
     };
 }
@@ -94,14 +97,16 @@ macro_rules! apply_transition {
             $reader.save_position($bm_cache);
         }
 
-        if nav.suspend {
-            with_app!(nav.from, $home, $files, $reader, $settings, |app| {
-                app.on_suspend();
-            });
-        } else {
-            with_app!(nav.from, $home, $files, $reader, $settings, |app| {
-                app.on_exit();
-            });
+        if nav.from != AppId::Upload {
+            if nav.suspend {
+                with_app!(nav.from, $home, $files, $reader, $settings, |app| {
+                    app.on_suspend();
+                });
+            } else {
+                with_app!(nav.from, $home, $files, $reader, $settings, |app| {
+                    app.on_exit();
+                });
+            }
         }
 
         // propagate persisted prefs before lifecycle callbacks
@@ -116,14 +121,16 @@ macro_rules! apply_transition {
             $settings.set_ui_font_size(ui_idx);
         }
 
-        if nav.resume {
-            with_app!(nav.to, $home, $files, $reader, $settings, |app| {
-                app.on_resume(&mut $launcher.ctx);
-            });
-        } else {
-            with_app!(nav.to, $home, $files, $reader, $settings, |app| {
-                app.on_enter(&mut $launcher.ctx);
-            });
+        if nav.to != AppId::Upload {
+            if nav.resume {
+                with_app!(nav.to, $home, $files, $reader, $settings, |app| {
+                    app.on_resume(&mut $launcher.ctx);
+                });
+            } else {
+                with_app!(nav.to, $home, $files, $reader, $settings, |app| {
+                    app.on_enter(&mut $launcher.ctx);
+                });
+            }
         }
     }};
 }
@@ -236,9 +243,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     // paint sentinel before any deep calls; measure peak later via stack_high_water_mark()
     paint_stack();
 
-    // 200KB heap (was 230KB); smaller heap gives ~30KB more stack room
-    // for zune-jpeg's Huffman table construction temporaries.
-    esp_alloc::heap_allocator!(size: 204800);
+    // 140KB heap (was 200KB); reduced to fit WiFi firmware blobs in DRAM.
+    // WiFi radio static data occupies ~65KB; this leaves enough for stack
+    // and the esp-radio internal allocations.
+    esp_alloc::heap_allocator!(size: 143360);
 
     info!("booting...");
 
@@ -352,6 +360,23 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut render_bar_overlaps: bool = false;
 
     loop {
+        // ── 0. Upload mode intercept ────────────────────────────────────
+        // Upload bypasses the App trait — it runs its own async loop with
+        // WiFi hardware, renders its own screens, and watches for BACK.
+        // When it returns the radio is torn down and we pop back to Home.
+        if launcher.active() == AppId::Upload {
+            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+            pulp_os::apps::upload::run_upload_mode(wifi, &mut board.display.epd, strip, &mut delay)
+                .await;
+
+            // Pop back to the previous screen and re-render
+            if let Some(nav) = launcher.apply(Transition::Pop) {
+                apply_transition!(nav, launcher, home, files, reader, settings, bm_cache);
+            }
+            launcher.ctx.request_full_redraw();
+            continue;
+        }
+
         // ── 1. Wait for input or work tick ──────────────────────────────
 
         let hw_event = match select(tasks::INPUT_EVENTS.receive(), work_ticker.next()).await {
@@ -520,6 +545,12 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     apply_transition!(nav, launcher, home, files, reader, settings, bm_cache);
                 }
             }
+        }
+
+        // If a transition just landed us on Upload, skip straight to the
+        // loop top where the upload-mode intercept lives.
+        if launcher.active() == AppId::Upload {
+            continue;
         }
 
         // ── 3. App work ─────────────────────────────────────────────────
@@ -778,7 +809,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
-    const HEAP_TOTAL: usize = 204800; // matches heap_allocator!(size: ...) above
+    const HEAP_TOTAL: usize = 143360; // matches heap_allocator!(size: ...) above
     let stats = esp_alloc::HEAP.stats();
 
     let bat_pct = battery::battery_percentage(battery_mv);
@@ -813,6 +844,7 @@ fn sync_quick_menu(
                 AppId::Files => files.on_quick_cycle_update(id, value, ctx),
                 AppId::Reader => reader.on_quick_cycle_update(id, value, ctx),
                 AppId::Settings => settings.on_quick_cycle_update(id, value, ctx),
+                AppId::Upload => {}
             }
         }
     }

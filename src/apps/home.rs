@@ -26,7 +26,7 @@ const ITEM_GAP: u16 = 14;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
 const ITEM_X: u16 = (480 - ITEM_W) / 2;
 const TITLE_ITEM_GAP: u16 = 24;
-const MAX_ITEMS: usize = 4;
+const MAX_ITEMS: usize = 5;
 
 // bookmark list view
 const BM_MARGIN: u16 = 8;
@@ -41,6 +41,7 @@ fn compute_item_regions(heading_line_h: u16) -> [Region; MAX_ITEMS] {
         Region::new(ITEM_X, item_y + ITEM_STRIDE, ITEM_W, ITEM_H),
         Region::new(ITEM_X, item_y + ITEM_STRIDE * 2, ITEM_W, ITEM_H),
         Region::new(ITEM_X, item_y + ITEM_STRIDE * 3, ITEM_W, ITEM_H),
+        Region::new(ITEM_X, item_y + ITEM_STRIDE * 4, ITEM_W, ITEM_H),
     ]
 }
 
@@ -92,7 +93,7 @@ impl HomeApp {
             body_font: fonts::body_font(0),
             heading_font: hf,
             item_regions: compute_item_regions(hf.line_height),
-            item_count: 3, // Files + Bookmarks + Settings; updated after load
+            item_count: 4, // Files + Bookmarks + Settings + Upload; updated after load
             recent_book: [0u8; 32],
             recent_book_len: 0,
             needs_load_recent: false,
@@ -131,8 +132,8 @@ impl HomeApp {
     }
 
     fn rebuild_item_count(&mut self) {
-        // Continue (optional) + Files + Bookmarks + Settings
-        self.item_count = if self.recent_book_len > 0 { 4 } else { 3 };
+        // Continue (optional) + Files + Bookmarks + Settings + Upload
+        self.item_count = if self.recent_book_len > 0 { 5 } else { 4 };
         if self.selected >= self.item_count {
             self.selected = 0;
         }
@@ -148,13 +149,15 @@ impl HomeApp {
                 0 => "Continue",
                 1 => "Files",
                 2 => "Bookmarks",
-                _ => "Settings",
+                3 => "Settings",
+                _ => "Upload",
             }
         } else {
             match idx {
                 0 => "Files",
                 1 => "Bookmarks",
-                _ => "Settings",
+                2 => "Settings",
+                _ => "Upload",
             }
         }
     }
@@ -165,13 +168,15 @@ impl HomeApp {
                 0 => MenuAction::Continue,
                 1 => MenuAction::Push(AppId::Files),
                 2 => MenuAction::OpenBookmarks,
-                _ => MenuAction::Push(AppId::Settings),
+                3 => MenuAction::Push(AppId::Settings),
+                _ => MenuAction::Push(AppId::Upload),
             }
         } else {
             match idx {
                 0 => MenuAction::Push(AppId::Files),
                 1 => MenuAction::OpenBookmarks,
-                _ => MenuAction::Push(AppId::Settings),
+                2 => MenuAction::Push(AppId::Settings),
+                _ => MenuAction::Push(AppId::Upload),
             }
         }
     }

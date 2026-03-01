@@ -9,6 +9,7 @@ pub mod files;
 pub mod home;
 pub mod reader;
 pub mod settings;
+pub mod upload;
 
 use crate::board::action::ActionEvent;
 use crate::drivers::sdcard::SdStorage;
@@ -25,6 +26,7 @@ pub enum AppId {
     Files,
     Reader,
     Settings,
+    Upload,
 }
 
 // Push: suspend current, push new. Pop: exit current, resume parent.
