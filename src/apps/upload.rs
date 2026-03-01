@@ -8,9 +8,23 @@
 // e-paper display and runs a tiny HTTP server on port 80.
 // Press BACK to tear down WiFi and return to the home screen.
 //
-// No embassy tasks are spawned — the network runner, HTTP server
-// and back-button monitor are multiplexed with `select`, so
-// everything cleans up naturally when the function returns.
+// No embassy tasks are spawned — the network runner, HTTP server,
+// mDNS responder and back-button monitor are multiplexed with
+// `select`, so everything cleans up naturally when the function
+// returns.
+//
+// A minimal mDNS responder advertises the device as `pulp.local`
+// so users can navigate to http://pulp.local/ instead of needing
+// to know the DHCP-assigned IP.  The responder only handles A
+// queries for "pulp.local" — no service browsing, no AAAA, no
+// probing.  Roughly 80 bytes on the wire per response.
+//
+// NOTE: embassy-net must have the "udp" feature enabled in
+//       Cargo.toml for the mDNS responder to compile:
+//
+//   embassy-net = { version = "0.8", features = [
+//       "dhcpv4", "medium-ethernet", "tcp", "udp",
+//   ] }
 
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
@@ -18,6 +32,7 @@ use core::fmt::Write as FmtWrite;
 use embassy_futures::select::{Either, select};
 use embassy_net::IpListenEndpoint;
 use embassy_net::tcp::TcpSocket;
+use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write as AsyncWrite;
 use esp_hal::delay::Delay;
@@ -50,6 +65,29 @@ const BODY_W: u16 = SCREEN_W - BODY_X * 2;
 const BODY_LINE_GAP: u16 = 10;
 
 const FOOTER_Y: u16 = SCREEN_H - 60;
+
+// ── mDNS constants ──────────────────────────────────────────────────
+
+const MDNS_PORT: u16 = 5353;
+
+/// "pulp.local" in DNS wire format: length-prefixed labels + NUL.
+const HOSTNAME_WIRE: [u8; 12] = [
+    4, b'p', b'u', b'l', b'p', //
+    5, b'l', b'o', b'c', b'a', b'l', //
+    0,
+];
+
+/// Size of a minimal mDNS A-record response for "pulp.local".
+///   12  header
+/// + 12  answer name (same wire encoding)
+/// +  2  TYPE
+/// +  2  CLASS
+/// +  4  TTL
+/// +  2  RDLENGTH
+/// +  4  RDATA (IPv4)
+/// ────
+///   38  total
+const MDNS_RESPONSE_LEN: usize = 38;
 
 // ── Public entry point ──────────────────────────────────────────────
 
@@ -202,7 +240,8 @@ pub async fn run_upload_mode(
         (rng.random() as u64) << 32 | rng.random() as u64
     };
 
-    let mut resources = embassy_net::StackResources::<3>::new();
+    // 4 sockets: 1 TCP (HTTP) + 1 UDP (mDNS) + headroom
+    let mut resources = embassy_net::StackResources::<4>::new();
     let (stack, mut runner) = embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
 
     // Poll the network runner while waiting for DHCP *or* BACK.
@@ -225,18 +264,28 @@ pub async fn run_upload_mode(
         return;
     }
 
-    // Format IP address
+    // Extract raw IPv4 octets for the mDNS responder.
+    let ip_octets: [u8; 4] = if let Some(cfg) = stack.config_v4() {
+        cfg.address.address().octets()
+    } else {
+        [0, 0, 0, 0]
+    };
+
+    // Format display strings — primary URL and parenthesised IP fallback.
     let mut ip_buf = [0u8; 48];
     let ip_len = stack_fmt(&mut ip_buf, |w| {
-        if let Some(cfg) = stack.config_v4() {
-            let _ = write!(w, "http://{}/", cfg.address.address());
-        } else {
-            let _ = write!(w, "(no IP address)");
-        }
+        let _ = write!(
+            w,
+            "({}.{}.{}.{})",
+            ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]
+        );
     });
     let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("???");
 
-    info!("upload: serving at {}", ip_str);
+    info!(
+        "upload: serving at http://pulp.local/  ({})",
+        core::str::from_utf8(&ip_buf[1..ip_len.saturating_sub(1)]).unwrap_or("?")
+    );
 
     render_screen(
         epd,
@@ -244,12 +293,21 @@ pub async fn run_upload_mode(
         delay,
         heading,
         body,
-        &[ip_str],
+        &["http://pulp.local/", ip_str],
         Some("Press BACK to exit"),
     )
     .await;
 
-    // ── Phase 4 — HTTP server loop ──────────────────────────────────
+    // ── Phase 4 — HTTP server + mDNS responder loop ─────────────────
+    //
+    // Three futures race each iteration:
+    //   • serve_one_request  — accept one TCP connection, reply, return
+    //   • mdns_respond_once  — answer one mDNS query for pulp.local
+    //   • drain_until_back   — wait for BACK button
+    //
+    // The network runner is always polled in parallel via the outer
+    // `select`.  When the HTTP or mDNS future completes we loop;
+    // when BACK is pressed we break out.
 
     let mut rx_buf = [0u8; 1536];
     let mut tx_buf = [0u8; 1536];
@@ -258,13 +316,16 @@ pub async fn run_upload_mode(
         match select(
             runner.run(),
             select(
-                serve_one_request(stack, &mut rx_buf, &mut tx_buf),
+                select(
+                    serve_one_request(stack, &mut rx_buf, &mut tx_buf),
+                    mdns_respond_once(stack, ip_octets),
+                ),
                 drain_until_back(),
             ),
         )
         .await
         {
-            Either::Second(Either::First(_)) => continue, // served a request
+            Either::Second(Either::First(_)) => continue, // served HTTP or mDNS
             Either::Second(Either::Second(_)) => break,   // back pressed
             _ => unreachable!(),
         }
@@ -324,6 +385,127 @@ async fn serve_one_request(stack: embassy_net::Stack<'_>, rx_buf: &mut [u8], tx_
     socket.abort();
 }
 
+// ── mDNS responder ─────────────────────────────────────────────────
+
+/// Bind a UDP socket on port 5353, wait for one mDNS query that asks
+/// for `pulp.local` type-A, and reply with the device's IPv4 address.
+///
+/// If the incoming packet is not a matching query we silently ignore
+/// it and return so the outer loop can re-enter promptly.
+///
+/// The socket buffers live inside this future's state (~1 KB) and are
+/// released when the future is dropped.
+async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_buf = [0u8; 512];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_buf = [0u8; 512];
+
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+
+    if socket.bind(MDNS_PORT).is_err() {
+        // Port may momentarily be held by the previous iteration's
+        // drop glue — back off briefly and let the caller retry.
+        Timer::after(Duration::from_millis(100)).await;
+        return;
+    }
+
+    let mut pkt = [0u8; 256];
+    let (n, _remote) = match socket.recv_from(&mut pkt).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    if !is_mdns_query_for_pulp(&pkt[..n]) {
+        return;
+    }
+
+    info!("upload: mDNS query for pulp.local — responding");
+
+    let mut resp = [0u8; MDNS_RESPONSE_LEN];
+    let len = build_mdns_response(&mut resp, ip_octets);
+
+    // mDNS responses are sent to the multicast group, not unicast
+    // back to the querier.
+    let mdns_dest = embassy_net::IpEndpoint::new(
+        embassy_net::IpAddress::Ipv4(embassy_net::Ipv4Address::new(224, 0, 0, 251)),
+        MDNS_PORT,
+    );
+    let _ = socket.send_to(&resp[..len], mdns_dest).await;
+}
+
+/// Return `true` if `pkt` is a DNS/mDNS **query** whose first
+/// question is "pulp.local" with QTYPE A (or ANY) and QCLASS IN.
+fn is_mdns_query_for_pulp(pkt: &[u8]) -> bool {
+    // Minimum size: 12 (header) + 12 (QNAME) + 2 (QTYPE) + 2 (QCLASS)
+    if pkt.len() < 28 {
+        return false;
+    }
+
+    // QR bit (bit 15 of flags) must be 0 → standard query.
+    let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+    if flags & 0x8000 != 0 {
+        return false;
+    }
+
+    // At least one question.
+    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+    if qdcount < 1 {
+        return false;
+    }
+
+    // ── Match QNAME at offset 12 against "pulp.local" ──────────────
+    //
+    // Wire encoding: 04 70 75 6C 70  05 6C 6F 63 61 6C  00
+    //                 ^p  u  l  p     ^l  o  c  a  l     ^root
+
+    let qname = &pkt[12..24];
+
+    if qname[0] != 4 || qname[5] != 5 || qname[11] != 0 {
+        return false;
+    }
+    if !qname[1..5].eq_ignore_ascii_case(b"pulp") {
+        return false;
+    }
+    if !qname[6..11].eq_ignore_ascii_case(b"local") {
+        return false;
+    }
+
+    // QTYPE immediately follows QNAME.
+    let qtype = u16::from_be_bytes([pkt[24], pkt[25]]);
+    // QCLASS with the unicast-response bit (bit 15) masked off.
+    let qclass = u16::from_be_bytes([pkt[26], pkt[27]]) & 0x7FFF;
+
+    // Accept A (1) or ANY (255), class IN (1).
+    (qtype == 1 || qtype == 255) && qclass == 1
+}
+
+/// Write a minimal mDNS A-record response for "pulp.local" into
+/// `buf` and return the number of bytes written ([`MDNS_RESPONSE_LEN`]).
+///
+/// The caller must ensure `buf.len() >= MDNS_RESPONSE_LEN` (38).
+fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
+    let r = &mut buf[..MDNS_RESPONSE_LEN];
+
+    // ── Header (12 bytes) ───────────────────────────────────────────
+    r[0..2].copy_from_slice(&[0x00, 0x00]); // ID — 0 for mDNS
+    r[2..4].copy_from_slice(&[0x84, 0x00]); // Flags: QR=1, AA=1
+    r[4..6].copy_from_slice(&[0x00, 0x00]); // QDCOUNT = 0
+    r[6..8].copy_from_slice(&[0x00, 0x01]); // ANCOUNT = 1
+    r[8..10].copy_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
+    r[10..12].copy_from_slice(&[0x00, 0x00]); // ARCOUNT = 0
+
+    // ── Answer RR ───────────────────────────────────────────────────
+    r[12..24].copy_from_slice(&HOSTNAME_WIRE); // NAME
+    r[24..26].copy_from_slice(&[0x00, 0x01]); // TYPE  = A
+    r[26..28].copy_from_slice(&[0x80, 0x01]); // CLASS = IN + cache-flush
+    r[28..32].copy_from_slice(&[0x00, 0x00, 0x00, 0x78]); // TTL = 120 s
+    r[32..34].copy_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
+    r[34..38].copy_from_slice(&ip); // RDATA = IPv4 address
+
+    MDNS_RESPONSE_LEN
+}
+
 // ── Input helpers ───────────────────────────────────────────────────
 
 /// Drain the input-event channel until a BACK press is detected.
@@ -349,8 +531,8 @@ async fn drain_until_back() {
 ///     │      Upload Mode         │  ← heading font, centred
 ///     │                          │
 ///     │                          │
-///     │     body line 1          │  ← body font, centred
-///     │     body line 2          │
+///     │   http://pulp.local/     │  ← body font, centred
+///     │     (192.168.1.42)       │
 ///     │                          │
 ///     │                          │
 ///     │     footer hint          │  ← body font, centred, near bottom

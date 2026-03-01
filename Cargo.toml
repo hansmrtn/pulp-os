@@ -30,7 +30,7 @@ esp-radio = { version = "0.17", default-features = false, features = [
   "log-04",
   "esp-alloc",
 ] }
-embassy-net       = { version = "0.8", features = ["dhcpv4", "medium-ethernet", "tcp"] }
+embassy-net       = { version = "0.8", features = ["dhcpv4", "medium-ethernet", "tcp", "udp"] }
 embedded-io-async = "0.7"
 
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3", "log-04"] }
