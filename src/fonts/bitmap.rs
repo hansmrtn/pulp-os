@@ -11,6 +11,16 @@ pub const FIRST_CHAR: u8 = 0x20;
 pub const LAST_CHAR: u8 = 0x7E;
 pub const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize; // 95
 
+// map arbitrary byte to printable char; out-of-range becomes '?'
+#[inline]
+pub fn byte_to_char(b: u8) -> char {
+    if (FIRST_CHAR..=LAST_CHAR).contains(&b) {
+        b as char
+    } else {
+        '?'
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BitmapGlyph {
@@ -55,14 +65,7 @@ impl BitmapFont {
     #[inline]
     pub fn measure_bytes(&self, text: &[u8]) -> u16 {
         text.iter()
-            .map(|&b| {
-                let ch = if (0x20..=0x7E).contains(&b) {
-                    b as char
-                } else {
-                    '?'
-                };
-                self.advance(ch) as u16
-            })
+            .map(|&b| self.advance(byte_to_char(b)) as u16)
             .sum()
     }
 
@@ -113,12 +116,7 @@ impl BitmapFont {
     pub fn draw_bytes(&self, strip: &mut StripBuffer, text: &[u8], cx: i32, baseline: i32) -> i32 {
         let mut x = cx;
         for &b in text {
-            let ch = if (0x20..=0x7E).contains(&b) {
-                b as char
-            } else {
-                '?'
-            };
-            x += self.draw_char(strip, ch, x, baseline) as i32;
+            x += self.draw_char(strip, byte_to_char(b), x, baseline) as i32;
         }
         x
     }

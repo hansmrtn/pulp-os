@@ -9,6 +9,17 @@ use esp_hal::time::{Duration, Instant};
 use crate::board::InputHw;
 use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
 
+// 4-sample average; ~40us per channel, rejects ADC noise from SPI/battery sag
+macro_rules! read_averaged {
+    ($adc:expr, $pin:expr) => {{
+        let mut sum: u32 = 0;
+        for _ in 0..ADC_OVERSAMPLE {
+            sum += nb::block!($adc.read_oneshot($pin)).unwrap() as u32;
+        }
+        (sum / ADC_OVERSAMPLE) as u16
+    }};
+}
+
 const DEBOUNCE_MS: u64 = 15;
 const LONG_PRESS_MS: u64 = 1000;
 const REPEAT_MS: u64 = 150;
@@ -144,26 +155,14 @@ impl InputDriver {
     }
 
     fn read_averaged_row1(&mut self) -> u16 {
-        let mut sum: u32 = 0;
-        for _ in 0..ADC_OVERSAMPLE {
-            sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row1)).unwrap() as u32;
-        }
-        (sum / ADC_OVERSAMPLE) as u16
+        read_averaged!(self.hw.adc, &mut self.hw.row1)
     }
 
     fn read_averaged_row2(&mut self) -> u16 {
-        let mut sum: u32 = 0;
-        for _ in 0..ADC_OVERSAMPLE {
-            sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.row2)).unwrap() as u32;
-        }
-        (sum / ADC_OVERSAMPLE) as u16
+        read_averaged!(self.hw.adc, &mut self.hw.row2)
     }
 
     pub fn read_battery_mv(&mut self) -> u16 {
-        let mut sum: u32 = 0;
-        for _ in 0..ADC_OVERSAMPLE {
-            sum += nb::block!(self.hw.adc.read_oneshot(&mut self.hw.battery)).unwrap() as u32;
-        }
-        (sum / ADC_OVERSAMPLE) as u16
+        read_averaged!(self.hw.adc, &mut self.hw.battery)
     }
 }

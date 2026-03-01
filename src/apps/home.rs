@@ -16,6 +16,7 @@ use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
+use crate::fonts::bitmap::byte_to_char;
 use crate::ui::{Alignment, BUTTON_BAR_H, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 // menu layout constants
@@ -490,12 +491,7 @@ impl HomeApp {
                 let mut ch_buf = [0u8; 8];
                 let ch_len = fmt_chapter_prefix(&mut ch_buf, entry.chapter);
                 for &b in &ch_buf[..ch_len] {
-                    let ch = if (0x20..=0x7E).contains(&b) {
-                        b as char
-                    } else {
-                        '?'
-                    };
-                    cx += font.draw_char_fg(strip, ch, fg, cx, baseline) as i32;
+                    cx += font.draw_char_fg(strip, byte_to_char(b), fg, cx, baseline) as i32;
                 }
             }
 

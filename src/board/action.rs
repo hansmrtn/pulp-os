@@ -44,19 +44,12 @@ impl ActionEvent {
     }
 }
 
-pub struct ButtonMapper {
-    _private: (),
-}
-
-impl Default for ButtonMapper {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Default)]
+pub struct ButtonMapper;
 
 impl ButtonMapper {
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self
     }
 
     pub fn map_button(&self, button: Button) -> Action {

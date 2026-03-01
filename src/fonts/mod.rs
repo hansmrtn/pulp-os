@@ -12,6 +12,16 @@ pub mod font_data {
 use crate::drivers::strip::StripBuffer;
 use bitmap::BitmapFont;
 
+// 0 = Small, 1 = Medium, 2 = Large
+pub const FONT_SIZE_NAMES: &[&str] = &["Small", "Medium", "Large"];
+
+pub fn font_size_name(idx: u8) -> &'static str {
+    FONT_SIZE_NAMES
+        .get(idx as usize)
+        .copied()
+        .unwrap_or("Small")
+}
+
 // body font by index: 0 = Small, 1 = Medium, 2 = Large
 pub fn body_font(idx: u8) -> &'static BitmapFont {
     match idx {
@@ -136,12 +146,7 @@ impl FontSet {
 
     #[inline]
     pub fn advance_byte(&self, b: u8, style: Style) -> u8 {
-        let ch = if (0x20..=0x7E).contains(&b) {
-            b as char
-        } else {
-            '?'
-        };
-        self.font(style).advance(ch)
+        self.font(style).advance(bitmap::byte_to_char(b))
     }
 
     #[inline]

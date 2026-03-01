@@ -259,11 +259,7 @@ impl DirCache {
             if space == 0 {
                 // line longer than buffer; skip to next newline
                 leftover = 0;
-                loop {
-                    let n = match read_pulp_file_chunk(sd, TITLES_FILE, offset, &mut buf) {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
+                while let Ok(n) = read_pulp_file_chunk(sd, TITLES_FILE, offset, &mut buf) {
                     if n == 0 {
                         break;
                     }

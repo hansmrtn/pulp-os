@@ -4,7 +4,6 @@
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeManager};
 use log::info;
 
-// No RTC on board; all file timestamps are set to 2025-01-01 00:00:00.
 #[derive(Default, Clone, Copy)]
 pub struct FixedTimestamp;
 

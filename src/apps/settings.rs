@@ -367,20 +367,18 @@ impl SettingsApp {
                 let _ = write!(buf, "Every {}", self.settings.ghost_clear_every);
             }
             2 => {
-                let s = match self.settings.book_font_size_idx {
-                    1 => "Medium",
-                    2 => "Large",
-                    _ => "Small",
-                };
-                let _ = write!(buf, "{}", s);
+                let _ = write!(
+                    buf,
+                    "{}",
+                    fonts::font_size_name(self.settings.book_font_size_idx)
+                );
             }
             3 => {
-                let s = match self.settings.ui_font_size_idx {
-                    1 => "Medium",
-                    2 => "Large",
-                    _ => "Small",
-                };
-                let _ = write!(buf, "{}", s);
+                let _ = write!(
+                    buf,
+                    "{}",
+                    fonts::font_size_name(self.settings.ui_font_size_idx)
+                );
             }
             _ => {}
         }

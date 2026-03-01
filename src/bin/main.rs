@@ -23,7 +23,7 @@ use embassy_time::{Duration, Ticker};
 
 use pulp_os::apps::files::FilesApp;
 use pulp_os::apps::home::HomeApp;
-use pulp_os::apps::reader::ReaderApp;
+use pulp_os::apps::reader::{self, ReaderApp};
 use pulp_os::apps::settings::SettingsApp;
 use pulp_os::apps::{
     App, AppContext, AppId, BookmarkCache, Launcher, Redraw, Services, Transition,
@@ -731,7 +731,7 @@ fn sync_quick_menu(qm: &QuickMenu, active: AppId, apps: &mut Apps, ctx: &mut App
 
     // persist reader font-size change into settings
     if active == AppId::Reader
-        && let Some(font_idx) = qm.app_cycle_value(1)
+        && let Some(font_idx) = qm.app_cycle_value(reader::QA_FONT_SIZE)
     {
         let ss = apps.settings.system_settings_mut();
         if ss.book_font_size_idx != font_idx {

@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use crate::fonts::bitmap::BitmapFont;
+use crate::fonts::bitmap::{self, BitmapFont};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -80,12 +80,11 @@ const POSITION_OVERLAY: Region = Region::new(
 
 const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, 464, 20);
 
-const QA_FONT_SIZE: u8 = 1;
+pub const QA_FONT_SIZE: u8 = 1;
 const QA_PREV_CHAPTER: u8 = 3;
 const QA_NEXT_CHAPTER: u8 = 4;
 const QA_TOC: u8 = 5;
 
-const QA_FONT_OPTIONS: &[&str] = &["Small", "Medium", "Large"];
 const QA_MAX: usize = 4;
 
 pub const RECENT_FILE: &str = "RECENT";
@@ -320,7 +319,7 @@ impl ReaderApp {
             QA_FONT_SIZE,
             "Book Font",
             self.book_font_size_idx,
-            QA_FONT_OPTIONS,
+            fonts::FONT_SIZE_NAMES,
         );
         n += 1;
 
@@ -1182,13 +1181,11 @@ impl ReaderApp {
             return true;
         }
 
-        if self.is_epub && self.fully_indexed {
-            if (self.chapter as usize + 1) < self.spine.len() {
-                self.chapter += 1;
-                self.goto_last_page = false;
-                self.state = State::NeedIndex;
-                return true;
-            }
+        if self.is_epub && self.fully_indexed && (self.chapter as usize + 1) < self.spine.len() {
+            self.chapter += 1;
+            self.goto_last_page = false;
+            self.state = State::NeedIndex;
+            return true;
         }
 
         false
@@ -1574,7 +1571,7 @@ fn load_cached_image<SPI: embedded_hal::spi::SpiDevice>(
     if width == 0 || height == 0 {
         return Err("zero dimensions in cache");
     }
-    let stride = (width as usize + 7) / 8;
+    let stride = (width as usize).div_ceil(8);
     let data_len = stride * height as usize;
     if size as usize != 4 + data_len {
         return Err("cache size mismatch");
@@ -2303,13 +2300,11 @@ impl App for ReaderApp {
                         j += 2;
                         continue;
                     }
-                    let ch = if (0x20..=0x7E).contains(&b) {
-                        b as char
-                    } else {
+                    if !(bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&b) {
                         j += 1;
                         continue; // non-printable
-                    };
-                    cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
+                    }
+                    cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
                     j += 1;
                 }
             }
@@ -2343,57 +2338,58 @@ impl App for ReaderApp {
         }
 
         // position overlay (long-press feedback)
-        if self.show_position && self.state == State::Ready {
-            if POSITION_OVERLAY.intersects(strip.logical_window()) {
-                let mut pbuf = StackFmt::<48>::new();
-                if self.is_epub && self.spine.len() > 1 {
-                    if self.fully_indexed {
-                        let _ = write!(
-                            pbuf,
-                            "Ch {}/{}  Page {}/{}",
-                            self.chapter + 1,
-                            self.spine.len(),
-                            self.page + 1,
-                            self.total_pages
-                        );
-                    } else {
-                        let _ = write!(
-                            pbuf,
-                            "Ch {}/{}  Page {}",
-                            self.chapter + 1,
-                            self.spine.len(),
-                            self.page + 1
-                        );
-                    }
-                } else if self.fully_indexed {
-                    let _ = write!(pbuf, "Page {}/{}", self.page + 1, self.total_pages);
-                } else {
-                    let _ = write!(pbuf, "Page {}  ({}%)", self.page + 1, self.progress_pct());
-                }
-
-                // inverted banner: black bg, white text
-                POSITION_OVERLAY
-                    .to_rect()
-                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                    .draw(strip)
-                    .unwrap();
-                let text = pbuf.as_str();
-                if let Some(f) = cf {
-                    f.draw_aligned(
-                        strip,
-                        POSITION_OVERLAY,
-                        text,
-                        Alignment::Center,
-                        BinaryColor::Off,
+        if self.show_position
+            && self.state == State::Ready
+            && POSITION_OVERLAY.intersects(strip.logical_window())
+        {
+            let mut pbuf = StackFmt::<48>::new();
+            if self.is_epub && self.spine.len() > 1 {
+                if self.fully_indexed {
+                    let _ = write!(
+                        pbuf,
+                        "Ch {}/{}  Page {}/{}",
+                        self.chapter + 1,
+                        self.spine.len(),
+                        self.page + 1,
+                        self.total_pages
                     );
                 } else {
-                    let tw = text.len() as u32 * 6;
-                    let pos = Alignment::Center.position(POSITION_OVERLAY, Size::new(tw, 13));
-                    let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::Off);
-                    Text::new(text, Point::new(pos.x, pos.y + 13), style)
-                        .draw(strip)
-                        .unwrap();
+                    let _ = write!(
+                        pbuf,
+                        "Ch {}/{}  Page {}",
+                        self.chapter + 1,
+                        self.spine.len(),
+                        self.page + 1
+                    );
                 }
+            } else if self.fully_indexed {
+                let _ = write!(pbuf, "Page {}/{}", self.page + 1, self.total_pages);
+            } else {
+                let _ = write!(pbuf, "Page {}  ({}%)", self.page + 1, self.progress_pct());
+            }
+
+            // inverted banner: black bg, white text
+            POSITION_OVERLAY
+                .to_rect()
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(strip)
+                .unwrap();
+            let text = pbuf.as_str();
+            if let Some(f) = cf {
+                f.draw_aligned(
+                    strip,
+                    POSITION_OVERLAY,
+                    text,
+                    Alignment::Center,
+                    BinaryColor::Off,
+                );
+            } else {
+                let tw = text.len() as u32 * 6;
+                let pos = Alignment::Center.position(POSITION_OVERLAY, Size::new(tw, 13));
+                let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::Off);
+                Text::new(text, Point::new(pos.x, pos.y + 13), style)
+                    .draw(strip)
+                    .unwrap();
             }
         }
     }

@@ -292,6 +292,34 @@ where
         }
     }
 
+    // transform logical region to byte-aligned physical coords + edge masks
+    fn align_partial_region(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
+        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
+
+        let px = (tx & !7).min(WIDTH);
+        let py = ty.min(HEIGHT);
+        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
+        let ph = th.min(HEIGHT - py);
+
+        if pw == 0 || ph == 0 {
+            return None;
+        }
+
+        let lp = (tx - px) as u32;
+        let rp = ((px + pw) - (tx + tw)) as u32;
+        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
+        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
+
+        Some(RenderState {
+            px,
+            py,
+            pw,
+            ph,
+            left_mask,
+            right_mask,
+        })
+    }
+
     // gates wired in reverse; Y flipped per GxEPD2
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
         let y_flipped = HEIGHT - y - h;
@@ -380,47 +408,23 @@ where
         if self.initial_refresh {
             return None;
         }
-
         if !self.init_done {
             self.init_display(delay);
         }
 
-        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
-
-        let px = (tx & !7).min(WIDTH);
-        let py = ty.min(HEIGHT);
-        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
-        let ph = th.min(HEIGHT - py);
-
-        if pw == 0 || ph == 0 {
-            return None;
-        }
-
-        let lp = (tx - px) as u32;
-        let rp = ((px + pw) - (tx + tw)) as u32;
-        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
-        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
-
+        let rs = self.align_partial_region(x, y, w, h)?;
         self.write_region_strips(
             strip,
-            px,
-            py,
-            pw,
-            ph,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
             cmd::WRITE_RAM_BW,
             draw,
-            left_mask,
-            right_mask,
+            rs.left_mask,
+            rs.right_mask,
         );
-
-        Some(RenderState {
-            px,
-            py,
-            pw,
-            ph,
-            left_mask,
-            right_mask,
-        })
+        Some(rs)
     }
 
     // write BW + inverted RED; use after skipped phase 3 to fix stale RED
@@ -441,37 +445,22 @@ where
         if self.initial_refresh {
             return None;
         }
-
         if !self.init_done {
             self.init_display(delay);
         }
 
-        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
-
-        let px = (tx & !7).min(WIDTH);
-        let py = ty.min(HEIGHT);
-        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
-        let ph = th.min(HEIGHT - py);
-
-        if pw == 0 || ph == 0 {
-            return None;
-        }
-
-        let lp = (tx - px) as u32;
-        let rp = ((px + pw) - (tx + tw)) as u32;
-        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
-        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
-
-        self.write_region_strips_bw_inv_red(strip, px, py, pw, ph, draw, left_mask, right_mask);
-
-        Some(RenderState {
-            px,
-            py,
-            pw,
-            ph,
-            left_mask,
-            right_mask,
-        })
+        let rs = self.align_partial_region(x, y, w, h)?;
+        self.write_region_strips_bw_inv_red(
+            strip,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            draw,
+            rs.left_mask,
+            rs.right_mask,
+        );
+        Some(rs)
     }
 
     // kick DU waveform (non-blocking); caller polls is_busy
@@ -598,7 +587,7 @@ where
         let _ = self.busy.wait_for_low().await;
     }
 
-    // async write_full_frame; SPI writes still blocking (DMA)
+    // async write_full_frame; SPI writes are blocking (DMA), no .await needed
     pub async fn write_full_frame_async<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -607,23 +596,7 @@ where
     ) where
         F: Fn(&mut StripBuffer),
     {
-        if !self.init_done {
-            self.init_display(delay);
-        }
-
-        delay.delay_millis(1);
-
-        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
-            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-            self.send_command(ram_cmd);
-            delay.delay_millis(1);
-
-            for i in 0..STRIP_COUNT {
-                strip.begin_strip(self.rotation, i);
-                draw(strip);
-                self.send_data(strip.data());
-            }
-        }
+        self.write_full_frame(strip, delay, draw);
     }
 
     // partial DU refresh in one await (~500ms); falls back to full GC on initial_refresh.
@@ -644,47 +617,26 @@ where
             self.full_refresh_async(strip, delay, draw).await;
             return;
         }
-
         if !self.init_done {
             self.init_display(delay);
         }
 
-        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
-
-        let px = (tx & !7).min(WIDTH);
-        let py = ty.min(HEIGHT);
-        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
-        let ph = th.min(HEIGHT - py);
-
-        if pw == 0 || ph == 0 {
-            return;
-        }
-
-        let lp = (tx - px) as u32;
-        let rp = ((px + pw) - (tx + tw)) as u32;
-        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
-        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
-
-        let rs = RenderState {
-            px,
-            py,
-            pw,
-            ph,
-            left_mask,
-            right_mask,
+        let rs = match self.align_partial_region(x, y, w, h) {
+            Some(rs) => rs,
+            None => return,
         };
 
         // phase 1: write BW RAM
         self.write_region_strips(
             strip,
-            px,
-            py,
-            pw,
-            ph,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
             cmd::WRITE_RAM_BW,
             draw,
-            left_mask,
-            right_mask,
+            rs.left_mask,
+            rs.right_mask,
         );
 
         // phase 2: kick DU waveform and await completion
@@ -692,7 +644,16 @@ where
         self.wait_busy_async().await;
 
         // phase 3: sync both RAM planes
-        self.write_region_strips_dual(strip, px, py, pw, ph, draw, left_mask, right_mask);
+        self.write_region_strips_dual(
+            strip,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            draw,
+            rs.left_mask,
+            rs.right_mask,
+        );
 
         self.power_off_async().await;
     }
