@@ -5,12 +5,14 @@
 mod bitmap_label;
 pub mod button_feedback;
 pub mod quick_menu;
+pub mod stack_fmt;
 pub mod statusbar;
 mod widget;
 
 pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
 pub use button_feedback::{BUTTON_BAR_H, ButtonFeedback};
 pub use quick_menu::QuickMenu;
+pub use stack_fmt::{BorrowedFmt, StackFmt, stack_fmt};
 pub use statusbar::{
     BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes, paint_stack,
     stack_high_water_mark,

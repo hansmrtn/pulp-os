@@ -27,7 +27,7 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::tasks;
-use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region};
+use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region, stack_fmt};
 
 // layout
 
@@ -922,25 +922,3 @@ async fn render_screen(
 }
 
 // stack-based fmt helper
-
-fn stack_fmt(buf: &mut [u8], f: impl FnOnce(&mut StackWriter<'_>)) -> usize {
-    let mut w = StackWriter { buf, pos: 0 };
-    f(&mut w);
-    w.pos
-}
-
-struct StackWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-impl core::fmt::Write for StackWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let room = self.buf.len() - self.pos;
-        let n = bytes.len().min(room);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
-        self.pos += n;
-        Ok(())
-    }
-}

@@ -17,6 +17,7 @@ use embedded_graphics::primitives::PrimitiveStyle;
 #[cfg(debug_assertions)]
 use embedded_graphics::text::Text;
 
+use super::stack_fmt::BorrowedFmt;
 use super::widget::Region;
 
 #[cfg(debug_assertions)]
@@ -73,10 +74,7 @@ impl StatusBar {
             let mins = (s.uptime_secs / 60) % 60;
             let hrs = s.uptime_secs / 3600;
 
-            let mut w = BufWriter {
-                buf: &mut self.buf,
-                pos: 0,
-            };
+            let mut w = BorrowedFmt::new(&mut self.buf);
 
             if s.battery_mv > 0 {
                 let _ = write!(
@@ -112,7 +110,7 @@ impl StatusBar {
 
             let _ = write!(w, "  SD:{}", if s.sd_ok { "OK" } else { "--" });
 
-            self.len = w.pos;
+            self.len = w.len();
         }
     }
 
@@ -243,23 +241,5 @@ pub fn stack_high_water_mark() -> usize {
     #[cfg(not(target_arch = "riscv32"))]
     {
         0
-    }
-}
-
-#[cfg(debug_assertions)]
-struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-#[cfg(debug_assertions)]
-impl<'a> Write for BufWriter<'a> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let avail = self.buf.len() - self.pos;
-        let n = bytes.len().min(avail);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
-        self.pos += n;
-        Ok(())
     }
 }

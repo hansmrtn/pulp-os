@@ -24,7 +24,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::ui::quick_menu::QuickAction;
-use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region};
+use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -1508,32 +1508,6 @@ fn read_full<SPI: embedded_hal::spi::SpiDevice>(
 }
 
 // tiny stack buffer for formatted text
-struct FmtBuf<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> FmtBuf<N> {
-    fn new() -> Self {
-        Self {
-            buf: [0u8; N],
-            len: 0,
-        }
-    }
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
-    }
-}
-
-impl<const N: usize> core::fmt::Write for FmtBuf<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(N - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
 
 // draw text with bitmap font (FONT_6X13 fallback), clearing region background
 fn draw_chrome_text(
@@ -2145,7 +2119,7 @@ impl App for ReaderApp {
         if self.state == State::ShowToc {
             draw_chrome_text(strip, STATUS_REGION, "Contents", Alignment::CenterRight, cf);
         } else if self.is_epub && !self.spine.is_empty() {
-            let mut sbuf = FmtBuf::<32>::new();
+            let mut sbuf = StackFmt::<32>::new();
             if self.spine.len() > 1 {
                 if self.fully_indexed {
                     let _ = write!(
@@ -2178,7 +2152,7 @@ impl App for ReaderApp {
                 cf,
             );
         } else if self.file_size > 0 {
-            let mut sbuf = FmtBuf::<24>::new();
+            let mut sbuf = StackFmt::<24>::new();
             if self.fully_indexed {
                 let _ = write!(sbuf, "{}/{}", self.page + 1, self.total_pages);
             } else {
@@ -2201,7 +2175,7 @@ impl App for ReaderApp {
         if self.state != State::Ready && self.state != State::Error && self.state != State::ShowToc
         {
             // loading indicator during work states
-            let mut lbuf = FmtBuf::<48>::new();
+            let mut lbuf = StackFmt::<48>::new();
             match self.state {
                 State::NeedCache | State::NeedCacheChapter => {
                     let _ = write!(
@@ -2390,7 +2364,7 @@ impl App for ReaderApp {
         // position overlay (long-press feedback)
         if self.show_position && self.state == State::Ready {
             if POSITION_OVERLAY.intersects(strip.logical_window()) {
-                let mut pbuf = FmtBuf::<48>::new();
+                let mut pbuf = StackFmt::<48>::new();
                 if self.is_epub && self.spine.len() > 1 {
                     if self.fully_indexed {
                         let _ = write!(
