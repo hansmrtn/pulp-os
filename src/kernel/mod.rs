@@ -1,5 +1,4 @@
-// Kernel — Embassy async runtime wrapper
-//
+// Kernel: Embassy async runtime wrapper.
 // wake:  uptime helper (embassy_time)
 // tasks: spawned tasks (input polling, housekeeping, idle sleep)
 

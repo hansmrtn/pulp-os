@@ -1,6 +1,5 @@
-// System settings with persistent storage
-//
-// #[repr(C)] struct written as raw bytes to settings.bin.
+// System settings with persistent storage.
+// #[repr(C)] struct written as raw bytes to SETTINGS.BIN.
 // Load/save deferred to on_work() so render is never blocked.
 
 use core::fmt::Write as _;
@@ -10,12 +9,11 @@ use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
-use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
+use crate::ui::{
+    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region, wrap_next, wrap_prev,
+};
 
-// ── Layout ────────────────────────────────────────────────────────────────────
-//
-// Logical screen: 480 wide × 800 tall (Deg270 rotation).
-// Status bar occupies y 0..CONTENT_TOP (18 px).
+// layout: 480x800 logical (Deg270); status bar at y 0..CONTENT_TOP (18px)
 
 const ROW_H: u16 = 40;
 const ROW_GAP: u16 = 6;
@@ -25,24 +23,23 @@ const LABEL_X: u16 = 16;
 const LABEL_W: u16 = 160;
 const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
-const VALUE_W: u16 = 296; // reaches to x = 480 − 8 = 472
+const VALUE_W: u16 = 296; // reaches x = 472
 
 const NUM_ITEMS: usize = 5;
-// Gap between heading bottom and first settings row.
-const HEADING_ITEMS_GAP: u16 = 8;
+const HEADING_ITEMS_GAP: u16 = 8; // gap between heading bottom and first row
 
-// ── Persistent settings ───────────────────────────────────────────────────────
+// persistent settings
 
 const SETTINGS_FILE: &str = "SETTINGS.BIN";
 
-// #[repr(C)] on-disk layout (8 bytes total):
-//   sleep_timeout      u16   bytes 0–1
+// on-disk layout (#[repr(C)], 8 bytes):
+//   sleep_timeout      u16   bytes 0-1
 //   contrast           u8    byte  2
 //   ghost_clear_every  u8    byte  3
 //   book_font_size_idx u8    byte  4
 //   ui_font_size_idx   u8    byte  5
-//   _pad               [u8;2] bytes 6–7
-// Add new fields before _pad and shrink it by the same byte count.
+//   _pad               [u8;2] bytes 6-7
+// add new fields before _pad and shrink it by the same count
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SystemSettings {
@@ -66,13 +63,13 @@ impl SystemSettings {
             sleep_timeout: 10,
             contrast: 150,
             ghost_clear_every: 10,
-            book_font_size_idx: 0,
-            ui_font_size_idx: 0,
+            book_font_size_idx: 1,
+            ui_font_size_idx: 1,
             _pad: [0u8; 2],
         }
     }
 
-    // reinterpret self as a byte slice for writing to SD
+    // reinterpret self as byte slice for writing to SD
     pub fn to_bytes(&self) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(
@@ -89,7 +86,7 @@ impl SystemSettings {
         self.ui_font_size_idx = self.ui_font_size_idx.min(2);
     }
 
-    // deserialise from raw bytes; returns defaults on short input
+    // deserialise from raw bytes; return defaults on short input
     pub fn from_bytes(data: &[u8]) -> Self {
         let size = core::mem::size_of::<Self>();
         if data.len() >= size {
@@ -104,8 +101,6 @@ impl SystemSettings {
         }
     }
 }
-
-// ── App ───────────────────────────────────────────────────────────────────────
 
 impl Default for SettingsApp {
     fn default() -> Self {
@@ -159,9 +154,8 @@ impl SettingsApp {
         self.loaded
     }
 
-    // Load settings from SD and apply font indices to self immediately.
-    // Called once at boot before the first render so saved preferences are
-    // in effect from the very first frame.
+    // load settings from SD and apply font indices immediately;
+    // called once at boot so saved preferences are in effect from the first frame
     pub fn load_eager<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         services: &mut Services<'_, SPI>,
@@ -170,10 +164,8 @@ impl SettingsApp {
         self.set_ui_font_size(self.settings.ui_font_size_idx);
     }
 
-    // ── Storage ───────────────────────────────────────────────────────────────
-
     fn load<SPI: embedded_hal::spi::SpiDevice>(&mut self, services: &mut Services<'_, SPI>) {
-        // Buffer must be >= size_of::<SystemSettings>() = 8 bytes.
+        // buf must be >= size_of::<SystemSettings>() = 8 bytes
         let mut buf = [0u8; 32];
         match services.read_pulp_start(SETTINGS_FILE, &mut buf) {
             Ok((size, n)) if n > 0 => {
@@ -200,8 +192,6 @@ impl SettingsApp {
             }
         }
     }
-
-    // ── Item metadata ─────────────────────────────────────────────────────────
 
     fn item_label(i: usize) -> &'static str {
         match i {
@@ -249,8 +239,6 @@ impl SettingsApp {
             _ => {}
         }
     }
-
-    // ── Value mutation ────────────────────────────────────────────────────────
 
     fn increment(&mut self) {
         match self.selected {
@@ -348,7 +336,7 @@ impl App for SettingsApp {
     fn on_enter(&mut self, ctx: &mut AppContext) {
         self.selected = 0;
         self.save_needed = false;
-        ctx.request_screen_redraw();
+        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
@@ -358,7 +346,7 @@ impl App for SettingsApp {
 
             ActionEvent::Press(Action::Next) => {
                 let old = self.selected;
-                self.selected = (self.selected + 1).min(NUM_ITEMS - 1);
+                self.selected = wrap_next(self.selected, NUM_ITEMS);
                 if self.selected != old {
                     ctx.mark_dirty(self.row_region(old));
                     ctx.mark_dirty(self.row_region(self.selected));
@@ -368,7 +356,7 @@ impl App for SettingsApp {
 
             ActionEvent::Press(Action::Prev) => {
                 let old = self.selected;
-                self.selected = self.selected.saturating_sub(1);
+                self.selected = wrap_prev(self.selected, NUM_ITEMS);
                 if self.selected != old {
                     ctx.mark_dirty(self.row_region(old));
                     ctx.mark_dirty(self.row_region(self.selected));
@@ -388,7 +376,6 @@ impl App for SettingsApp {
                 Transition::None
             }
 
-            // Select on a row is a no-op; use Jump axis to adjust values.
             _ => Transition::None,
         }
     }

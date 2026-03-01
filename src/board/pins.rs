@@ -1,5 +1,4 @@
-// GPIO pin assignments for XTEink X4 (ESP32-C3)
-// Reference only — not imported by other modules.
+// GPIO pin assignments for XTEink X4 (ESP32-C3). Reference only; not imported.
 //
 // GPIO  Function         Notes
 //  0    ADC battery      voltage divider, 100K/100K

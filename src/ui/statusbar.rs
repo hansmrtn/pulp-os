@@ -1,5 +1,5 @@
-// Persistent status bar at top of screen
-// Shows battery, uptime, heap (current/peak/total), stack, and SD card state.
+// Persistent status bar at top of screen.
+// Shows battery, uptime, heap (current/peak/total), stack, SD state.
 
 use core::fmt::Write;
 
@@ -80,7 +80,7 @@ impl StatusBar {
         }
 
         if s.heap_total > 0 {
-            // current / peak / total — all in KB
+            // current / peak / total in KB
             let _ = write!(
                 w,
                 "  H:{}/{}/{}K",
@@ -91,7 +91,7 @@ impl StatusBar {
         }
 
         if s.stack_free > 0 {
-            // free / high-water-mark (peak usage) — both in KB
+            // free / high-water-mark in KB
             let _ = write!(w, "  S:{}K/{}K", s.stack_free / 1024, s.stack_hwm / 1024);
         }
 
@@ -124,7 +124,7 @@ impl StatusBar {
     }
 }
 
-// distance from current SP down to _stack_end_cpu0 (bottom of stack / top of .bss)
+// distance from current SP down to _stack_end_cpu0 (bottom of stack)
 pub fn free_stack_bytes() -> usize {
     let sp: usize;
     #[cfg(target_arch = "riscv32")]
@@ -136,7 +136,7 @@ pub fn free_stack_bytes() -> usize {
         sp = 0;
     }
 
-    // lowest address the stack may reach; growth past this corrupts .bss
+    // lowest address the stack may reach
     #[cfg(target_arch = "riscv32")]
     {
         unsafe extern "C" {
@@ -152,11 +152,8 @@ pub fn free_stack_bytes() -> usize {
     }
 }
 
-// ── Stack painting ───────────────────────────────────────────────────────
-//
-// paint_stack() fills unused stack with 0xDEAD_BEEF at boot.
+// stack painting: paint_stack() fills unused stack with 0xDEAD_BEEF at boot;
 // stack_high_water_mark() scans upward to find peak usage.
-
 const STACK_PAINT_WORD: u32 = 0xDEAD_BEEF;
 
 // fill unused stack with sentinel; call once early in main before task spawn
@@ -173,12 +170,10 @@ pub fn paint_stack() {
         }
         let bottom = (&raw const _stack_end_cpu0) as usize;
 
-        // skip 256B above _stack_end_cpu0: covers esp-hal stack guard word
-        let guard_skip = 256;
+        let guard_skip = 256; // skip esp-hal stack guard word
         let paint_bottom = bottom + guard_skip;
 
-        // leave 256B below SP unpainted (our own frame + ISR margin)
-        let paint_top = sp.saturating_sub(256);
+        let paint_top = sp.saturating_sub(256); // leave 256B below SP for our frame + ISR
 
         if paint_top <= paint_bottom {
             return;
@@ -196,7 +191,7 @@ pub fn paint_stack() {
     }
 }
 
-// scan for first non-sentinel word from stack bottom; returns peak usage in bytes
+// scan for first non-sentinel word from stack bottom; return peak usage in bytes
 pub fn stack_high_water_mark() -> usize {
     #[cfg(target_arch = "riscv32")]
     {
@@ -207,8 +202,7 @@ pub fn stack_high_water_mark() -> usize {
         let bottom = (&raw const _stack_end_cpu0) as usize;
         let top = (&raw const _stack_start_cpu0) as usize;
 
-        // skip same guard region as paint_stack
-        let guard_skip = 256;
+        let guard_skip = 256; // same guard region as paint_stack
         let scan_bottom = bottom + guard_skip;
 
         let start = (scan_bottom + 3) & !3;

@@ -1,8 +1,6 @@
-// EPUB chapter cache — streaming decompress + HTML strip
-//
-// Stream ZIP entries through DEFLATE + HTML stripper to plain text
-// on SD. No persistent heap; ~51KB temporary per chapter (freed on
-// return). Cache dir: _XXXXXXX/ with META.BIN + CHnnn.TXT files.
+// EPUB chapter cache: streaming decompress + HTML strip to SD.
+// No persistent heap; ~51KB temp per chapter. Cache dir: _XXXXXXX/
+// with META.BIN + CHnnn.TXT files.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -32,7 +30,7 @@ pub fn fnv1a(data: &[u8]) -> u32 {
     h
 }
 
-// 8.3 cache dir name: '_' + 7 hex digits of lower 28 bits
+// 8.3 cache dir name: '_' + 7 hex digits of lower 28 bits of hash
 pub fn dir_name_for_hash(name_hash: u32) -> [u8; 8] {
     let h = name_hash & 0x0FFF_FFFF;
     let mut buf = [0u8; 8];
@@ -53,7 +51,7 @@ pub fn dir_name_str(buf: &[u8; 8]) -> &str {
     core::str::from_utf8(buf).unwrap_or("_0000000")
 }
 
-// 8.3 chapter filename: CH000.TXT .. CH255.TXT
+// 8.3 chapter filename: CH000.TXT to CH255.TXT
 pub fn chapter_file_name(idx: u16) -> [u8; 9] {
     let mut n = *b"CH000.TXT";
     n[2] = b'0' + ((idx / 100) % 10) as u8;
@@ -69,7 +67,7 @@ pub fn chapter_file_str(buf: &[u8; 9]) -> &str {
 
 pub const META_FILE: &str = "META.BIN";
 
-// encode cache metadata into buf; returns bytes written
+// encode cache metadata into buf; return bytes written
 pub fn encode_cache_meta(
     epub_size: u32,
     name_hash: u32,
@@ -101,7 +99,7 @@ pub fn encode_cache_meta(
     total
 }
 
-// parse and validate META.BIN; write chapter sizes into caller's slice
+// parse and validate META.BIN; write chapter sizes into out slice
 pub fn parse_cache_meta(
     data: &[u8],
     epub_size: u32,
@@ -155,14 +153,14 @@ pub fn parse_cache_meta(
     Ok(count)
 }
 
-// stream-decompress ZIP entry, strip HTML, emit plain-text chunks; ~47KB temp heap
+// stream-decompress ZIP entry, strip HTML, emit plain-text chunks; ~47KB temp
 pub fn stream_strip_entry<E>(
     entry: &ZipEntry,
     local_offset: u32,
     mut read_fn: impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
     mut output_fn: impl FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<u32, &'static str> {
-    // skip past local file header to entry data
+    // skip local file header to reach entry data
     let mut header = [0u8; 30];
     read_fn(local_offset, &mut header).map_err(|_| "cache: read local header failed")?;
     let skip = ZipIndex::local_header_data_skip(&header)?;
@@ -175,7 +173,7 @@ pub fn stream_strip_entry<E>(
     }
 }
 
-// stored entry: read raw, strip HTML, write via callback; stack only
+// stored entry: read raw, strip HTML, write via callback; stack-only
 fn stream_stored<E>(
     entry: &ZipEntry,
     data_offset: u32,
@@ -214,7 +212,7 @@ fn stream_stored<E>(
         )?;
     }
 
-    // Flush any trailing stripper state (deferred newlines, etc.)
+    // flush trailing stripper state (deferred newlines, etc.)
     let trailing = stripper.finish(&mut strip_buf[strip_pos..]);
     strip_pos += trailing;
     if strip_pos > 0 {
@@ -225,7 +223,7 @@ fn stream_stored<E>(
     Ok(total_written)
 }
 
-// deflate entry: decompress in 32KB circular window, strip HTML; ~47KB temp heap
+// deflate entry: decompress into 32KB circular window, strip HTML; ~47KB temp
 fn stream_deflate<E>(
     entry: &ZipEntry,
     data_offset: u32,
@@ -244,7 +242,7 @@ fn stream_deflate<E>(
         uncomp_size
     );
 
-    // ~11KB DecompressorOxide; alloc zeroed directly — Box::new() overflows stack
+    // ~11KB DecompressorOxide; alloc zeroed directly (Box::new overflows stack)
 
     let decomp_ptr =
         unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<DecompressorOxide>()) };
@@ -253,14 +251,14 @@ fn stream_deflate<E>(
     }
     let mut decomp = unsafe { Box::from_raw(decomp_ptr as *mut DecompressorOxide) };
 
-    // 32KB circular dictionary window
+    // 32KB circular dictionary
     let mut window = Vec::new();
     window
         .try_reserve_exact(WINDOW_SIZE)
         .map_err(|_| "cache: OOM for window")?;
     window.resize(WINDOW_SIZE, 0);
 
-    // 4KB compressed-data read buffer
+    // 4KB read buffer
     let mut rbuf = Vec::new();
     rbuf.try_reserve_exact(READ_BUF_SIZE)
         .map_err(|_| "cache: OOM for read buffer")?;
@@ -274,10 +272,10 @@ fn stream_deflate<E>(
     let mut in_avail: usize = 0;
     let mut file_pos = data_offset;
     let mut comp_left = comp_size;
-    let mut out_pos: usize = 0; // logical position in the circular window
+    let mut out_pos: usize = 0; // write position in circular window
 
     loop {
-        // top up read buffer from SD
+        // top up read buffer
         if in_avail < READ_BUF_SIZE && comp_left > 0 {
             let space = READ_BUF_SIZE - in_avail;
             let want = space.min(comp_left);
@@ -298,7 +296,7 @@ fn stream_deflate<E>(
             return Err("cache: empty deflate stream");
         }
 
-        // circular-buffer mode: do NOT set TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
+        // circular-buffer mode: do not set TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
         let flags = if comp_left > 0 {
             inflate_flags::TINFL_FLAG_HAS_MORE_INPUT
         } else {
@@ -340,7 +338,7 @@ fn stream_deflate<E>(
             TINFLStatus::Done => break,
 
             TINFLStatus::HasMoreOutput => {
-                // window full; reset to 0, data stays for back-references
+                // window full; reset write pos, data stays for back-references
                 out_pos = 0;
             }
 
@@ -367,7 +365,7 @@ fn stream_deflate<E>(
     Ok(total_written)
 }
 
-// feed input through stripper; flush to output_fn at FLUSH_THRESHOLD
+// feed input through stripper; flush to output_fn when FLUSH_THRESHOLD reached
 fn feed_and_flush(
     stripper: &mut HtmlStripStream,
     input: &[u8],
@@ -381,7 +379,7 @@ fn feed_and_flush(
     while ip < input.len() {
         let avail_out = STRIP_BUF_SIZE - *strip_pos;
         if avail_out == 0 {
-            // Output buffer completely full — flush before continuing.
+            // output buffer full; flush before continuing
             output_fn(&strip_buf[..*strip_pos])?;
             *total_written += *strip_pos as u32;
             *strip_pos = 0;
@@ -396,19 +394,18 @@ fn feed_and_flush(
         *strip_pos += written;
 
         if consumed == 0 && written == 0 {
-            // no progress: flush if we have data, otherwise skip byte
+            // no progress: flush pending data, or skip byte to break deadlock
             if *strip_pos > 0 {
                 output_fn(&strip_buf[..*strip_pos])?;
                 *total_written += *strip_pos as u32;
                 *strip_pos = 0;
             } else {
-                // safety net: advance to avoid infinite loop
                 ip += 1;
             }
             continue;
         }
 
-        // Flush when we have accumulated a good-sized chunk.
+        // flush when buffer is sufficiently full
         if *strip_pos >= FLUSH_THRESHOLD {
             output_fn(&strip_buf[..*strip_pos])?;
             *total_written += *strip_pos as u32;

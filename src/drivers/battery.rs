@@ -1,12 +1,11 @@
-// Li-ion battery voltage estimation
-//
-// GPIO0 reads through a 100K/100K divider (2:1). ADC with 11dB
-// attenuation gives 0..2500mV; multiply by 2 for actual cell voltage.
-// Piecewise-linear lookup table models the real discharge curve.
+// Li-ion battery voltage estimation.
+// GPIO0 reads through 100K/100K divider (2:1); ADC 11dB attenuation gives
+// 0..2500mV; multiply by 2 for actual cell voltage.
+// Piecewise-linear LUT models the discharge curve.
 
 const DIVIDER_MULT: u32 = 2;
 
-// (millivolts, percentage) — must be sorted descending by mV
+// (millivolts, percentage); must be sorted descending by mV
 const DISCHARGE_CURVE: &[(u32, u8)] = &[
     (4200, 100),
     (4060, 90),
@@ -38,7 +37,7 @@ pub fn battery_percentage(battery_mv: u16) -> u8 {
         return DISCHARGE_CURVE[last].1;
     }
 
-    // interpolate between the two bracketing points
+    // interpolate between bracketing points
     let mut i = 0;
     while i + 1 < DISCHARGE_CURVE.len() {
         let (mv_hi, pct_hi) = DISCHARGE_CURVE[i];

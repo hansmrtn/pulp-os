@@ -1,15 +1,6 @@
-// RAM-resident bookmark cache
-//
-// 16 slots × 48 bytes decoded, held permanently in RAM (~780 bytes).
-// Loaded from SD once via `ensure_loaded()`; all subsequent reads
-// (`find`, `load_all`) served from memory with zero SD I/O.
-//
-// Writes (`save`) update the in-memory cache and set a dirty flag.
-// `flush()` persists to SD only when dirty — called by the main
-// loop on nav transitions, app exit, or periodically.
-//
-// This eliminates the read→modify→write cycle on every position
-// save and removes all heap allocation from the bookmark path.
+// RAM-resident bookmark cache: 16 slots x 48 bytes held permanently in RAM (~780B).
+// Loaded from SD once; reads served from RAM with zero SD I/O.
+// Writes mark dirty; flush() persists to SD only when dirty.
 //
 // Record layout (little-endian, 48 bytes per slot):
 //   [0..4)   name_hash    u32
@@ -27,10 +18,8 @@ use crate::drivers::storage;
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
 pub const RECORD_LEN: usize = 48;
-pub const FILE_LEN: usize = SLOTS * RECORD_LEN; // 768
+pub const FILE_LEN: usize = SLOTS * RECORD_LEN; // 768B
 pub const FILENAME_CAP: usize = 32;
-
-// ── Slot types ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 pub struct BookmarkSlot {
@@ -104,7 +93,7 @@ impl BookmarkSlot {
     }
 }
 
-// lightweight entry for the bookmark list (35 bytes vs 48 for BookmarkSlot)
+// lightweight bookmark list entry (35B vs 48B for BookmarkSlot)
 #[derive(Clone, Copy)]
 pub struct BmListEntry {
     pub filename: [u8; FILENAME_CAP],
@@ -124,8 +113,6 @@ impl BmListEntry {
     }
 }
 
-// ── Hash ────────────────────────────────────────────────────────────
-
 // FNV-1a 32-bit hash
 pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -136,14 +123,10 @@ pub fn fnv1a(data: &[u8]) -> u32 {
     h
 }
 
-// ── RAM-resident cache ──────────────────────────────────────────────
-
-// in-memory bookmark table; loaded once, reads from RAM, writes mark dirty
-// ~780 bytes total (16 × 48B slots + overhead)
+// in-memory bookmark table; loaded once, reads from RAM, writes mark dirty (~780B)
 pub struct BookmarkCache {
     slots: [BookmarkSlot; SLOTS],
-    // slots present in file; new saves past this extend count
-    count: usize,
+    count: usize, // slots present in file; new saves past this extend count
     dirty: bool,
     loaded: bool,
 }
@@ -169,14 +152,11 @@ impl BookmarkCache {
         self.dirty
     }
 
-    // true if loaded from SD at least once
     pub fn is_loaded(&self) -> bool {
         self.loaded
     }
 
-    // ── Load from SD ────────────────────────────────────────────
-
-    // read bookmark file from SD; idempotent — no-op if already loaded
+    // read bookmark file from SD; idempotent; no-op if already loaded
     pub fn ensure_loaded<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         if self.loaded {
             return;
@@ -184,7 +164,7 @@ impl BookmarkCache {
         self.force_load(sd);
     }
 
-    // unconditionally reload from SD, discarding in-memory changes
+    // reload from SD, discarding in-memory changes
     pub fn force_load<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         let mut buf = [0u8; FILE_LEN];
         let slot_count = match storage::read_pulp_file_start(sd, BOOKMARK_FILE, &mut buf) {
@@ -207,9 +187,7 @@ impl BookmarkCache {
         log::info!("bookmarks: loaded {} slots from SD", slot_count);
     }
 
-    // ── In-memory reads (no SD I/O) ─────────────────────────────
-
-    // find bookmark by filename; None if not found or not yet loaded
+    // find bookmark by filename; None if not found or not loaded
     pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
         if !self.loaded {
             return None;
@@ -225,13 +203,13 @@ impl BookmarkCache {
         None
     }
 
-    // copy valid bookmarks into out, sorted by generation descending; returns count written
+    // copy valid bookmarks into out, sorted by generation descending; return count written
     pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
         if !self.loaded {
             return 0;
         }
 
-        // Collect valid entries with their generation for sorting.
+        // collect valid entries with their generation for sorting
         let mut gens = [0u16; SLOTS];
         let mut count = 0usize;
 
@@ -251,7 +229,7 @@ impl BookmarkCache {
             }
         }
 
-        // Insertion sort by generation descending (most recent first).
+        // insertion sort by generation descending (most recent first)
         for i in 1..count {
             let key_gen = gens[i];
             let key_entry = out[i];
@@ -268,10 +246,8 @@ impl BookmarkCache {
         count
     }
 
-    // ── In-memory writes (marks dirty, no SD I/O) ───────────────
-
-    // save bookmark; updates cache + marks dirty; call flush() to persist
-    // handles LRU eviction, generation increment, hash+name matching
+    // save bookmark; update cache + mark dirty; call flush() to persist.
+    // handles LRU eviction, generation increment, hash+name matching.
     pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         if !self.loaded {
             log::warn!("bookmarks: save called before load, ignoring");
@@ -280,7 +256,7 @@ impl BookmarkCache {
 
         let key = fnv1a(filename);
 
-        // Scan for: target slot, max generation, first free, LRU.
+        // scan for: target slot, max generation, first free, LRU
         let mut max_gen: u16 = 0;
         let mut target: Option<usize> = None;
         let mut first_free: Option<usize> = None;
@@ -333,7 +309,7 @@ impl BookmarkCache {
 
         self.slots[write_slot] = new_slot;
 
-        // Extend count if we wrote past the current end.
+        // extend count if we wrote past the current end
         if write_slot >= self.count {
             self.count = write_slot + 1;
         }
@@ -349,9 +325,7 @@ impl BookmarkCache {
         );
     }
 
-    // ── Flush to SD ─────────────────────────────────────────────
-
-    // write cache to SD if dirty; no-op if clean; 768-byte stack buffer
+    // write cache to SD if dirty; no-op if clean; 768B stack buffer
     pub fn flush<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         if !self.dirty || !self.loaded {
             return;
@@ -373,7 +347,7 @@ impl BookmarkCache {
             }
             Err(e) => {
                 log::warn!("bookmarks: flush failed: {}", e);
-                // Leave dirty=true so we retry next time.
+                // leave dirty=true so we retry next time
             }
         }
     }

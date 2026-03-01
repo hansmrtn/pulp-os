@@ -1,5 +1,4 @@
-// XTEink X4 board support (ESP32-C3, SSD1677 800x480, SD over SPI2)
-//
+// XTEink X4 board support (ESP32-C3, SSD1677 800x480, SD over SPI2).
 // DMA-backed SPI (GDMA CH0); RefCellDevice arbitrates bus.
 // BUSY (GPIO6) handled by esp-hal async Wait, not a pre-armed IRQ.
 
@@ -40,8 +39,7 @@ static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
 // ISR clears interrupt flag; InputDriver reads level via is_low()
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
-// GPIO3 only; BUSY handled by esp-hal async Wait. Clears flag and returns;
-// any IRQ exits WFI inside the Embassy executor.
+// GPIO3 only; BUSY handled by esp-hal async Wait; any IRQ exits WFI
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
@@ -49,7 +47,7 @@ fn gpio_handler() {
             && btn.is_interrupt_set()
         {
             btn.clear_interrupt();
-            // No explicit signal needed — any interrupt wakes the Embassy executor.
+            // any interrupt wakes the Embassy executor; no explicit signal needed
         }
     });
 }
@@ -146,7 +144,6 @@ impl Board {
 
         // no pre-armed interrupt; esp-hal async Wait manages GPIO6
         let busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
-        info!("display BUSY: GPIO6 (async wait, no pre-armed interrupt)");
 
         // GPIO12 free in DIO mode; no esp-hal type, use raw registers
         let sd_cs = unsafe { raw_gpio::RawOutputPin::new(12) };
@@ -159,7 +156,7 @@ impl Board {
             .with_mosi(p.GPIO10)
             .with_miso(p.GPIO7);
 
-        // 80 clocks with CS high (SD spec init) before DMA conversion
+        // 80 clocks with CS high before DMA conversion (SD spec init)
         let _ = spi_raw.write(&[0xFF; 10]);
 
         // 4096B each direction: strip max ~4000B, SD sectors 512B

@@ -1,8 +1,6 @@
-// Embassy spawned tasks — input polling, housekeeping, idle sleep
-//
+// Embassy spawned tasks: input polling, housekeeping, idle sleep.
 // input_task:        ADC ladder + power button debounce, 10ms poll.
-//                    Sends Button events; reads battery every ~30s.
-// housekeeping_task: periodic signals for status bar, SD check, bookmark flush.
+// housekeeping_task: periodic signals (status bar, SD check, bookmark flush).
 // idle_timeout_task: fires IDLE_SLEEP_DUE after configured idle minutes.
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -21,7 +19,7 @@ pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, Event, INPUT_CHANNEL_C
 // latest battery mv; Signal overwrites stale values
 pub static BATTERY_MV: Signal<CriticalSectionRawMutex, u16> = Signal::new();
 
-// 3000 × 10ms = 30s between battery reads
+// 3000 x 10ms = 30s between battery reads
 const BATTERY_INTERVAL_TICKS: u32 = 3000;
 
 #[embassy_executor::task]
@@ -37,8 +35,7 @@ pub async fn input_task(mut input: InputDriver) -> ! {
         ticker.next().await;
 
         if let Some(ev) = input.poll() {
-            // try_send: drop on full; main loop drains faster than events arrive
-            let _ = INPUT_EVENTS.try_send(ev);
+            let _ = INPUT_EVENTS.try_send(ev); // drop on full; main drains faster than events arrive
             IDLE_RESET.signal(());
         }
 
@@ -57,13 +54,13 @@ pub static BOOKMARK_FLUSH_DUE: Signal<CriticalSectionRawMutex, ()> = Signal::new
 
 #[embassy_executor::task]
 pub async fn housekeeping_task() -> ! {
-    // let boot rendering finish before first cycle
+    // let boot rendering finish before first housekeeping cycle
     Timer::after(Duration::from_secs(5)).await;
 
     let mut status_ticker = Ticker::every(Duration::from_secs(5));
     let mut sd_ticker = Ticker::every(Duration::from_secs(30));
 
-    // stagger bookmark 2s behind SD so they don't hit the card together
+    // stagger bookmark ticker 2s behind SD so they don't hit the card together
     Timer::after(Duration::from_secs(2)).await;
     let mut bm_ticker = Ticker::every(Duration::from_secs(30));
 
@@ -78,10 +75,10 @@ pub async fn housekeeping_task() -> ! {
     }
 }
 
-// set by main loop after loading settings; re-signal on change; 0 = never
+// set by main after loading settings; re-signal on change; 0 = never
 pub static IDLE_TIMEOUT_MINS: Signal<CriticalSectionRawMutex, u16> = Signal::new();
 
-// any button activity; Signal collapses rapid presses to one flag
+// any button activity; Signal collapses rapid presses to one
 pub static IDLE_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // fired when idle timer expires; main loop puts display + MCU to sleep
@@ -102,7 +99,7 @@ pub async fn idle_timeout_task() -> ! {
     let mut timeout_mins = IDLE_TIMEOUT_MINS.wait().await;
 
     loop {
-        // park until user enables a timeout
+        // park until a non-zero timeout is configured
         if timeout_mins == 0 {
             timeout_mins = IDLE_TIMEOUT_MINS.wait().await;
             continue;
@@ -128,7 +125,7 @@ pub async fn idle_timeout_task() -> ! {
             .await
             {
                 Either3::First(()) => {
-                    // activity — restart countdown
+                    // activity; restart countdown
                     continue;
                 }
                 Either3::Second(new_mins) => {
@@ -138,8 +135,7 @@ pub async fn idle_timeout_task() -> ! {
                 Either3::Third(()) => {
                     IDLE_SLEEP_DUE.signal(());
 
-                    // park until main loop acts (deep sleep is -> !, so this
-                    // rarely returns; handles aborted sleep gracefully)
+                    // park until main acts; deep sleep is -> ! so this rarely returns
                     use embassy_futures::select::{Either, select};
                     match select(IDLE_RESET.wait(), IDLE_TIMEOUT_MINS.wait()).await {
                         Either::First(()) => {}

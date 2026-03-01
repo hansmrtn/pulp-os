@@ -1,12 +1,11 @@
-// Single-pass HTML to styled-text converter for EPUB XHTML
-//
+// Single-pass HTML to styled-text converter for EPUB XHTML.
 // HtmlStripStream: streaming feed/finish; emits 2-byte [MARKER, tag] style codes.
 // strip_html_inplace(): in-place variant for container.xml/OPF/TOC.
 // Marker: [0x01, tag]. Inline: B/b I/i. Block: H/h Q/q S(hr).
 
 use alloc::vec::Vec;
 
-pub const MARKER: u8 = 0x01; // escape byte for 2-byte style markers
+pub const MARKER: u8 = 0x01; // escape byte for style markers
 
 pub const BOLD_ON: u8 = b'B';
 pub const BOLD_OFF: u8 = b'b';
@@ -19,7 +18,7 @@ pub const QUOTE_OFF: u8 = b'q';
 
 // Standalone
 pub const BREAK: u8 = b'S';
-pub const IMG_REF: u8 = b'P'; // image ref: [MARKER, IMG_REF, len, path_bytes...]
+pub const IMG_REF: u8 = b'P'; // image ref: [MARKER, IMG_REF, len, path...]
 
 #[inline]
 pub const fn is_marker(b: u8) -> bool {
@@ -31,9 +30,9 @@ const ENTITY_BUF_CAP: usize = 12;
 const BANG_BUF_CAP: usize = 8;
 const PENDING_CAP: usize = 16;
 const DEFERRED_CAP: usize = 8;
-const IMG_SRC_CAP: usize = 128; // 3-byte header + up to 125 path bytes
+const IMG_SRC_CAP: usize = 128; // 3-byte marker header + up to 125 path bytes
 
-// streaming state machine phases
+// state machine phases
 #[derive(Clone, Copy, PartialEq)]
 #[repr(u8)]
 enum Phase {
@@ -69,51 +68,45 @@ impl Default for HtmlStripStream {
 pub struct HtmlStripStream {
     phase: Phase,
 
-    // ── Tag name accumulation ──────────────────────────────────
+    // tag name accumulation
     tag_buf: [u8; TAG_BUF_CAP],
     tag_len: u8,
     is_close_tag: bool,
     enter_skip: bool, // tag is skip-content; enter SkipContent on >
 
-    // ── Entity accumulation ────────────────────────────────────
+    // entity accumulation
     entity_buf: [u8; ENTITY_BUF_CAP],
     entity_len: u8,
 
-    // ── Skip content ───────────────────────────────────────────
+    // skip content
     skip_target: Option<SkipTag>,
     skip_match: bool, // in SkipToGt: did close tag name match?
 
-    // ── Bang construct probing ─────────────────────────────────
+    // bang construct probing
     bang_buf: [u8; BANG_BUF_CAP],
     bang_len: u8,
 
-    // ── Terminator matching (comment / CDATA / PI) ─────────────
+    // terminator matching (comment / CDATA / PI)
     match_pos: u8,
 
-    // ── Output state ───────────────────────────────────────────
+    // output state
     last_was_space: bool,
     trailing_nl: u8, // deferred newlines; flushed before next visible byte; capped at 2
     has_output: bool, // true once any visible char emitted; suppresses leading whitespace
 
-    // ── Deferred open-style markers ────────────────────────────
-    //
-    // Open-tag markers (bold on, heading on, etc.) are deferred so
-    // they appear AFTER paragraph-break newlines and BEFORE text.
-    // Close-tag markers go to `pending` immediately so they appear
-    // BEFORE paragraph-break newlines.
+    // deferred open-style markers; open-tag markers (bold on, heading on, etc.)
+    // appear AFTER paragraph-break newlines and BEFORE text.
+    // close-tag markers go to `pending` immediately (before paragraph newlines).
     deferred: [u8; DEFERRED_CAP],
     deferred_len: u8,
 
-    // ── Pending output buffer ──────────────────────────────────
-    //
-    // Bytes queued by classify_tag (close markers) or queue_text
-    // (newlines + deferred markers + text byte) that haven't yet
-    // been drained to the caller's output slice.
+    // pending output: bytes queued by classify_tag or queue_text not yet
+    // drained to the caller's output slice
     pending: [u8; PENDING_CAP],
     pend_w: u8,
     pend_r: u8,
 
-    // ── Image src capture (<img src="...">) ────────────────────
+    // image src capture (<img src="...">)
     img_src: [u8; IMG_SRC_CAP],
     img_w: u8,         // write cursor (accumulation at [3..]) / drain length
     img_r: u8,         // drain read cursor
@@ -154,7 +147,7 @@ impl HtmlStripStream {
         }
     }
 
-    // process a chunk of HTML; returns (consumed, written); call again if not all consumed
+    // process a chunk of HTML; returns (consumed, written); call again if input not fully consumed
     pub fn feed(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize) {
         let ilen = input.len();
         let olen = output.len();
@@ -162,7 +155,7 @@ impl HtmlStripStream {
         let mut op: usize = 0;
 
         loop {
-            // ── Step 1: drain pending bytes to output ──────────
+            // step 1: drain pending bytes to output
             while self.pend_r < self.pend_w {
                 if op >= olen {
                     return (ip, op);
@@ -174,7 +167,7 @@ impl HtmlStripStream {
             self.pend_r = 0;
             self.pend_w = 0;
 
-            // ── Step 1.5: drain image reference ────────────
+            // step 1.5: drain image reference
             if !self.capture_img && self.img_r < self.img_w {
                 while self.img_r < self.img_w {
                     if op >= olen {
@@ -188,24 +181,20 @@ impl HtmlStripStream {
                 self.img_w = 0;
             }
 
-            // ── Step 2: check for end of input ─────────────────
+            // step 2: check for end of input
             if ip >= ilen {
                 return (ip, op);
             }
 
-            // ── Step 3: process one input byte ─────────────────
+            // step 3: process one input byte
             let b = input[ip];
             let mut advance = true;
 
             match self.phase {
-                // ──────────────────────────────────────────────
-                //  Normal text
-                // ──────────────────────────────────────────────
+                // normal text
                 Phase::Text => {
                     if b == MARKER {
-                        // Escape a literal 0x01 in source text (very rare).
-                        // Emit nothing — drop it silently.  Real EPUBs
-                        // never contain SOH bytes.
+                        // literal 0x01 in source; drop silently (SOH never in real EPUBs)
                     } else if b == b'<' {
                         self.phase = Phase::AfterLt;
                     } else if b == b'&' {
@@ -218,9 +207,7 @@ impl HtmlStripStream {
                     }
                 }
 
-                // ──────────────────────────────────────────────
-                //  After '<'
-                // ──────────────────────────────────────────────
+                // after '<'
                 Phase::AfterLt => match b {
                     b'!' => {
                         self.bang_len = 0;
@@ -237,7 +224,7 @@ impl HtmlStripStream {
                         self.phase = Phase::TagName;
                     }
                     b'>' => {
-                        // Empty `<>` — ignore.
+                        // empty <>; ignore
                         self.phase = Phase::Text;
                     }
                     _ => {
@@ -245,13 +232,11 @@ impl HtmlStripStream {
                         self.tag_len = 0;
                         self.enter_skip = false;
                         self.phase = Phase::TagName;
-                        advance = false; // TagName handles this byte
+                        advance = false; // reprocess in TagName
                     }
                 },
 
-                // ──────────────────────────────────────────────
-                //  Accumulating tag name
-                // ──────────────────────────────────────────────
+                // accumulating tag name
                 Phase::TagName => {
                     if is_tag_delim(b) {
                         self.classify_tag();
@@ -271,22 +256,17 @@ impl HtmlStripStream {
                         self.tag_buf[self.tag_len as usize] = b.to_ascii_lowercase();
                         self.tag_len += 1;
                     }
-                    // Overflow: stop accumulating, keep scanning for delimiter.
+                    // overflow: stop accumulating, keep scanning for delimiter
                 }
 
-                // ──────────────────────────────────────────────
-                //  Past tag name, skip attributes to '>'
-                // ──────────────────────────────────────────────
+                // past tag name; skip attributes to '>'
                 Phase::TagBody => {
                     if b == b'>' {
                         self.finish_tag();
                     }
-                    // else: consume and stay in TagBody
                 }
 
-                // ──────────────────────────────────────────────
-                //  <img> attribute parsing — capture src="..."
-                // ──────────────────────────────────────────────
+                // <img> attribute parsing; capture src="..."
                 Phase::ImgBody => {
                     if b == b'>' {
                         self.finish_img_tag();
@@ -296,7 +276,7 @@ impl HtmlStripStream {
                         self.tag_len = 1;
                         self.phase = Phase::ImgAttrName;
                     }
-                    // whitespace, '/', etc — stay
+                    // whitespace, '/', etc: stay
                 }
 
                 Phase::ImgAttrName => {
@@ -327,7 +307,7 @@ impl HtmlStripStream {
                         self.tag_len = 1;
                         self.phase = Phase::ImgAttrName;
                     }
-                    // whitespace, '/' — stay
+                    // whitespace, '/': stay
                 }
 
                 Phase::ImgValStart => {
@@ -341,7 +321,7 @@ impl HtmlStripStream {
                     } else if b == b'>' {
                         self.finish_img_tag();
                     } else if !is_html_ws(b) {
-                        // Unquoted attribute value
+                        // unquoted attribute value
                         self.img_quote = 0;
                         if self.img_is_src {
                             let pos = self.img_w as usize;
@@ -390,9 +370,7 @@ impl HtmlStripStream {
                     }
                 }
 
-                // ──────────────────────────────────────────────
-                //  Entity accumulation
-                // ──────────────────────────────────────────────
+                // entity accumulation
                 Phase::Entity => {
                     if b == b';' {
                         let name = &self.entity_buf[..self.entity_len as usize];
@@ -408,7 +386,7 @@ impl HtmlStripStream {
                                 self.queue_text(c);
                             }
                             None => {
-                                // Unrecognised entity → literal '&'
+                                // unrecognised entity; emit literal '&'
                                 self.queue_text(b'&');
                             }
                         }
@@ -417,16 +395,14 @@ impl HtmlStripStream {
                         self.entity_buf[self.entity_len as usize] = b;
                         self.entity_len += 1;
                     } else {
-                        // Invalid char or buffer overflow → literal '&'
+                        // invalid char or overflow; emit literal '&'
                         self.queue_text(b'&');
                         self.phase = Phase::Text;
                         advance = false; // reprocess this byte as text
                     }
                 }
 
-                // ──────────────────────────────────────────────
-                //  Skip content (script / style / head)
-                // ──────────────────────────────────────────────
+                // skip content (script / style / head)
                 Phase::SkipContent => {
                     if b == b'<' {
                         self.phase = Phase::SkipLt;
@@ -481,9 +457,7 @@ impl HtmlStripStream {
                     }
                 }
 
-                // ──────────────────────────────────────────────
-                //  Bang construct probing (after '<!')
-                // ──────────────────────────────────────────────
+                // bang construct probing (after '<!')
                 Phase::BangProbe => {
                     if b == b'>' {
                         self.phase = Phase::Text;
@@ -508,7 +482,7 @@ impl HtmlStripStream {
                                 self.phase = Phase::BangOther;
                             }
                         } else {
-                            // bang_buf[0] == '[', check against "[CDATA["
+                            // bang_buf[0] == '[': check against "[CDATA["
                             const CDATA: &[u8] = b"[CDATA[";
                             if n <= CDATA.len() && b == CDATA[n - 1] {
                                 if n == CDATA.len() {
@@ -522,9 +496,7 @@ impl HtmlStripStream {
                     }
                 }
 
-                // ──────────────────────────────────────────────
-                //  Comment: scanning for '-->'
-                // ──────────────────────────────────────────────
+                // comment: scanning for '-->'
                 Phase::Comment => match self.match_pos {
                     0 => {
                         if b == b'-' {
@@ -547,9 +519,7 @@ impl HtmlStripStream {
                     }
                 },
 
-                // ──────────────────────────────────────────────
-                //  CDATA: scanning for ']]>'
-                // ──────────────────────────────────────────────
+                // CDATA: scanning for ']]>'
                 Phase::Cdata => match self.match_pos {
                     0 => {
                         if b == b']' {
@@ -572,9 +542,7 @@ impl HtmlStripStream {
                     }
                 },
 
-                // ──────────────────────────────────────────────
-                //  Processing instruction: scanning for '?>'
-                // ──────────────────────────────────────────────
+                // PI: scanning for '?>'
                 Phase::Pi => match self.match_pos {
                     0 => {
                         if b == b'?' {
@@ -590,9 +558,7 @@ impl HtmlStripStream {
                     }
                 },
 
-                // ──────────────────────────────────────────────
-                //  Other bang construct: scanning for '>'
-                // ──────────────────────────────────────────────
+                // other bang construct: scanning for '>'
                 Phase::BangOther => {
                     if b == b'>' {
                         self.phase = Phase::Text;
@@ -606,11 +572,11 @@ impl HtmlStripStream {
         }
     }
 
-    // flush pending state; appends terminal newline if content was produced; returns bytes written
+    // flush pending state; append terminal newline if content was produced; return bytes written
     pub fn finish(&mut self, output: &mut [u8]) -> usize {
         let mut op: usize = 0;
 
-        // Drain remaining pending bytes
+        // drain remaining pending bytes
         while self.pend_r < self.pend_w && op < output.len() {
             output[op] = self.pending[self.pend_r as usize];
             op += 1;
@@ -619,7 +585,7 @@ impl HtmlStripStream {
         self.pend_r = 0;
         self.pend_w = 0;
 
-        // Terminal newline
+        // terminal newline
         if self.has_output && op < output.len() {
             output[op] = b'\n';
             op += 1;
@@ -628,8 +594,6 @@ impl HtmlStripStream {
         self.phase = Phase::Text;
         op
     }
-
-    // ── Internal: pending buffer ──────────────────────────────────
 
     #[inline]
     fn push_pending(&mut self, byte: u8) {
@@ -640,8 +604,6 @@ impl HtmlStripStream {
         }
     }
 
-    // ── Internal: deferred marker buffer ──────────────────────────
-
     fn push_deferred_marker(&mut self, tag: u8) {
         let n = self.deferred_len as usize;
         if n + 2 <= DEFERRED_CAP {
@@ -651,11 +613,9 @@ impl HtmlStripStream {
         }
     }
 
-    // ── Internal: output helpers ──────────────────────────────────
-
-    // queue visible text byte; flushes deferred newlines and style markers first
+    // queue visible text byte; flush deferred newlines and style markers first
     fn queue_text(&mut self, b: u8) {
-        // Deferred newlines
+        // deferred newlines
         if self.has_output && self.trailing_nl > 0 {
             let nl = self.trailing_nl;
             for _ in 0..nl {
@@ -664,14 +624,13 @@ impl HtmlStripStream {
         }
         self.trailing_nl = 0;
 
-        // Deferred open-style markers
+        // deferred open-style markers
         let dlen = self.deferred_len as usize;
         for i in 0..dlen {
             self.push_pending(self.deferred[i]);
         }
         self.deferred_len = 0;
 
-        // The text byte
         self.push_pending(b);
         self.last_was_space = false;
         self.has_output = true;
@@ -684,7 +643,7 @@ impl HtmlStripStream {
         }
         self.last_was_space = true;
 
-        // Pending newlines already act as word separators.
+        // pending newlines already act as word separators
         if self.trailing_nl > 0 {
             return;
         }
@@ -692,59 +651,52 @@ impl HtmlStripStream {
         self.push_pending(b' ');
     }
 
-    // ── Internal: tag classification ──────────────────────────────
-
-    // classify accumulated tag name; push close markers to pending, open markers to deferred
+    // classify accumulated tag name; push close markers to pending, open to deferred
     fn classify_tag(&mut self) {
-        // Copy tag name to a local to avoid borrowing self.tag_buf
-        // while we mutate self through push_pending / push_deferred.
+        // copy tag name to a local to avoid borrowing self.tag_buf
+        // while mutating self through push_pending / push_deferred
         let mut tn = [0u8; TAG_BUF_CAP];
         let tn_len = self.tag_len as usize;
         tn[..tn_len].copy_from_slice(&self.tag_buf[..tn_len]);
         let name = &tn[..tn_len];
         let is_close = self.is_close_tag;
 
-        // Skip-content tags (script / style / head) — open only
+        // skip-content tags (script/style/head); open only
         if !is_close && let Some(sk) = SkipTag::from_name(name) {
             self.skip_target = Some(sk);
             self.enter_skip = true;
         }
 
-        // Close-tag style markers go out IMMEDIATELY (before any
-        // deferred newlines from the block-element check below).
+        // close-tag markers go out immediately (before deferred newlines)
         if is_close && let Some(m) = close_style_tag(name) {
             self.push_pending(MARKER);
             self.push_pending(m);
         }
 
-        // Block elements set deferred paragraph breaks.
+        // block elements set deferred paragraph breaks
         if is_block_element(name) {
             self.trailing_nl = self.trailing_nl.max(2);
             self.last_was_space = true;
         }
 
-        // Open-tag style markers are DEFERRED (after newlines,
-        // before text).  This applies to both block-style (heading,
-        // blockquote) and inline-style (bold, italic) tags.
-        //
-        // Deferring inline markers too is correct: `<p><b>text`
-        // should produce `\n\n[B]text`, not `[B]\n\ntext`.
+        // open-tag markers are deferred (after newlines, before text);
+        // inline markers too: <p><b>text -> \n\n[B]text, not [B]\n\ntext
         if !is_close && let Some(m) = open_style_tag(name) {
             self.push_deferred_marker(m);
         }
 
-        // <br> — line break
+        // <br>: line break
         if name == b"br" {
             self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
             self.last_was_space = true;
         }
 
-        // <hr> — scene break marker (deferred, like open markers)
+        // <hr>: scene break marker (deferred)
         if name == b"hr" && !is_close {
             self.push_deferred_marker(BREAK);
         }
 
-        // <img> — enter image-src capture mode
+        // <img>: enter image-src capture mode
         if name == b"img" && !is_close {
             self.capture_img = true;
             self.img_w = 3; // reserve [0..3] for marker header
@@ -752,7 +704,7 @@ impl HtmlStripStream {
         }
     }
 
-    // transition out of TagName/TagBody on >
+    // transition out of TagName/TagBody on '>'
     fn finish_tag(&mut self) {
         if self.enter_skip {
             self.enter_skip = false;
@@ -762,17 +714,17 @@ impl HtmlStripStream {
         }
     }
 
-    // finish <img> tag — emit image-ref marker if src was captured
+    // finish <img> tag; emit image-ref marker if src was captured
     fn finish_img_tag(&mut self) {
         let path_len = (self.img_w as usize).saturating_sub(3);
         self.capture_img = false;
 
         if path_len > 0 {
-            // Block break before image
+            // block break before image
             if self.has_output {
                 self.trailing_nl = self.trailing_nl.max(2);
             }
-            // Emit deferred newlines
+            // emit deferred newlines
             if self.has_output && self.trailing_nl > 0 {
                 let nl = self.trailing_nl;
                 for _ in 0..nl {
@@ -780,20 +732,19 @@ impl HtmlStripStream {
                 }
             }
             self.trailing_nl = 0;
-            // Flush deferred open-style markers
+            // flush deferred open-style markers
             let dlen = self.deferred_len as usize;
             for i in 0..dlen {
                 self.push_pending(self.deferred[i]);
             }
             self.deferred_len = 0;
-            // Fill marker header: [MARKER, IMG_REF, path_len]
-            // Path bytes are already at img_src[3..3+path_len].
+            // fill marker header [MARKER, IMG_REF, path_len];
+            // path bytes already at img_src[3..3+path_len]
             self.img_src[0] = MARKER;
             self.img_src[1] = IMG_REF;
             self.img_src[2] = path_len as u8;
-            // img_w already points past the last path byte; start drain
             self.img_r = 0;
-            // Block break after image
+            // block break after image
             self.trailing_nl = 2;
             self.last_was_space = true;
             self.has_output = true;
@@ -805,11 +756,8 @@ impl HtmlStripStream {
     }
 }
 
-// ── In-place stripper (legacy) ────────────────────────────────────────
-//
-// Operates on a complete buffer.  Produces plain text WITHOUT style
-// markers.  Write cursor never passes read cursor (w ≤ r always).
-
+// in-place HTML stripper: operates on a complete buffer, produces plain text
+// without style markers. write cursor never passes read cursor (w <= r always).
 pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     let len = buf.len();
     if len == 0 {
@@ -964,8 +912,6 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     buf.truncate(w);
 }
 
-// ── Shared: block element classification ──────────────────────────────
-
 fn is_block_element(name: &[u8]) -> bool {
     matches!(
         name,
@@ -998,11 +944,7 @@ fn is_block_element(name: &[u8]) -> bool {
     )
 }
 
-// ── Shared: style tag classification ──────────────────────────────────
-//
-// Returns the marker tag byte for tags that carry formatting.
-// Used by HtmlStripStream::classify_tag.
-
+// marker byte for formatting tags; used by classify_tag
 fn open_style_tag(tag: &[u8]) -> Option<u8> {
     match tag {
         b"b" | b"strong" => Some(BOLD_ON),
@@ -1022,8 +964,6 @@ fn close_style_tag(tag: &[u8]) -> Option<u8> {
         _ => None,
     }
 }
-
-// ── Shared: skip-content tags ─────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 enum SkipTag {
@@ -1078,9 +1018,7 @@ fn find_close_tag(data: &[u8], name: &[u8]) -> Option<usize> {
     None
 }
 
-// ── Shared: entity resolution (streaming stripper) ────────────────────
-
-// resolve entity name to output byte; None for unrecognised names
+// resolve entity name to output byte; None for unrecognised
 fn resolve_entity(name: &[u8]) -> Option<u8> {
     match name {
         b"amp" => Some(b'&'),
@@ -1118,22 +1056,19 @@ fn codepoint_to_byte(cp: u32) -> Option<u8> {
     match cp {
         0 => None,
         0x0001..=0x007F => Some(cp as u8),
-        0x00A0 => Some(b' '), // non-breaking space
+        0x00A0 => Some(b' '), // nbsp
         0x00AD => Some(b'-'), // soft hyphen
         0x2013 | 0x2014 => Some(b'-'),
         0x2018..=0x201A => Some(b'\''),
         0x201C..=0x201E => Some(b'"'),
         0x2022 => Some(b'*'),
         0x2026 => Some(b'.'),
-        _ => Some(b'?'), // Unicode placeholder
+        _ => Some(b'?'), // unicode placeholder
     }
 }
 
-// ── In-place entity decoding ──────────────────────────────────────────
-//
-// Separate from resolve_entity to avoid changing the in-place stripper's
-// exact behaviour (DecodedInplace::Unicode vs Some(b'?'), advance logic).
-
+// in-place entity decoding; separate from resolve_entity to preserve
+// existing stripper behaviour (DecodedInplace::Unicode vs Some(b'?'))
 enum DecodedInplace {
     Byte(u8),
     #[allow(dead_code)]
@@ -1204,8 +1139,6 @@ fn codepoint_to_decoded_inplace(cp: u32) -> DecodedInplace {
     }
 }
 
-// ── Shared: numeric parsing ───────────────────────────────────────────
-
 fn parse_hex(bytes: &[u8]) -> u32 {
     let mut val = 0u32;
     for &b in bytes {
@@ -1232,8 +1165,6 @@ fn parse_decimal(bytes: &[u8]) -> u32 {
     val
 }
 
-// ── Shared: character classification ──────────────────────────────────
-
 #[inline]
 fn is_html_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
@@ -1248,8 +1179,6 @@ fn is_tag_delim(b: u8) -> bool {
 fn is_entity_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'#'
 }
-
-// ── In-place scanning helpers ─────────────────────────────────────────
 
 fn skip_to_gt(data: &[u8], mut pos: usize) -> usize {
     while pos < data.len() {

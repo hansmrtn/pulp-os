@@ -134,3 +134,23 @@ impl Alignment {
         }
     }
 }
+
+// wrap-around list navigation helpers
+
+// advance index by one, wrapping past count-1 back to 0
+#[inline]
+pub fn wrap_next(current: usize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if current + 1 >= count { 0 } else { current + 1 }
+}
+
+// retreat index by one, wrapping past 0 to count-1
+#[inline]
+pub fn wrap_prev(current: usize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if current == 0 { count - 1 } else { current - 1 }
+}

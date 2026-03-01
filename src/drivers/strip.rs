@@ -1,7 +1,6 @@
-// Strip-based rendering buffer for e-paper
-//
-// 4KB strip instead of 48KB framebuffer. Display split into
-// horizontal bands; widgets draw to logical coords, clipped here.
+// Strip-based rendering buffer for e-paper.
+// 4KB strip instead of 48KB framebuffer; display split into horizontal bands.
+// Widgets draw to logical coords, clipped here.
 // begin_strip() for full refresh, begin_window() for partial.
 
 use embedded_graphics_core::{
@@ -15,11 +14,11 @@ use embedded_graphics_core::{
 use super::ssd1677::{HEIGHT, Rotation, WIDTH};
 use crate::ui::Region;
 
-pub const STRIP_ROWS: u16 = 40; // 800/8 * 40 = 4000B per strip
+pub const STRIP_ROWS: u16 = 40; // 4000B per strip (800/8 * 40)
 pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8;
 
-pub const STRIP_BUF_SIZE: usize = PHYS_BYTES_PER_ROW * STRIP_ROWS as usize; // 4000
-pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS; // 12
+pub const STRIP_BUF_SIZE: usize = PHYS_BYTES_PER_ROW * STRIP_ROWS as usize; // 4000B
+pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS; // 12 strips
 
 pub struct StripBuffer {
     buf: [u8; STRIP_BUF_SIZE],
@@ -383,7 +382,7 @@ impl DrawTarget for StripBuffer {
 
         match self.rotation {
             Rotation::Deg270 => {
-                // logical (lx,ly) → physical (ly, HEIGHT-1-lx)
+                // logical (lx,ly) -> physical (ly, HEIGHT-1-lx)
                 self.fill_physical_rect(ly0, HEIGHT - lx1, ly1, HEIGHT - lx0, black);
             }
             Rotation::Deg0 => {

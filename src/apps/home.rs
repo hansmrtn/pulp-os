@@ -1,8 +1,6 @@
-// Launcher screen, entry point after boot
-//
-// Menu items: Continue (if recent) / Files / Bookmarks / Settings.
-// "Bookmarks" enters a scrollable list of saved reading positions,
-// sorted most-recent-first. Selecting one opens that book.
+// Launcher screen, entry point after boot.
+// Menu: Continue (if recent) / Files / Bookmarks / Settings / Upload.
+// Bookmarks shows a scrollable list of saved positions, most-recent-first.
 
 use core::fmt::Write as _;
 
@@ -19,7 +17,7 @@ use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
 use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
-// menu layout
+// menu layout constants
 const ITEM_W: u16 = 280;
 const ITEM_H: u16 = 52;
 const ITEM_GAP: u16 = 14;
@@ -28,7 +26,7 @@ const ITEM_X: u16 = (480 - ITEM_W) / 2;
 const TITLE_ITEM_GAP: u16 = 24;
 const MAX_ITEMS: usize = 5;
 
-// bookmark list view
+// bookmark list layout
 const BM_MARGIN: u16 = 8;
 const BM_HEADER_GAP: u16 = 4;
 const BM_BOTTOM: u16 = 790;
@@ -65,12 +63,12 @@ pub struct HomeApp {
     item_regions: [Region; MAX_ITEMS],
     item_count: usize,
 
-    // recent book ("Continue" button)
+    // recent book for "Continue" button
     recent_book: [u8; 32],
     recent_book_len: usize,
     needs_load_recent: bool,
 
-    // bookmark browser
+    // bookmark browser state
     bm_entries: [BmListEntry; bookmarks::SLOTS],
     bm_count: usize,
     bm_selected: usize,
@@ -93,7 +91,7 @@ impl HomeApp {
             body_font: fonts::body_font(0),
             heading_font: hf,
             item_regions: compute_item_regions(hf.line_height),
-            item_count: 4, // Files + Bookmarks + Settings + Upload; updated after load
+            item_count: 4, // updated after load; may include Continue
             recent_book: [0u8; 32],
             recent_book_len: 0,
             needs_load_recent: false,
@@ -111,7 +109,7 @@ impl HomeApp {
         self.item_regions = compute_item_regions(self.heading_font.line_height);
     }
 
-    // called once at boot before the first render
+    // called once at boot before first render
     pub fn load_recent<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         services: &mut Services<'_, SPI>,
@@ -132,7 +130,6 @@ impl HomeApp {
     }
 
     fn rebuild_item_count(&mut self) {
-        // Continue (optional) + Files + Bookmarks + Settings + Upload
         self.item_count = if self.recent_book_len > 0 { 5 } else { 4 };
         if self.selected >= self.item_count {
             self.selected = 0;
@@ -194,8 +191,6 @@ impl HomeApp {
         }
     }
 
-    // ── Bookmark list helpers ────────────────────────────────────
-
     fn bm_text_y(&self) -> u16 {
         CONTENT_TOP + 4 + self.heading_font.line_height + BM_HEADER_GAP
     }
@@ -215,14 +210,14 @@ impl App for HomeApp {
         ctx.clear_message();
         self.state = HomeState::Menu;
         self.selected = 0;
-        ctx.request_screen_redraw();
+        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
         self.state = HomeState::Menu;
         self.selected = 0;
         self.needs_load_recent = true;
-        ctx.request_screen_redraw();
+        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
     }
 
     fn needs_work(&self) -> bool {
@@ -285,8 +280,6 @@ impl App for HomeApp {
     }
 }
 
-// ── Event handlers ──────────────────────────────────────────────────
-
 impl HomeApp {
     fn on_event_menu(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
         match event {
@@ -328,8 +321,13 @@ impl HomeApp {
             }
 
             ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
-                if self.bm_count > 0 && self.bm_selected + 1 < self.bm_count {
-                    self.bm_selected += 1;
+                if self.bm_count > 0 {
+                    if self.bm_selected + 1 < self.bm_count {
+                        self.bm_selected += 1;
+                    } else {
+                        self.bm_selected = 0;
+                        self.bm_scroll = 0;
+                    }
                     let vis = self.bm_visible_lines();
                     if self.bm_selected >= self.bm_scroll + vis {
                         self.bm_scroll = self.bm_selected + 1 - vis;
@@ -340,8 +338,16 @@ impl HomeApp {
             }
 
             ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
-                if self.bm_selected > 0 {
-                    self.bm_selected -= 1;
+                if self.bm_count > 0 {
+                    if self.bm_selected > 0 {
+                        self.bm_selected -= 1;
+                    } else {
+                        self.bm_selected = self.bm_count - 1;
+                        let vis = self.bm_visible_lines();
+                        if self.bm_selected >= vis {
+                            self.bm_scroll = self.bm_selected + 1 - vis;
+                        }
+                    }
                     if self.bm_selected < self.bm_scroll {
                         self.bm_scroll = self.bm_selected;
                     }
@@ -388,8 +394,6 @@ impl HomeApp {
     }
 }
 
-// ── Drawing ─────────────────────────────────────────────────────────
-
 impl HomeApp {
     fn draw_menu(&self, strip: &mut StripBuffer) {
         let title_region = Region::new(
@@ -414,7 +418,6 @@ impl HomeApp {
     }
 
     fn draw_bookmarks(&self, strip: &mut StripBuffer) {
-        // header
         let header_region = Region::new(
             BM_MARGIN,
             CONTENT_TOP + 4,
@@ -426,7 +429,6 @@ impl HomeApp {
             .draw(strip)
             .unwrap();
 
-        // counter
         if self.bm_count > 0 {
             let status_region = Region::new(
                 SCREEN_W / 2,
@@ -440,7 +442,6 @@ impl HomeApp {
             status.draw(strip).unwrap();
         }
 
-        // empty state
         if self.bm_count == 0 {
             let r = Region::new(BM_MARGIN, self.bm_text_y(), 300, self.body_font.line_height);
             BitmapLabel::new(r, "No bookmarks saved", self.body_font)
@@ -450,7 +451,6 @@ impl HomeApp {
             return;
         }
 
-        // scrollable list
         let font = self.body_font;
         let line_h = font.line_height as i32;
         let ascent = font.ascent as i32;
@@ -483,7 +483,6 @@ impl HomeApp {
 
             let mut cx = BM_MARGIN as i32;
 
-            // chapter prefix for multi-chapter books
             if entry.chapter > 0 {
                 let mut ch_buf = [0u8; 8];
                 let ch_len = fmt_chapter_prefix(&mut ch_buf, entry.chapter);
@@ -502,7 +501,7 @@ impl HomeApp {
     }
 }
 
-// format "Ch{N} " into buf (1-based display), return byte count
+// format "Ch{N} " into buf (1-based), return byte count
 fn fmt_chapter_prefix(buf: &mut [u8; 8], chapter: u16) -> usize {
     let n = chapter + 1;
     buf[0] = b'C';

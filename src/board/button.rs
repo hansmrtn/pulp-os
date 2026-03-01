@@ -1,7 +1,6 @@
-// Button definitions and ADC resistance ladder decoding
-//
-// Two ADC ladders (Row1 GPIO1, Row2 GPIO2) plus discrete power
-// button on GPIO3. Each ladder encodes buttons as voltage levels.
+// Button definitions and ADC resistance ladder decoding.
+// Two ADC ladders (Row1 GPIO1, Row2 GPIO2) plus discrete power button on GPIO3.
+// Each ladder encodes buttons as voltage levels.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {

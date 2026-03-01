@@ -1,13 +1,11 @@
-// Minimal XML tag/attribute scanner for EPUB metadata
-//
-// Not a general parser. Handles container.xml and OPF only.
+// Minimal XML tag/attribute scanner for EPUB metadata.
+// Not a general parser; handles container.xml and OPF only.
 // Single-pass, forward-only, namespace-aware, lenient.
 
 pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
     let len = tag_bytes.len();
 
-    // skip past tag name
     while pos < len && !is_ws(tag_bytes[pos]) && tag_bytes[pos] != b'>' && tag_bytes[pos] != b'/' {
         pos += 1;
     }
@@ -71,7 +69,7 @@ pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-// text of first element matching tag_name; namespace-aware
+// text of first element matching tag_name (namespace-aware)
 pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
 
@@ -123,7 +121,7 @@ pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-// invoke cb for every opening tag matching tag_name
+// invoke cb for every opening tag matching tag_name (namespace-aware)
 pub fn for_each_tag<'a>(data: &'a [u8], tag_name: &[u8], mut cb: impl FnMut(&'a [u8])) {
     let mut pos = 0;
 
@@ -167,7 +165,7 @@ pub fn for_each_tag<'a>(data: &'a [u8], tag_name: &[u8], mut cb: impl FnMut(&'a 
     }
 }
 
-// "dc:title" matches "title"; "item" matches "item"
+// namespace-aware name match: "dc:title" matches "title"
 fn tag_name_matches(full_name: &[u8], target: &[u8]) -> bool {
     if full_name == target {
         return true;

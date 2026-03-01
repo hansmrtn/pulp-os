@@ -1,8 +1,6 @@
-// EPUB structure parser (container.xml → OPF → spine + metadata)
-//
-// Parses the two XML files that define an EPUB's reading order:
+// EPUB structure parser: container.xml -> OPF -> spine + metadata.
 // container.xml gives the OPF path; the OPF gives metadata, a
-// manifest (id→href), and a spine (ordered idrefs). Spine idrefs
+// manifest (id->href), and a spine (ordered idrefs). Spine idrefs
 // are resolved through the manifest to ZIP entry indices.
 
 use alloc::vec::Vec;
@@ -89,7 +87,7 @@ impl EpubSpine {
     }
 }
 
-// ── Table of Contents ─────────────────────────────────────────────────────
+// table of contents
 
 pub const MAX_TOC: usize = 128;
 pub const TOC_TITLE_CAP: usize = 48;
@@ -164,8 +162,8 @@ impl EpubToc {
 // where the TOC data lives inside the EPUB ZIP
 #[derive(Clone, Copy, Debug)]
 pub enum TocSource {
-    Ncx(usize), // EPUB 2 NCX
-    Nav(usize), // EPUB 3 nav document
+    Ncx(usize), // EPUB 2
+    Nav(usize), // EPUB 3
 }
 
 impl TocSource {
@@ -176,7 +174,7 @@ impl TocSource {
     }
 }
 
-// parse container.xml to find the OPF path; writes into out
+// parse container.xml to find the OPF path; write into out
 pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usize, &'static str> {
     let mut found_len: Option<usize> = None;
 
@@ -194,18 +192,9 @@ pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usiz
     found_len.ok_or("epub: no rootfile full-path in container.xml")
 }
 
-// parse OPF: extract metadata and build the reading-order spine as indices into ZipIndex
-//
-// Two-pass approach — zero heap allocation for manifest/idref bookkeeping.
-// The OPF buffer is already in memory; scanning it twice per spine entry
-// is negligible compared to the DEFLATE work that follows.
-//
-// Phase 1: collect <itemref idref="..."> locations as byte ranges
-//          within the OPF buffer.  Stack cost: MAX_SPINE × 4 = 1 KB.
-//
-// Phase 2: for each idref, scan <item> tags to find the matching id
-//          and resolve its href to a ZIP entry index.
-//          O(spine × manifest) — microseconds for typical EPUBs.
+// parse OPF: extract metadata and build the reading-order spine as ZIP entry indices.
+// Two-pass, zero heap: phase 1 collects idref byte offsets (MAX_SPINE*4 = 1KB stack);
+// phase 2 resolves each idref to a manifest href and then a ZIP index.
 pub fn parse_opf(
     opf: &[u8],
     opf_dir: &str,
@@ -223,10 +212,8 @@ pub fn parse_opf(
         meta.set_author(author);
     }
 
-    // Phase 1: collect idref locations as byte offsets into the OPF.
-    // get_attr returns subslices of opf, so pointer subtraction gives
-    // the offset.  Stored as (start: u16, len: u16) to keep the array
-    // at 4 bytes per entry (1 KB total for MAX_SPINE = 256).
+    // phase 1: collect idref byte offsets; get_attr returns subslices so
+    // pointer subtraction gives the offset; (start,len) = 4B each = 1KB total
 
     #[derive(Clone, Copy)]
     struct IdrefLoc {
@@ -242,7 +229,6 @@ pub fn parse_opf(
             return;
         }
         if let Some(idref) = xml::get_attr(tag_bytes, b"idref") {
-            // idref is a subslice of opf; compute its byte offset.
             let offset = idref.as_ptr() as usize - opf.as_ptr() as usize;
             if offset <= u16::MAX as usize && idref.len() <= u16::MAX as usize {
                 idref_locs[idref_count] = IdrefLoc {
@@ -254,8 +240,7 @@ pub fn parse_opf(
         }
     });
 
-    // Phase 2: for each idref, scan the manifest for a matching <item>
-    // and resolve its href to a ZIP entry index.
+    // phase 2: for each idref, scan manifest for matching <item> and resolve href
     let mut path_buf = [0u8; 512];
 
     for loc in &idref_locs[..idref_count] {
@@ -298,13 +283,11 @@ pub fn parse_opf(
     Ok(())
 }
 
-// ── TOC discovery and parsing ─────────────────────────────────────────────
-
-// locate TOC in ZIP: EPUB 3 nav first, then EPUB 2 NCX fallback
+// locate TOC in ZIP: EPUB 3 nav first, EPUB 2 NCX fallback
 pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocSource> {
     let mut path_buf = [0u8; 512];
 
-    // ── EPUB 3: manifest item whose properties contain "nav" ────
+    // EPUB 3: manifest item with properties containing "nav"
     let mut nav_href_buf = [0u8; 256];
     let mut nav_href_len: usize = 0;
     xml::for_each_tag(opf, b"item", |tag_bytes| {
@@ -333,7 +316,7 @@ pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocS
         }
     }
 
-    // ── EPUB 2: <spine toc="id"> → manifest item href ───────────
+    // EPUB 2: <spine toc="id"> -> manifest item href
     let mut toc_id = [0u8; 64];
     let mut toc_id_len: usize = 0;
     xml::for_each_tag(opf, b"spine", |tag_bytes| {
@@ -381,10 +364,7 @@ pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocS
         }
     }
 
-    // ── Fallback: find NCX by media-type in manifest ────────────
-    // Many EPUB 2 books omit the toc attribute on <spine> but still
-    // include a toc.ncx referenced in the manifest with the NCX
-    // media-type.
+    // fallback: find NCX by media-type (many EPUB 2 books omit toc attr on <spine>)
     let mut ncx_fb_href = [0u8; 256];
     let mut ncx_fb_len: usize = 0;
     xml::for_each_tag(opf, b"item", |tag_bytes| {
@@ -457,7 +437,7 @@ pub fn parse_ncx_toc(
             break;
         }
 
-        // skip comments, PIs
+        // skip comments and PIs
         if ncx[pos] == b'!' || ncx[pos] == b'?' {
             pos = toc_skip_to_gt(ncx, pos);
             continue;
@@ -490,7 +470,7 @@ pub fn parse_ncx_toc(
             continue;
         }
 
-        // <content src="...">: emit a TOC entry
+        // <content src="...">: emit TOC entry
         if name.eq_ignore_ascii_case(b"content") {
             let gt = toc_find_byte(ncx, pos, b'>').unwrap_or(ncx.len());
             let tag_bytes = &ncx[name_start..gt];
@@ -527,7 +507,7 @@ pub fn parse_nav_toc(
 ) {
     toc.clear();
 
-    // Restrict scanning to the <nav epub:type="toc"> ... </nav> region
+    // restrict scanning to the <nav epub:type="toc"> ... </nav> region
     let Some((region_start, region_end)) = find_nav_toc_region(nav) else {
         log::warn!("epub: nav document has no <nav epub:type=\"toc\"> region");
         return;
@@ -560,18 +540,18 @@ pub fn parse_nav_toc(
             continue;
         }
 
-        // Found <a ...>: extract href attribute
+        // found <a ...>: extract href attribute
         let gt = toc_find_byte(region, pos, b'>').unwrap_or(region.len());
         let tag_bytes = &region[name_start..gt];
         let href = xml::get_attr(tag_bytes, b"href");
         pos = if gt < region.len() { gt + 1 } else { gt };
 
-        // Read text until </a>, stripping any nested tags (e.g. <span>)
+        // read text until </a>, stripping nested tags
         let mut title_buf = [0u8; TOC_TITLE_CAP];
         let mut title_len: usize = 0;
         while pos < region.len() {
             if region[pos] == b'<' {
-                // Check for </a>
+                // check for </a>
                 if pos + 1 < region.len() && region[pos + 1] == b'/' {
                     let cs = pos + 2;
                     let mut ce = cs;
@@ -583,11 +563,11 @@ pub fn parse_nav_toc(
                         break;
                     }
                 }
-                // Skip other nested tag
+                // skip nested tag
                 pos = toc_skip_to_gt(region, pos + 1);
                 continue;
             }
-            // Accumulate text, collapsing whitespace
+            // accumulate text, collapse whitespace
             if title_len < TOC_TITLE_CAP {
                 let b = region[pos];
                 if is_toc_ws(b) {
@@ -603,7 +583,7 @@ pub fn parse_nav_toc(
             pos += 1;
         }
 
-        // trim trailing space
+        // trim trailing whitespace
         while title_len > 0 && title_buf[title_len - 1] == b' ' {
             title_len -= 1;
         }
@@ -653,11 +633,11 @@ fn find_nav_toc_region(data: &[u8]) -> Option<(usize, usize)> {
             continue;
         }
 
-        // Check for epub:type="toc" or type="toc"
+        // check for epub:type="toc" or type="toc"
         let gt = toc_find_byte(data, pos, b'>').unwrap_or(data.len());
         let tag_bytes = &data[name_start..gt];
 
-        // epub:type can contain space-separated tokens, e.g. "toc landmarks"
+        // epub:type may be space-separated tokens e.g. "toc landmarks"
         let is_toc = if let Some(t) = xml::get_attr(tag_bytes, b"epub:type") {
             t == b"toc" || t.split(|&b| b == b' ').any(|w| w == b"toc")
         } else {
@@ -673,7 +653,7 @@ fn find_nav_toc_region(data: &[u8]) -> Option<(usize, usize)> {
 
         let content_start = if gt < data.len() { gt + 1 } else { gt };
 
-        // Find closing </nav> (case-insensitive)
+        // find closing </nav>
         let mut search = content_start;
         while search < data.len() {
             if data[search] == b'<' && search + 2 < data.len() && data[search + 1] == b'/' {
@@ -688,18 +668,18 @@ fn find_nav_toc_region(data: &[u8]) -> Option<(usize, usize)> {
             }
             search += 1;
         }
-        // no closing tag — use rest of document
+        // no closing tag; use rest of document
         return Some((content_start, data.len()));
     }
     None
 }
 
-// resolve TOC href to spine index; strips fragment, percent-decodes, resolves relative path
-// returns 0xFFFF if href cannot be resolved
+// resolve TOC href to spine index; strip fragment, percent-decode, resolve relative path.
+// returns 0xFFFF if unresolvable.
 fn href_to_spine_idx(href: &[u8], base_dir: &str, spine: &EpubSpine, zip: &ZipIndex) -> u16 {
     let decoded = percent_decode(href);
     let href_str = core::str::from_utf8(&decoded).unwrap_or("");
-    // strip fragment (#section-id)
+    // strip fragment
     let href_no_frag = href_str.split('#').next().unwrap_or(href_str);
     if href_no_frag.is_empty() {
         return 0xFFFF;
@@ -709,14 +689,12 @@ fn href_to_spine_idx(href: &[u8], base_dir: &str, spine: &EpubSpine, zip: &ZipIn
     let full_len = resolve_path(base_dir, href_no_frag, &mut path_buf);
     let full_path = core::str::from_utf8(&path_buf[..full_len]).unwrap_or("");
 
-    // 1. Try exact path match, then case-insensitive
+    // 1. exact match, then case-insensitive
     let zip_idx = zip
         .find(full_path)
         .or_else(|| zip.find_icase(full_path))
         .or_else(|| {
-            // 2. Fallback: match by filename component only.
-            //    Handles cases where the TOC and OPF resolve paths
-            //    differently (different base dirs, leading ./, etc.)
+            // 2. filename-only match (handles differing base dirs, leading ./, etc.)
             let filename = href_no_frag.rsplit('/').next().unwrap_or(href_no_frag);
             if filename.is_empty() {
                 return None;
@@ -739,16 +717,14 @@ fn href_to_spine_idx(href: &[u8], base_dir: &str, spine: &EpubSpine, zip: &ZipIn
         return 0xFFFF;
     };
 
-    // 3. Map zip entry index → spine position
+    // 3. map zip entry index to spine position
     for i in 0..spine.len() {
         if spine.items[i] as usize == zip_idx {
             return i as u16;
         }
     }
 
-    // 4. Fallback: match by filename against spine entry names.
-    //    Covers rare cases where the same content appears under
-    //    slightly different paths in the manifest vs the TOC.
+    // 4. filename fallback against spine entry names
     let target_fname = zip
         .entry_name(zip_idx)
         .as_bytes()
@@ -769,7 +745,7 @@ fn href_to_spine_idx(href: &[u8], base_dir: &str, spine: &EpubSpine, zip: &ZipIn
     0xFFFF
 }
 
-// ── TOC scanning helpers (private) ────────────────────────────────────────
+// TOC scanning helpers (private)
 
 fn toc_find_byte(data: &[u8], start: usize, needle: u8) -> Option<usize> {
     data[start..]
@@ -917,15 +893,13 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-// check if a filename looks like an EPUB (.epub or .epu for FAT 8.3)
+// check if filename looks like an EPUB (.epub or .epu for FAT 8.3 truncation)
 pub fn is_epub_filename(name: &str) -> bool {
     let b = name.as_bytes();
 
-    // ".epub"
     if b.len() >= 5 && b[b.len() - 5] == b'.' {
         return b[b.len() - 4..].eq_ignore_ascii_case(b"epub");
     }
-    // FAT 8.3 truncation: ".epu"
     if b.len() >= 4 && b[b.len() - 4] == b'.' {
         return b[b.len() - 3..].eq_ignore_ascii_case(b"epu");
     }

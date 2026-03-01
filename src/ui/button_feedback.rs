@@ -1,7 +1,6 @@
-// Button feedback — edge labels with press inversion
-//
-// Bottom tabs show the mapped action; side labels for vol.
-// On press the text inverts (white-on-black); no borders or shapes.
+// Button feedback: plain text edge labels (no inversion).
+// Bottom tabs show the mapped action text; side labels hidden.
+// No visual change on press/release; purely informational.
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
@@ -9,6 +8,7 @@ use super::widget::Region;
 use crate::board::action::{Action, ButtonMapper};
 use crate::board::button::Button;
 use crate::drivers::strip::StripBuffer;
+use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
 
 const TAB_W: u16 = 60;
@@ -20,7 +20,7 @@ const RIDGE_H: u16 = 36;
 const SCREEN_W: u16 = 480;
 const SCREEN_H: u16 = 800;
 
-// Center positions of each button on the screen edge (px).
+// center positions of each button on the screen edge (px)
 const CX_BACK: u16 = 84;
 const CX_CONFIRM: u16 = 194;
 const CX_LEFT: u16 = 286;
@@ -41,7 +41,7 @@ enum Edge {
 struct BumpDef {
     button: Button,
     edge: Edge,
-    center: u16, // x for bottom edge, y for right edge
+    center: u16, // x for bottom edge; y for right edge
 }
 
 const BUMPS: [BumpDef; NUM_BUMPS] = [
@@ -77,11 +77,13 @@ const BUMPS: [BumpDef; NUM_BUMPS] = [
     },
 ];
 
+const BOTTOM_INSET: u16 = 4;
+
 fn bump_region(def: &BumpDef) -> Region {
     match def.edge {
         Edge::Bottom => Region::new(
             def.center.saturating_sub(TAB_W / 2),
-            SCREEN_H - TAB_H,
+            SCREEN_H - TAB_H - BOTTOM_INSET,
             TAB_W,
             TAB_H,
         ),
@@ -107,8 +109,8 @@ fn action_label(action: Action) -> &'static str {
 }
 
 pub struct ButtonFeedback {
-    active: Option<usize>, // index into BUMPS, or None
     mapper: ButtonMapper,
+    font: Option<&'static BitmapFont>,
 }
 
 impl Default for ButtonFeedback {
@@ -120,75 +122,61 @@ impl Default for ButtonFeedback {
 impl ButtonFeedback {
     pub const fn new() -> Self {
         Self {
-            active: None,
             mapper: ButtonMapper::new(),
+            font: None,
         }
     }
 
-    // returns dirty region for pressed button, or None for Power
-    pub fn on_press(&mut self, button: Button) -> Option<Region> {
-        if button == Button::Power {
-            return None;
-        }
-        let idx = BUMPS.iter().position(|d| d.button == button)?;
-        let mut region = bump_region(&BUMPS[idx]);
-        if let Some(old) = self.active
-            && old != idx
-        {
-            region = region.union(bump_region(&BUMPS[old]));
-        }
-        self.active = Some(idx);
-        Some(region)
+    // set chrome font for button label text; call on UI font size change
+    pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
+        self.font = Some(font);
     }
 
-    // returns dirty region so bump reverts to normal appearance
+    pub fn on_press(&mut self, _button: Button) -> Option<Region> {
+        None
+    }
+
     pub fn on_release(&mut self) -> Option<Region> {
-        let idx = self.active.take()?;
-        Some(bump_region(&BUMPS[idx]))
+        None
     }
 
-    // draw all bumps; call after app and overlay so bumps layer on top
+    // draw bottom-edge labels only; no side indicators or inversion
     pub fn draw(&self, strip: &mut StripBuffer) {
-        let font = &font_data::REGULAR_BODY_SMALL;
+        let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);
 
-        for (i, def) in BUMPS.iter().enumerate() {
-            let pressed = self.active == Some(i);
+        for def in BUMPS.iter() {
+            // skip side-edge indicators (VolUp/VolDown)
+            if def.edge != Edge::Bottom {
+                continue;
+            }
+
             let r = bump_region(def);
 
             if !r.intersects(strip.logical_window()) {
                 continue;
             }
 
-            let (bg, fg) = if pressed {
-                (BinaryColor::On, BinaryColor::Off)
-            } else {
-                (BinaryColor::Off, BinaryColor::On)
-            };
-
-            // fill background
+            // plain: white background, black text
             r.to_rect()
-                .into_styled(PrimitiveStyle::with_fill(bg))
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
                 .draw(strip)
                 .unwrap();
 
-            // draw label text (bottom tabs only; side ridges are too narrow)
-            if def.edge == Edge::Bottom {
-                let action = self.mapper.map_button(def.button);
-                let label = action_label(action);
-                if label.is_empty() {
-                    continue;
-                }
-
-                let text_w = font.measure_str(label) as i32;
-                let lh = font.line_height as i32;
-                let asc = font.ascent as i32;
-
-                let text_x = r.x as i32 + (r.w as i32 - text_w) / 2;
-                let text_top = r.y as i32 + (r.h as i32 - lh) / 2;
-                let baseline = text_top + asc;
-
-                font.draw_str_fg(strip, label, fg, text_x, baseline);
+            let action = self.mapper.map_button(def.button);
+            let label = action_label(action);
+            if label.is_empty() {
+                continue;
             }
+
+            let text_w = font.measure_str(label) as i32;
+            let lh = font.line_height as i32;
+            let asc = font.ascent as i32;
+
+            let text_x = r.x as i32 + (r.w as i32 - text_w) / 2;
+            let text_top = r.y as i32 + (r.h as i32 - lh) / 2;
+            let baseline = text_top + asc;
+
+            font.draw_str_fg(strip, label, BinaryColor::On, text_x, baseline);
         }
     }
 }

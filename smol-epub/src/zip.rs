@@ -1,5 +1,4 @@
-// ZIP central directory parser and streaming entry extraction
-//
+// ZIP central directory parser and streaming entry extraction.
 // ZipIndex: 256 entries inline (~5KB); names heap-allocated during parse.
 // DEFLATE in 4KB chunks; try_reserve throughout for graceful OOM.
 
@@ -7,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-const MAX_ENTRY_SIZE: u32 = 192 * 1024; // OOM guard
+const MAX_ENTRY_SIZE: u32 = 192 * 1024; // max uncompressed entry size (OOM guard)
 
 const EOCD_SIG: u32 = 0x0605_4b50;
 const CD_SIG: u32 = 0x0201_4b50;
@@ -75,7 +74,7 @@ impl ZipIndex {
         self.names = Vec::new();
     }
 
-    // parse EOCD from file tail; returns (cd_offset, cd_size)
+    // parse EOCD from file tail; return (cd_offset, cd_size)
     pub fn parse_eocd(tail: &[u8], file_size: u32) -> Result<(u32, u32), &'static str> {
         if tail.len() < 22 {
             return Err("zip: tail too short for EOCD");
@@ -102,7 +101,7 @@ impl ZipIndex {
         Ok((cd_offset, cd_size))
     }
 
-    // parse central directory into the entry index
+    // parse central directory into entry index
     pub fn parse_central_directory(&mut self, cd: &[u8]) -> Result<(), &'static str> {
         self.count = 0;
         self.names.clear();
@@ -204,7 +203,7 @@ impl ZipIndex {
         None
     }
 
-    // bytes past local file header to reach entry data
+    // bytes past local file header to entry data
     pub fn local_header_data_skip(header: &[u8]) -> Result<u32, &'static str> {
         if header.len() < 30 {
             return Err("zip: local header too short");
@@ -218,7 +217,7 @@ impl ZipIndex {
     }
 }
 
-// ── Entry extraction ──────────────────────────────────────────────────
+// entry extraction
 
 pub fn extract_entry<E, F>(
     entry: &ZipEntry,
@@ -289,7 +288,7 @@ where
         .map_err(|_| "zip: chapter too large for memory")?;
     output.resize(uncomp_size, 0);
 
-    // ~11KB DecompressorOxide; alloc zeroed directly — Box::new() overflows stack
+    // ~11KB DecompressorOxide; alloc zeroed directly (Box::new overflows stack)
     let decomp_ptr =
         unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<DecompressorOxide>()) };
     if decomp_ptr.is_null() {
@@ -304,7 +303,7 @@ where
     let mut comp_left = comp_size;
 
     loop {
-        // top up read buffer
+        // top up compressed read buffer
         if in_avail < DEFLATE_READ_BUF && comp_left > 0 {
             let space = DEFLATE_READ_BUF - in_avail;
             let want = space.min(comp_left);

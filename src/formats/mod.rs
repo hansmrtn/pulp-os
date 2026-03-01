@@ -1,8 +1,6 @@
-// Document format support for the reader
-//
-// All parsing and decoding lives in the `smol-epub` crate.
-// This module re-exports everything so the rest of pulp-os
-// can continue to use `crate::formats::*` paths unchanged.
+// Document format support for the reader.
+// All parsing and decoding lives in the smol-epub crate.
+// Re-exports everything so pulp-os can use crate::formats::* paths unchanged.
 
 pub use smol_epub::cache;
 pub use smol_epub::css;

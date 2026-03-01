@@ -1,5 +1,4 @@
-// Application framework and launcher
-//
+// Application framework and launcher.
 // App trait + nav stack (max 4). No dyn, no heap.
 // needs_work()/on_work() decouple SD I/O from rendering.
 // Services is the syscall boundary into storage.
@@ -29,8 +28,8 @@ pub enum AppId {
     Upload,
 }
 
-// Push: suspend current, push new. Pop: exit current, resume parent.
-// Replace: swap in place. Home: unwind to root.
+// nav transitions: Push suspends current + pushes new; Pop exits + resumes parent;
+// Replace swaps in place; Home unwinds to root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
@@ -47,7 +46,7 @@ pub enum Redraw {
     Full,
 }
 
-// 8.3 filename or short path
+// 8.3 filename or short path context message
 const MSG_BUF_SIZE: usize = 64;
 
 pub struct AppContext {
@@ -189,7 +188,11 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::write_file(self.sd, name, data)
     }
 
-    // ── Subdirectory ops (EPUB chapter cache) ────────────────────
+    pub fn save_title(&self, filename: &str, title: &str) -> Result<(), &'static str> {
+        storage::save_title(self.sd, filename, title)
+    }
+
+    // subdirectory ops (EPUB chapter cache)
 
     pub fn ensure_dir(&self, name: &str) -> Result<(), &'static str> {
         storage::ensure_dir(self.sd, name)
@@ -221,7 +224,7 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::delete_file_in_dir(self.sd, dir, name)
     }
 
-    // ── _PULP app-data directory ──────────────────────────────────
+    // _PULP app-data directory
 
     pub fn ensure_pulp_dir(&self) -> Result<(), &'static str> {
         storage::ensure_pulp_dir(self.sd)
@@ -249,7 +252,6 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
     }
 
     // nested ops inside _PULP/<dir>/
-
     pub fn ensure_pulp_subdir(&self, name: &str) -> Result<(), &'static str> {
         storage::ensure_pulp_subdir(self.sd, name)
     }
@@ -304,7 +306,7 @@ pub trait App {
 
     fn on_quick_cycle_update(&mut self, _id: u8, _value: u8, _ctx: &mut AppContext) {}
 
-    // called once per strip during refresh; widgets clip automatically
+    // called once per strip during refresh
     fn draw(&self, strip: &mut StripBuffer);
 
     fn needs_work(&self) -> bool {

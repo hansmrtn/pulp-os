@@ -1,24 +1,22 @@
-// Quick-action overlay — summoned by Power (Menu) from any app
-//
-// Core actions (Refresh, Go Home) always present; apps inject up to
-// MAX_APP_ACTIONS items above. Two kinds: Cycle (rotate options)
-// and Trigger (fire on Select). Menu/Back dismisses.
-//
+// Quick-action overlay: summoned by Power (Menu) from any app.
+// Core actions (Refresh, Go Home) always present; apps inject up to MAX_APP_ACTIONS items.
+// Two kinds: Cycle (rotate options) and Trigger (fire on Select). Menu/Back dismisses.
 // Rendering: plain inverted-text rows, no borders or separators.
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
 use super::bitmap_label::BitmapDynLabel;
-use super::widget::{Alignment, Region};
+use super::widget::{Alignment, Region, wrap_next, wrap_prev};
 use crate::board::action::Action;
 use crate::drivers::strip::StripBuffer;
+use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
 
-// ── Layout constants ──────────────────────────────────────────────
+// layout constants
 
 const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (480 - OVERLAY_W) / 2;
-const OVERLAY_BOTTOM: u16 = 790; // 10px from screen bottom
+const OVERLAY_BOTTOM: u16 = 760; // above button widgets (~14px clearance)
 const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
@@ -34,8 +32,6 @@ pub const MAX_APP_ACTIONS: usize = 6;
 
 const NUM_CORE: usize = 2; // Refresh + Go Home
 const MAX_ITEMS: usize = MAX_APP_ACTIONS + NUM_CORE;
-
-// ── Public types ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 pub enum QuickActionKind {
@@ -90,8 +86,6 @@ pub enum QuickMenuResult {
     AppTrigger(u8),
 }
 
-// ── Internal item representation ──────────────────────────────────
-
 #[derive(Clone, Copy)]
 enum MenuItemKind {
     AppCycle {
@@ -120,8 +114,6 @@ impl MenuItem {
     };
 }
 
-// ── QuickMenu ─────────────────────────────────────────────────────
-
 pub struct QuickMenu {
     pub open: bool,
     items: [MenuItem; MAX_ITEMS],
@@ -130,6 +122,7 @@ pub struct QuickMenu {
     selected: usize,
     pub dirty: bool,
     overlay_region: Region,
+    font: Option<&'static BitmapFont>,
 }
 
 impl Default for QuickMenu {
@@ -148,10 +141,14 @@ impl QuickMenu {
             selected: 0,
             dirty: false,
             overlay_region: Region::new(0, 0, 0, 0),
+            font: None,
         }
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────
+    // set chrome font for menu item text; call on UI font size change
+    pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
+        self.font = Some(font);
+    }
 
     // open overlay with app-provided items; core items appended automatically
     pub fn show(&mut self, app_actions: &[QuickAction]) {
@@ -212,8 +209,6 @@ impl QuickMenu {
         None
     }
 
-    // ── Input handling ────────────────────────────────────────────
-
     pub fn on_action(&mut self, action: Action) -> QuickMenuResult {
         match action {
             Action::Menu | Action::Back => {
@@ -222,16 +217,18 @@ impl QuickMenu {
             }
 
             Action::Next => {
-                if self.selected + 1 < self.count {
-                    self.selected += 1;
+                let new = wrap_next(self.selected, self.count);
+                if new != self.selected {
+                    self.selected = new;
                     self.dirty = true;
                 }
                 QuickMenuResult::Consumed
             }
 
             Action::Prev => {
-                if self.selected > 0 {
-                    self.selected -= 1;
+                let new = wrap_prev(self.selected, self.count);
+                if new != self.selected {
+                    self.selected = new;
                     self.dirty = true;
                 }
                 QuickMenuResult::Consumed
@@ -251,7 +248,6 @@ impl QuickMenu {
         }
     }
 
-    // no-op on Trigger / core items
     fn adjust_selected(&mut self, delta: i8) {
         let item = &mut self.items[self.selected];
         if let MenuItemKind::AppCycle {
@@ -271,7 +267,7 @@ impl QuickMenu {
         }
     }
 
-    // Cycle: advance value; Trigger/core: fire and close
+    // cycle: advance value; trigger/core: fire and close
     fn activate_selected(&mut self) -> QuickMenuResult {
         match &mut self.items[self.selected].kind {
             MenuItemKind::AppCycle { value, options, .. } => {
@@ -297,8 +293,6 @@ impl QuickMenu {
             }
         }
     }
-
-    // ── Layout helpers ────────────────────────────────────────────
 
     fn compute_region(total_items: usize) -> Region {
         let content_h = PAD_TOP + (ITEM_STRIDE * total_items as u16) + HELP_H + PAD_BOTTOM;
@@ -348,14 +342,12 @@ impl QuickMenu {
         }
     }
 
-    // ── Drawing ───────────────────────────────────────────────────
-
     pub fn draw(&self, strip: &mut StripBuffer) {
         if !self.open {
             return;
         }
 
-        let font = &font_data::REGULAR_BODY_SMALL;
+        let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);
 
         // clear the overlay background
         let outer = self.overlay_region;
@@ -375,7 +367,7 @@ impl QuickMenu {
             let label_region = self.item_label_region(i);
             let value_region = self.item_value_region(i);
 
-            // Selected row: inverted (white text on black)
+            // selected row: inverted (white text on black)
             if selected {
                 let row_region = Region::new(OVERLAY_X, self.item_y(i), OVERLAY_W, ITEM_H);
                 if row_region.intersects(strip.logical_window()) {
@@ -387,7 +379,7 @@ impl QuickMenu {
                 }
             }
 
-            // Draw label text
+            // draw label text
             if label_region.intersects(strip.logical_window()) {
                 let fg = if selected {
                     BinaryColor::Off
@@ -405,7 +397,7 @@ impl QuickMenu {
                 }
             }
 
-            // Draw value text
+            // draw value text
             if value_region.intersects(strip.logical_window()) {
                 self.format_value(i, &mut val_buf);
                 let vtext = val_buf.text();
@@ -425,7 +417,7 @@ impl QuickMenu {
             }
         }
 
-        // Help text at the bottom
+        // help text at the bottom
         let help = match &self.items[self.selected].kind {
             MenuItemKind::AppCycle { .. } => "Up/Down: move  Jump: adjust  Sel: cycle  Menu: close",
             _ => "Up/Down: move  Sel: activate  Menu: close",

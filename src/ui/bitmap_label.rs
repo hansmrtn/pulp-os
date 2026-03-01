@@ -1,4 +1,4 @@
-// Proportional-font label widgets; bitmap pipeline equivalent of label.rs.
+// Proportional-font label widgets for the bitmap rendering pipeline.
 
 use core::convert::Infallible;
 
@@ -49,7 +49,7 @@ impl<'a> BitmapLabel<'a> {
     }
 }
 
-// Owned fixed-size buffer variant; implements fmt::Write for formatted output.
+// owned fixed-size buffer variant; implements fmt::Write for formatted output
 pub struct BitmapDynLabel<const N: usize> {
     region: Region,
     buffer: [u8; N],

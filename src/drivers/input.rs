@@ -1,12 +1,8 @@
-// Debounced input from ADC ladders and power button
-//
-// One button at a time (ladder hw limitation). Three sources:
-// Row1 (GPIO1), Row2 (GPIO2), Power (GPIO3 interrupt).
-// 15ms debounce, 1s long press, 150ms repeat.
-//
-// ADC reads are oversampled (4 samples averaged) to reject noise
-// from ESP32-C3 ADC non-linearity and battery voltage sag during
-// SPI traffic. ~40µs total per channel — invisible at 10ms poll.
+// Debounced input from ADC ladders and power button.
+// One button at a time (ladder hw limitation). Sources: Row1 (GPIO1),
+// Row2 (GPIO2), Power (GPIO3 interrupt). 15ms debounce, 1s long press, 150ms repeat.
+// ADC reads oversampled (4 samples averaged) to reject noise from ESP32-C3
+// non-linearity and battery sag during SPI traffic; ~40us per channel.
 
 use esp_hal::time::{Duration, Instant};
 

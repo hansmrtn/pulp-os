@@ -1,10 +1,8 @@
-// pulp-os entry point — Embassy multi-task architecture
-//
-// main:             UI event loop, app dispatch, rendering.
-// input_task:       10ms button poll, publishes events + battery mv.
+// pulp-os entry point: Embassy multi-task architecture.
+// main:              UI event loop, app dispatch, rendering.
+// input_task:        10ms button poll, publishes events + battery mv.
 // housekeeping_task: periodic signals (status 5s, SD/bookmarks 30s).
 // idle_timeout_task: fires IDLE_SLEEP_DUE after idle timeout.
-//
 // CPU sleeps (WFI) whenever all tasks are waiting.
 
 #![no_std]
@@ -36,6 +34,7 @@ use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::storage::{self, DirCache};
 use pulp_os::drivers::strip::StripBuffer;
+use pulp_os::fonts;
 use pulp_os::kernel::tasks;
 use pulp_os::kernel::uptime_secs;
 use pulp_os::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
@@ -49,14 +48,10 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// ── Constants ───────────────────────────────────────────────────────────
-
 // on_work cadence: lets multi-step ops (EPUB init, caching) progress between events
 const TICK_MS: u64 = 10;
 
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
-
-// ── App dispatch macro ───────────────────────────────────────────────────
 
 macro_rules! with_app {
     ($id:expr, $home:expr, $files:expr, $reader:expr, $settings:expr,
@@ -85,11 +80,10 @@ macro_rules! with_app {
     };
 }
 
-// ── Transition handler ───────────────────────────────────────────────────
-
 macro_rules! apply_transition {
     ($nav:expr, $launcher:expr, $home:expr, $files:expr,
-     $reader:expr, $settings:expr, $bm_cache:expr) => {{
+     $reader:expr, $settings:expr, $bm_cache:expr,
+     $quick_menu:expr, $bumps:expr) => {{
         let nav = $nav;
         info!("app: {:?} -> {:?}", nav.from, nav.to);
 
@@ -119,6 +113,10 @@ macro_rules! apply_transition {
             $home.set_ui_font_size(ui_idx);
             $files.set_ui_font_size(ui_idx);
             $settings.set_ui_font_size(ui_idx);
+            let chrome = fonts::chrome_font(ui_idx);
+            $quick_menu.set_chrome_font(chrome);
+            $bumps.set_chrome_font(chrome);
+            $reader.set_chrome_font(chrome);
         }
 
         if nav.to != AppId::Upload {
@@ -135,12 +133,10 @@ macro_rules! apply_transition {
     }};
 }
 
-// ── BUSY-wait loop with input processing ────────────────────────────────
-//
-// Runs during full and partial waveforms. Selects on BUSY pin, input
-// channel, and work ticker so page pre-loads happen concurrently.
-// Non-trivial transitions (Back, Home) deferred until waveform ends.
-
+// busy-wait loop with input processing.
+// runs during full and partial waveforms; selects on BUSY pin, input channel,
+// and work ticker so page pre-loads happen concurrently.
+// non-trivial transitions (Back, Home) deferred until waveform ends.
 macro_rules! busy_wait_with_input {
     ($epd:expr, $mapper:expr,
      $quick_menu:expr, $launcher:expr,
@@ -149,7 +145,7 @@ macro_rules! busy_wait_with_input {
         let mut _deferred: Option<Transition> = None;
         let mut _work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
         loop {
-            // Level-check first; avoids creating futures if already done.
+            // level-check first; avoids creating futures if already done
             if !$epd.is_busy() {
                 break;
             }
@@ -163,7 +159,7 @@ macro_rules! busy_wait_with_input {
             {
                 Either::First(_) => break,
 
-                // Input event from the channel
+                // input event from the channel
                 Either::Second(Either::First(hw_event)) => {
                     let event = $mapper.map_event(hw_event);
 
@@ -180,7 +176,7 @@ macro_rules! busy_wait_with_input {
                     }
                 }
 
-                // work tick — drive on_work
+                // work tick
                 Either::Second(Either::Second(_)) => {}
             }
 
@@ -198,13 +194,11 @@ macro_rules! busy_wait_with_input {
     }};
 }
 
-// ── Heavy statics ───────────────────────────────────────────────────────
-//
-// Kept out of the async future so Embassy's state machine stays ~200B.
-// const-fn types -> ConstStaticCell (zero stack cost, placed in .bss).
-// runtime-init types -> StaticCell (small enough for stack).
+// heavy statics kept out of async future so Embassy's state machine stays ~200B.
+// const-fn types -> ConstStaticCell (zero stack, placed in .bss).
+// runtime-init types -> StaticCell.
 
-// zero-stack static: value in .bss at link time; as_static_mut() called once
+// value in .bss at link time; as_static_mut() called once
 struct ConstStaticCell<T>(core::cell::UnsafeCell<T>);
 unsafe impl<T> Sync for ConstStaticCell<T> {}
 impl<T> ConstStaticCell<T> {
@@ -217,7 +211,6 @@ impl<T> ConstStaticCell<T> {
     }
 }
 
-// const-fn types: ConstStaticCell
 static STRIP: ConstStaticCell<StripBuffer> = ConstStaticCell::new(StripBuffer::new());
 static STATUSBAR: ConstStaticCell<StatusBar> = ConstStaticCell::new(StatusBar::new());
 static READER: ConstStaticCell<ReaderApp> = ConstStaticCell::new(ReaderApp::new());
@@ -227,12 +220,9 @@ static BUMPS: ConstStaticCell<ButtonFeedback> = ConstStaticCell::new(ButtonFeedb
 static DIR_CACHE: ConstStaticCell<DirCache> = ConstStaticCell::new(DirCache::new());
 static BM_CACHE: ConstStaticCell<BookmarkCache> = ConstStaticCell::new(BookmarkCache::new());
 
-// runtime-init types: StaticCell (font lookups, < 1 KB each)
 static HOME: StaticCell<HomeApp> = StaticCell::new();
 static FILES: StaticCell<FilesApp> = StaticCell::new();
 static SETTINGS: StaticCell<SettingsApp> = StaticCell::new();
-
-// ── Entry point ─────────────────────────────────────────────────────────
 
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
@@ -240,25 +230,21 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // paint sentinel before any deep calls; measure peak later via stack_high_water_mark()
+    // paint sentinel before any deep calls; measure peak via stack_high_water_mark()
     paint_stack();
 
-    // 140KB heap (was 200KB); reduced to fit WiFi firmware blobs in DRAM.
-    // WiFi radio static data occupies ~65KB; this leaves enough for stack
-    // and the esp-radio internal allocations.
+    // 140KB heap (reduced from 200KB to fit WiFi firmware blobs in DRAM).
+    // WiFi radio static data ~65KB; this leaves enough for stack + esp-radio.
     esp_alloc::heap_allocator!(size: 143360);
 
     info!("booting...");
 
-    // ── esp-rtos scheduler + Embassy time driver ────────────────────────
     // must run before first .await; sets up RTOS scheduler + Embassy timer driver
     let timg0 = TimerGroup::new(unsafe { peripherals.TIMG0.clone_unchecked() });
     let sw_ints =
         SoftwareInterruptControl::new(unsafe { peripherals.SW_INTERRUPT.clone_unchecked() });
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
     info!("esp-rtos scheduler started (TIMG0 + SW_INT0).");
-
-    // ── Hardware ─────────────────────────────────────────────────────────
 
     let mut board = Board::init(peripherals);
     let mut delay = Delay::new();
@@ -275,18 +261,14 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .is_ok();
 
-    // ensure _PULP/ app-data directory exists
+    // ensure _PULP/ exists
     if sd_ok && let Err(e) = storage::ensure_pulp_dir(&board.storage.sd) {
         info!("warning: failed to create _PULP dir: {}", e);
     }
 
-    // ── Input ────────────────────────────────────────────────────────────
     // created here for initial battery read, then moved into input_task
-
     let mut input = InputDriver::new(board.input);
     let mapper = ButtonMapper::new();
-
-    // ── Applications ─────────────────────────────────────────────────────
 
     let home = HOME.init(HomeApp::new());
     let files = FILES.init(FilesApp::new());
@@ -312,20 +294,22 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         files.set_ui_font_size(ui_idx);
         settings.set_ui_font_size(ui_idx);
         reader.set_book_font_size(book_idx);
+        let chrome = fonts::chrome_font(ui_idx);
+        quick_menu.set_chrome_font(chrome);
+        bumps.set_chrome_font(chrome);
+        reader.set_chrome_font(chrome);
         home.load_recent(&mut svc);
     }
 
     // signal idle timeout after settings load so persisted value is used
     tasks::set_idle_timeout(settings.system_settings().sleep_timeout);
 
-    // ── Initial render ───────────────────────────────────────────────────
-
     let cached_battery_mv_init = battery::adc_to_battery_mv(input.read_battery_mv());
     update_statusbar(statusbar, cached_battery_mv_init, sd_ok);
 
     home.on_enter(&mut launcher.ctx);
 
-    // write both RAM planes, kick GC waveform, yield ~1.6s; no input needed at boot
+    // write both RAM planes, kick GC waveform, yield ~1.6s
     board
         .display
         .epd
@@ -339,19 +323,14 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let _ = launcher.ctx.take_redraw();
     info!("ui ready.");
 
-    // ── Spawn background tasks ───────────────────────────────────────────
     // InputDriver moved into input_task; events arrive via INPUT_EVENTS from here on
-
     spawner.spawn(tasks::input_task(input)).unwrap();
     spawner.spawn(tasks::housekeeping_task()).unwrap();
     spawner.spawn(tasks::idle_timeout_task()).unwrap();
     info!("tasks spawned (input_task, housekeeping_task, idle_timeout_task).");
     info!("kernel ready.");
 
-    // ── Main event loop ──────────────────────────────────────────────────
-    // wakes on: input event (INPUT_EVENTS) or work ticker (10ms)
-    // each iteration checks housekeeping signals and drives app work + render
-
+    // main event loop: wakes on input event or work ticker (10ms)
     let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
     let mut partial_refreshes: u32 = 0;
@@ -360,10 +339,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut render_bar_overlaps: bool = false;
 
     loop {
-        // ── 0. Upload mode intercept ────────────────────────────────────
-        // Upload bypasses the App trait — it runs its own async loop with
-        // WiFi hardware, renders its own screens, and watches for BACK.
-        // When it returns the radio is torn down and we pop back to Home.
+        // 0. upload mode intercept: bypasses App trait, runs own async loop
         if launcher.active() == AppId::Upload {
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
             pulp_os::apps::upload::run_upload_mode(
@@ -372,28 +348,30 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 strip,
                 &mut delay,
                 &board.storage.sd,
+                settings.system_settings().ui_font_size_idx,
+                bumps,
             )
             .await;
 
-            // Pop back to the previous screen and re-render
+            // pop back and re-render
             if let Some(nav) = launcher.apply(Transition::Pop) {
-                apply_transition!(nav, launcher, home, files, reader, settings, bm_cache);
+                apply_transition!(
+                    nav, launcher, home, files, reader, settings, bm_cache, quick_menu, bumps
+                );
             }
             launcher.ctx.request_full_redraw();
             continue;
         }
 
-        // ── 1. Wait for input or work tick ──────────────────────────────
-
+        // 1. wait for input or work tick
         let hw_event = match select(tasks::INPUT_EVENTS.receive(), work_ticker.next()).await {
             Either::First(ev) => Some(ev),
             Either::Second(_) => None,
         };
 
-        // ── 2. Input event ──────────────────────────────────────────────
-
+        // 2. input event
         if let Some(hw_event) = hw_event {
-            // Button feedback (edge labels)
+            // button feedback (edge labels)
             match hw_event {
                 pulp_os::drivers::input::Event::Press(btn) => {
                     if let Some(r) = bumps.on_press(btn) {
@@ -408,14 +386,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 _ => {}
             }
 
-            // ── Power long-press → deep sleep ────────────────────────────
-            // Intercept before mapping so no app ever sees this event.
+            // power long-press: intercept before mapping so no app sees it
             if hw_event
                 == pulp_os::drivers::input::Event::LongPress(pulp_os::board::button::Button::Power)
             {
                 info!("power held: entering sleep...");
 
-                // flush dirty bookmarks before sleep
+                // flush dirty bookmarks
                 if bm_cache.is_dirty() {
                     bm_cache.flush(&board.storage.sd);
                 }
@@ -437,11 +414,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     .await;
                 info!("display: sleep screen rendered");
 
-                // SSD1677 deep-sleep mode 1 (~3µA, image retained; hw reset to wake)
+                // SSD1677 deep-sleep mode 1 (~3uA, image retained; hw reset to wake)
                 board.display.epd.enter_deep_sleep();
                 info!("display: deep sleep mode 1");
 
-                // ESP32-C3 deep sleep (~5µA); GPIO3 as RTC wake; MCU resets on wake
+                // ESP32-C3 deep sleep (~5uA); GPIO3 RTC wake; MCU resets on wake
                 let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
                 let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
                 let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
@@ -454,8 +431,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
             let event = mapper.map_event(hw_event);
 
-            // ── Quick-menu ──────────────────────────────────────────────
-
+            // quick-menu
             if quick_menu.open {
                 if let ActionEvent::Press(action) | ActionEvent::Repeat(action) = event {
                     let result = quick_menu.on_action(action);
@@ -504,7 +480,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             let transition = Transition::Home;
                             if let Some(nav) = launcher.apply(transition) {
                                 apply_transition!(
-                                    nav, launcher, home, files, reader, settings, bm_cache
+                                    nav, launcher, home, files, reader, settings, bm_cache,
+                                    quick_menu, bumps
                                 );
                             }
                         }
@@ -531,7 +508,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     }
                 }
             }
-            // ── Menu toggle ──────────────────────────────────────────────
+            // menu toggle
             else if matches!(event, ActionEvent::Press(Action::Menu)) {
                 let active = launcher.active();
                 let actions: &[_] = with_app!(active, home, files, reader, settings, |app| {
@@ -540,7 +517,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 quick_menu.show(actions);
                 launcher.ctx.mark_dirty(quick_menu.region());
             }
-            // ── App dispatch ─────────────────────────────────────────────
+            // app dispatch
             else {
                 let active = launcher.active();
                 let transition = with_app!(active, home, files, reader, settings, |app| {
@@ -548,19 +525,19 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 });
 
                 if let Some(nav) = launcher.apply(transition) {
-                    apply_transition!(nav, launcher, home, files, reader, settings, bm_cache);
+                    apply_transition!(
+                        nav, launcher, home, files, reader, settings, bm_cache, quick_menu, bumps
+                    );
                 }
             }
         }
 
-        // If a transition just landed us on Upload, skip straight to the
-        // loop top where the upload-mode intercept lives.
+        // if we just landed on Upload, skip to top where intercept lives
         if launcher.active() == AppId::Upload {
             continue;
         }
 
-        // ── 3. App work ─────────────────────────────────────────────────
-        // one step per iteration; multi-step ops yield between SD reads
+        // 3. app work: one step per iteration; multi-step ops yield between SD reads
         {
             let active = launcher.active();
             let needs = with_app!(active, home, files, reader, settings, |app| {
@@ -574,7 +551,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             }
         }
 
-        // ── 4. Housekeeping ─────────────────────────────────────────────
+        // 4. housekeeping
 
         // battery mv (~30s, from input_task)
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
@@ -600,19 +577,17 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         if tasks::STATUS_DUE.try_take().is_some() {
             update_statusbar(statusbar, cached_battery_mv, sd_ok);
 
-            // re-sync idle timeout in case user changed it in Settings
+            // re-sync idle timeout in case settings changed
             if settings.is_loaded() {
                 tasks::set_idle_timeout(settings.system_settings().sleep_timeout);
             }
         }
 
-        // ── 4b. Idle sleep ──────────────────────────────────────────────
-        // IDLE_SLEEP_DUE: flush, sleep screen, deep sleep; wake = full reset
-
+        // idle sleep: flush, sleep screen, deep sleep; wake = full reset
         if tasks::IDLE_SLEEP_DUE.try_take().is_some() {
             info!("idle timeout: entering sleep...");
 
-            // flush dirty bookmarks before sleep
+            // flush dirty bookmarks
             if bm_cache.is_dirty() {
                 bm_cache.flush(&board.storage.sd);
             }
@@ -634,12 +609,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 .await;
             info!("display: sleep screen rendered");
 
-            // SSD1677 deep-sleep mode 1 (~3µA, image retained; hw reset to wake)
+            // SSD1677 deep-sleep mode 1 (~3uA, image retained; hw reset to wake)
             board.display.epd.enter_deep_sleep();
             info!("display: deep sleep mode 1");
 
-            // ESP32-C3 deep sleep (~5µA); GPIO3 as RTC wake; MCU resets on wake
-            //
+            // ESP32-C3 deep sleep (~5uA); GPIO3 RTC wake; MCU resets on wake
             // steal peripherals: ownership irrelevant, sleep_deep() is -> !
             let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
             let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
@@ -651,8 +625,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             rtc.sleep_deep(&[&rtcio]);
         }
 
-        // ── 5. Render ────────────────────────────────────────────────────
-
+        // 5. render
         if !launcher.ctx.has_redraw() {
             continue;
         }
@@ -699,7 +672,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                         // phase 2: kick DU waveform (~400-600ms)
                         board.display.epd.partial_start_du(&rs);
 
-                        // process input + work while DU runs; page turns pre-load next page
+                        // process input + work while DU runs
                         let deferred = busy_wait_with_input!(
                             board.display.epd,
                             mapper,
@@ -733,16 +706,17 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             );
                         });
 
-                        // phase 4: power off (async, ~200ms)
+                        // phase 4: power off (~200ms)
                         board.display.epd.power_off_async().await;
                         partial_refreshes += 1;
 
-                        // apply deferred transition from BUSY wait (Back, Home, etc.)
+                        // apply deferred transition from busy wait
                         if let Some(transition) = deferred
                             && let Some(nav) = launcher.apply(transition)
                         {
                             apply_transition!(
-                                nav, launcher, home, files, reader, settings, bm_cache
+                                nav, launcher, home, files, reader, settings, bm_cache, quick_menu,
+                                bumps
                             );
                         }
 
@@ -752,7 +726,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     if !board.display.epd.needs_initial_refresh() {
                         break 'render; // degenerate zero-size region
                     }
-                    // fall through to full GC (initial refresh needed)
+                    // fall through to full GC
                     info!("display: partial failed (initial refresh), promoting to full");
                 } else {
                     info!("display: promoted partial to full (ghosting clear)");
@@ -760,9 +734,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 // fall through to full GC
             }
 
-            // ── Full GC refresh ──────────────────────────────────────────
-            // explicit Full, ghost-clear promotion, or initial-refresh fallback
-
+            // full GC refresh: explicit Full, ghost-clear, or initial-refresh fallback
             if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
                 update_statusbar(statusbar, cached_battery_mv, sd_ok);
 
@@ -805,14 +777,16 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 if let Some(transition) = deferred
                     && let Some(nav) = launcher.apply(transition)
                 {
-                    apply_transition!(nav, launcher, home, files, reader, settings, bm_cache);
+                    apply_transition!(
+                        nav, launcher, home, files, reader, settings, bm_cache, quick_menu, bumps
+                    );
                 }
             }
         } // 'render
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// helpers
 
 fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
     const HEAP_TOTAL: usize = 143360; // matches heap_allocator!(size: ...) above

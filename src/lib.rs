@@ -1,4 +1,4 @@
-// "operating system" for the XTEink X4 (ESP32-C3, e-paper)
+// pulp-os: operating system for the XTEink X4 (ESP32-C3, e-paper)
 
 #![no_std]
 

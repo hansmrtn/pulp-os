@@ -1,22 +1,9 @@
-// Baseline JPEG decoder for e-ink display
-//
-// Streams MCU-row-by-row through a `ChunkReader` that fetches 4 KB at
-// a time from SD.  Peak RAM is ~30 KB regardless of image dimensions.
-// Handles any-size STORED or DEFLATE-compressed ZIP entries without
-// extracting to a contiguous buffer.  Only the luminance (Y) channel
-// is reconstructed; chrominance is Huffman-decoded to advance the
-// bitstream but discarded.
-//
-// Progressive JPEG (SOF2) is partially supported — only the first scan
-// is decoded.  This typically contains DC coefficients (and sometimes
-// low-frequency AC), producing a blocky but recognisable image.  On a
-// 1-bit dithered e-ink display the result is surprisingly close to full
-// decode.  Full progressive decode is not feasible: it requires
-// buffering all DCT coefficients across scans (~1.5 MB for a typical
-// image), far exceeding the ESP32-C3's 200 KB heap.
-//
-// Output: `png::DecodedImage` — packed 1-bit MSB-first, row-major,
-// Floyd-Steinberg dithered.  Compatible with `StripBuffer::blit_1bpp`.
+// Baseline JPEG decoder for e-ink display.
+// Streams MCU-row-by-row via ChunkReader (4KB chunks from SD); peak RAM ~30KB.
+// Luminance (Y) only; chrominance Huffman-decoded to advance bitstream, discarded.
+// Progressive JPEG (SOF2) partially supported: first scan only (DC + low-freq AC).
+// Full progressive not feasible: ~1.5MB coefficient buffer exceeds ESP32-C3 heap.
+// Output: png::DecodedImage, packed 1-bit MSB-first, Floyd-Steinberg dithered.
 
 extern crate alloc;
 
@@ -26,7 +13,7 @@ use alloc::vec::Vec;
 
 use crate::png::DecodedImage;
 
-// ── JPEG marker bytes ─────────────────────────────────────────────────
+// JPEG marker bytes
 
 const M_SOF0: u8 = 0xC0;
 const M_SOF2: u8 = 0xC2;
@@ -39,22 +26,21 @@ const M_DRI: u8 = 0xDD;
 const M_RST0: u8 = 0xD0;
 const M_RST7: u8 = 0xD7;
 
-// ── Limits ────────────────────────────────────────────────────────────
+// limits
 
 const MAX_COMP: usize = 4;
 const MAX_PIXELS: u32 = 2048 * 2048;
 
-/// Header area read for marker parsing (covers virtually all JPEGs;
-/// large APP/EXIF segments are skipped by length within this window).
+// header bytes to read for marker parsing; large APP/EXIF segments skipped by length
 const HEADER_READ: usize = 32768;
 
-/// Chunk size for streaming SD reads during MCU decode.
+// chunk size for streaming SD reads during MCU decode
 const CHUNK_SIZE: usize = 4096;
 
-/// DEFLATE sliding-window size for streaming ZIP decompression.
+// DEFLATE sliding-window size for streaming ZIP decompression
 const DEFLATE_WINDOW: usize = 32768;
 
-// ── Zig-zag scan order ────────────────────────────────────────────────
+// zig-zag scan order
 
 #[rustfmt::skip]
 const ZZ: [usize; 64] = [
@@ -68,7 +54,7 @@ const ZZ: [usize; 64] = [
     53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-// ── IDCT constants (IJG ISLOW, CONST_BITS = 13) ──────────────────────
+// IDCT constants (IJG ISLOW, CONST_BITS = 13)
 
 const CB: i32 = 13;
 const P1: i32 = 2;
@@ -85,9 +71,7 @@ const F2053: i32 = 16819;
 const F2562: i32 = 20995;
 const F3072: i32 = 25172;
 
-// ══════════════════════════════════════════════════════════════════════
-//  Types
-// ══════════════════════════════════════════════════════════════════════
+// types
 
 #[derive(Clone, Copy, Default)]
 struct Component {
@@ -121,16 +105,16 @@ struct JpegState {
     dc_ok: [bool; 4],
     ac_ok: [bool; 4],
     restart_interval: u16,
-    /// Byte offset of entropy data (relative to start of JPEG data).
+    // byte offset of entropy data (relative to start of JPEG data)
     scan_start: usize,
     scan_num_comp: u8,
     scan_order: [u8; MAX_COMP],
     progressive: bool,
-    /// First-scan spectral selection start (0 = DC).
+    // first-scan spectral selection start (0 = DC)
     scan_ss: u8,
-    /// First-scan spectral selection end (0 = DC only, 63 = all AC).
+    // first-scan spectral selection end (0 = DC only, 63 = all AC)
     scan_se: u8,
-    /// First-scan successive approximation low bit (point transform).
+    // first-scan successive approximation low bit (point transform)
     scan_al: u8,
 }
 
@@ -151,17 +135,15 @@ impl JpegState {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Byte source trait + implementations
-// ══════════════════════════════════════════════════════════════════════
+// byte source trait + implementations
 
-/// Raw byte source for the JPEG bitstream.
+// raw byte source for the JPEG bitstream
 trait JpegRead {
     fn read_byte(&mut self) -> Result<u8, &'static str>;
     fn is_eof(&self) -> bool;
 }
 
-/// Reads from an in-memory slice.
+// reads from an in-memory slice
 struct SliceReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -190,13 +172,11 @@ impl JpegRead for SliceReader<'_> {
     }
 }
 
-/// Reads from SD card via a closure, buffering 4 KB chunks.
+// reads from SD via closure, buffering 4KB chunks
 struct ChunkReader<F> {
     read_fn: F,
-    /// Absolute SD offset of the next byte to fetch.
-    offset: u32,
-    /// End-of-data offset (exclusive).
-    end: u32,
+    offset: u32, // absolute SD offset of next byte to fetch
+    end: u32,    // end-of-data offset (exclusive)
     buf: [u8; CHUNK_SIZE],
     pos: usize,
     len: usize,
@@ -250,34 +230,20 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Chunk
     }
 }
 
-/// Streaming DEFLATE-from-SD reader implementing `JpegRead`.
-///
-/// Reads compressed data from SD in 4 KB chunks, decompresses through
-/// miniz_oxide into a 32 KB circular dictionary, and yields one
-/// decompressed byte at a time.  Peak heap: ~47 KB (11 KB decompressor
-/// + 32 KB window + 4 KB read buffer).
+// streaming DEFLATE-from-SD reader; 4KB chunks in, one decompressed byte at a time out.
+// peak heap: ~47KB (11KB decompressor + 32KB window + 4KB read buf).
 struct DeflateReader<F> {
     read_fn: F,
-    /// Absolute SD offset of the next compressed byte to fetch.
-    file_pos: u32,
-    /// Compressed bytes remaining in the ZIP entry.
-    comp_left: usize,
-    /// Compressed-data read buffer.
-    rbuf: Vec<u8>,
-    /// Valid bytes in `rbuf`.
-    in_avail: usize,
-    /// Heap-allocated decompressor (~11 KB).
-    decomp: Box<miniz_oxide::inflate::core::DecompressorOxide>,
-    /// 32 KB circular dictionary buffer.
-    window: Vec<u8>,
-    /// Write position in the circular window (cumulative, mod DEFLATE_WINDOW).
-    dict_pos: usize,
-    /// Read cursor — next byte to yield from the window.
-    read_pos: usize,
-    /// Number of decompressed bytes available (dict_pos - read_pos).
-    avail: usize,
-    /// True once miniz reports `Done`.
-    done: bool,
+    file_pos: u32,    // absolute SD offset of next compressed byte
+    comp_left: usize, // compressed bytes remaining in ZIP entry
+    rbuf: Vec<u8>,    // compressed-data read buffer
+    in_avail: usize,  // valid bytes in rbuf
+    decomp: Box<miniz_oxide::inflate::core::DecompressorOxide>, // ~11KB
+    window: Vec<u8>,  // 32KB circular dictionary
+    dict_pos: usize,  // write position in window (cumulative, mod DEFLATE_WINDOW)
+    read_pos: usize,  // next byte to yield from window
+    avail: usize,     // decompressed bytes available (dict_pos - read_pos)
+    done: bool,       // true once miniz reports Done
 }
 
 impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
@@ -317,7 +283,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
         })
     }
 
-    /// Decompress more data into the circular window.
+    // decompress more data into the circular window
     fn pump(&mut self) -> Result<(), &'static str> {
         use miniz_oxide::inflate::TINFLStatus;
         use miniz_oxide::inflate::core::{decompress, inflate_flags};
@@ -326,7 +292,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
             return Ok(());
         }
 
-        // Top up compressed read buffer from SD.
+        // top up read buffer from SD
         if self.in_avail < CHUNK_SIZE && self.comp_left > 0 {
             let space = CHUNK_SIZE - self.in_avail;
             let want = space.min(self.comp_left);
@@ -380,8 +346,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
         Ok(())
     }
 
-    /// Read up to `buf.len()` decompressed bytes into `buf`.
-    /// Returns the number of bytes actually read.
+    // read up to buf.len() decompressed bytes into buf; return count read
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
         let mut total = 0usize;
         while total < buf.len() {
@@ -429,16 +394,13 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Defla
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  BitReader — generic over byte source
-// ══════════════════════════════════════════════════════════════════════
+// BitReader: generic over byte source
 
 struct BitReader<R> {
     source: R,
     buf: u32,
     avail: u8,
-    /// Stashed marker byte (non-zero ⇒ encountered during next_byte).
-    marker: u8,
+    marker: u8, // stashed marker byte (non-zero = encountered during next_byte)
 }
 
 impl<R: JpegRead> BitReader<R> {
@@ -451,7 +413,7 @@ impl<R: JpegRead> BitReader<R> {
         }
     }
 
-    /// Fetch the next entropy-coded byte, handling JPEG byte stuffing.
+    // fetch next entropy-coded byte, handling JPEG byte stuffing
     fn next_byte(&mut self) -> Result<u8, &'static str> {
         if self.marker != 0 {
             return Ok(0);
@@ -509,23 +471,23 @@ impl<R: JpegRead> BitReader<R> {
         Ok(val)
     }
 
-    /// Discard remaining bits, advance past the next restart marker.
+    // discard remaining bits, advance past the next restart marker
     fn consume_restart(&mut self) -> Result<(), &'static str> {
         self.buf = 0;
         self.avail = 0;
 
-        // If next_byte already stashed a marker, check it now.
+        // if next_byte already stashed a marker, check it now
         if self.marker != 0 {
             let m = self.marker;
             self.marker = 0;
             if m >= M_RST0 && m <= M_RST7 {
                 return Ok(());
             }
-            // Non-RST marker — not fatal; just keep going.
+            // non-RST marker; keep going
             return Ok(());
         }
 
-        // Scan forward for the restart marker.
+        // scan forward for the restart marker
         loop {
             if self.source.is_eof() {
                 return Ok(());
@@ -550,11 +512,9 @@ impl<R: JpegRead> BitReader<R> {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Public API
-// ══════════════════════════════════════════════════════════════════════
+// public API
 
-/// Decode a baseline JPEG from an in-memory buffer.
+// decode a baseline JPEG from an in-memory buffer
 pub fn decode_jpeg_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImage, &'static str> {
     let st = parse_markers(data)?;
 
@@ -564,13 +524,8 @@ pub fn decode_jpeg_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedIma
     decode_baseline(&st, BitReader::new(reader), max_w, max_h)
 }
 
-/// Decode a baseline JPEG by streaming 4 KB chunks from SD.
-///
-/// `read_fn(abs_offset, buf) → Ok(bytes_read)` reads from the EPUB
-/// file at an absolute byte offset.  `data_offset` is the start of
-/// the JPEG data within that file; `data_size` its byte length.
-///
-/// Progressive JPEGs are partially decoded (first scan only).
+// decode a JPEG by streaming 4KB chunks from SD.
+// read_fn(abs_offset, buf) -> Ok(bytes_read). progressive = first scan only.
 pub fn decode_jpeg_sd<F>(
     mut read_fn: F,
     data_offset: u32,
@@ -581,7 +536,7 @@ pub fn decode_jpeg_sd<F>(
 where
     F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
 {
-    // Read the first portion of the JPEG for marker parsing.
+    // read the first portion of the JPEG for marker parsing
     let hdr_size = HEADER_READ.min(data_size as usize);
     let mut hdr = Vec::new();
     hdr.try_reserve_exact(hdr_size)
@@ -594,8 +549,7 @@ where
 
     validate_tables(&st)?;
 
-    // Free header — we only need it for marker data, which is now
-    // stored inside JpegState (Huffman tables + quant tables).
+    // free header; marker data is now in JpegState
     drop(hdr);
 
     let scan_abs = data_offset + st.scan_start as u32;
@@ -605,16 +559,8 @@ where
     decode_baseline(&st, BitReader::new(reader), max_w, max_h)
 }
 
-/// Decode a baseline JPEG from a DEFLATE-compressed ZIP entry by
-/// streaming both the decompression and the MCU decode.
-///
-/// `read_fn(abs_offset, buf) → Ok(bytes_read)` reads from the EPUB
-/// file.  `data_offset` is the absolute offset of the compressed
-/// entry data; `comp_size` / `uncomp_size` come from the ZIP central
-/// directory.
-///
-/// Peak heap: ~79 KB (47 KB DEFLATE reader + 32 KB header buffer +
-/// ~30 KB decode buffers — header freed before decode starts).
+// decode a DEFLATE-compressed JPEG from SD, streaming both decompression and MCU decode.
+// peak heap: ~79KB (47KB deflate reader + 32KB header buf + ~30KB decode bufs).
 pub fn decode_jpeg_deflate_sd<F>(
     read_fn: F,
     data_offset: u32,
@@ -626,10 +572,9 @@ pub fn decode_jpeg_deflate_sd<F>(
 where
     F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
 {
-    // Build the streaming DEFLATE reader.
     let mut deflate = DeflateReader::new(read_fn, data_offset, comp_size)?;
 
-    // Decompress enough for JPEG marker parsing.
+    // decompress enough for marker parsing
     let hdr_size = HEADER_READ.min(uncomp_size as usize);
     let mut hdr = Vec::new();
     hdr.try_reserve_exact(hdr_size)
@@ -642,14 +587,11 @@ where
 
     validate_tables(&st)?;
 
-    // Advance the DEFLATE reader past any header bytes we already
-    // decompressed beyond scan_start.  The reader's cursor is at `n`;
-    // scan data starts at `scan_start`.  If scan_start > n we need to
-    // skip forward; if scan_start <= n, some scan bytes are already in
-    // the window — rewind the read cursor.
+    // advance past header bytes already decompressed beyond scan_start;
+    // if scan_start > n skip forward; if <= n rewind read cursor
     let scan_start = st.scan_start;
     if scan_start > n {
-        // Rare: headers larger than HEADER_READ.  Skip forward.
+        // rare: headers larger than HEADER_READ; skip forward
         let skip = scan_start - n;
         let mut trash = [0u8; 256];
         let mut left = skip;
@@ -662,22 +604,19 @@ where
             left -= got;
         }
     } else {
-        // Rewind: the bytes from scan_start..n are already in the
-        // circular window.  Just adjust the read cursor back.
+        // bytes from scan_start..n already in window; rewind read cursor
         let rewind = n - scan_start;
         deflate.read_pos -= rewind;
         deflate.avail += rewind;
     }
 
-    // Free header — marker data is stored inside JpegState.
+    // free header; marker data is in JpegState
     drop(hdr);
 
     decode_baseline(&st, BitReader::new(deflate), max_w, max_h)
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Baseline decode core (generic over byte source)
-// ══════════════════════════════════════════════════════════════════════
+// baseline decode core (generic over byte source)
 
 fn validate_tables(st: &JpegState) -> Result<(), &'static str> {
     for sci in 0..st.scan_num_comp as usize {
@@ -749,7 +688,7 @@ fn decode_baseline<R: JpegRead>(
         );
     }
 
-    // ── Allocate buffers ──────────────────────────────────────────
+    // allocate buffers
 
     let mut y_row = vec![128u8; row_w * mcu_h];
     let mut output = Vec::new();
@@ -767,7 +706,7 @@ fn decode_baseline<R: JpegRead>(
     let total_mcus = (mcus_x * mcus_y) as u32;
     let mut out_y: usize = 0;
 
-    // ── MCU decode loop ───────────────────────────────────────────
+    // MCU decode loop
 
     for mcu_row in 0..mcus_y {
         y_row.fill(128);
@@ -822,7 +761,7 @@ fn decode_baseline<R: JpegRead>(
             }
         }
 
-        // ── Dither this MCU row ───────────────────────────────────
+        // dither this MCU row
         for py in 0..mcu_h {
             let src_y = mcu_row * mcu_h + py;
             if src_y >= h || out_y >= out_h {
@@ -855,9 +794,7 @@ fn decode_baseline<R: JpegRead>(
     })
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Marker parsing  (operates on &[u8] header buffer)
-// ══════════════════════════════════════════════════════════════════════
+// marker parsing (operates on &[u8] header buffer)
 
 fn parse_markers(data: &[u8]) -> Result<Box<JpegState>, &'static str> {
     if data.len() < 2 || data[0] != 0xFF || data[1] != M_SOI {
@@ -1090,9 +1027,7 @@ fn parse_sos(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'s
     Ok(())
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Huffman table construction
-// ══════════════════════════════════════════════════════════════════════
+// Huffman table construction
 
 fn build_huff_table(table: &mut HuffTable, bits: &[u8; 16], vals: &[u8]) {
     let total: usize = bits.iter().map(|&b| b as usize).sum();
@@ -1127,9 +1062,7 @@ fn build_huff_table(table: &mut HuffTable, bits: &[u8; 16], vals: &[u8]) {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Huffman decode
-// ══════════════════════════════════════════════════════════════════════
+// Huffman decode
 
 fn huff_decode<R: JpegRead>(r: &mut BitReader<R>, t: &HuffTable) -> Result<u8, &'static str> {
     let peek8 = r.peek(8)? as usize;
@@ -1160,9 +1093,7 @@ fn extend(bits: u32, size: u8) -> i32 {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Block decode (Y) / skip (non-Y)
-// ══════════════════════════════════════════════════════════════════════
+// block decode (Y) / skip (non-Y)
 
 fn decode_block<R: JpegRead>(
     r: &mut BitReader<R>,
@@ -1246,9 +1177,7 @@ fn skip_block<R: JpegRead>(
     Ok(())
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Integer IDCT (IJG ISLOW, two-pass row + col)
-// ══════════════════════════════════════════════════════════════════════
+// integer IDCT (IJG ISLOW, two-pass row + col)
 
 fn idct(block: &[i32; 64], out: &mut [u8; 64]) {
     let mut ws = [0i32; 64];
@@ -1348,11 +1277,9 @@ fn idct(block: &[i32; 64], out: &mut [u8; 64]) {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Floyd-Steinberg dithering
-// ══════════════════════════════════════════════════════════════════════
+// Floyd-Steinberg dithering
 
-/// Dither one row of Y pixels (from the MCU row buffer) inline.
+// dither one row of Y pixels from the MCU row buffer inline
 #[inline]
 fn dither_row_grey(
     row: &[u8],
@@ -1379,9 +1306,7 @@ fn dither_row_grey(
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Helpers
-// ══════════════════════════════════════════════════════════════════════
+// helpers
 
 #[inline]
 fn descale(x: i32, n: i32) -> i32 {

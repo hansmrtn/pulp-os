@@ -1,7 +1,6 @@
-// Build-time rasterised bitmap fonts for e-ink rendering
-//
+// Build-time rasterised bitmap fonts for e-ink rendering.
 // TTFs rasterised by build.rs via fontdue into 1-bit tables in flash.
-// Zero heap, zero parsing at runtime. Three sizes (0=Small/1=Med/2=Large).
+// Zero heap, zero parsing at runtime. Three sizes: 0=Small, 1=Medium, 2=Large.
 
 pub mod bitmap;
 
@@ -12,13 +11,19 @@ pub mod font_data {
 use crate::drivers::strip::StripBuffer;
 use bitmap::BitmapFont;
 
-// idx: 0 = Small, 1 = Medium, 2 = Large
+// body font by index: 0 = Small, 1 = Medium, 2 = Large
 pub fn body_font(idx: u8) -> &'static BitmapFont {
     match idx {
         1 => &font_data::REGULAR_BODY_MEDIUM,
         2 => &font_data::REGULAR_BODY_LARGE,
         _ => &font_data::REGULAR_BODY_SMALL,
     }
+}
+
+// chrome font (button labels, quick-menu items, loading text, etc.);
+// always returns the small body font regardless of the size setting
+pub fn chrome_font(_idx: u8) -> &'static BitmapFont {
+    body_font(0)
 }
 
 pub fn heading_font(idx: u8) -> &'static BitmapFont {

@@ -1,5 +1,4 @@
-// SD card file operations and directory cache
-//
+// SD card file operations and directory cache.
 // DirCache reads all entries once into RAM, serves pages from there.
 // Subdirectory ops support the EPUB chapter cache pipeline.
 
@@ -10,12 +9,23 @@ use crate::drivers::sdcard::SdStorage;
 // all app data lives under this directory on the SD root
 pub const PULP_DIR: &str = "_PULP";
 
+// title index file inside _PULP; maps 8.3 filenames to parsed titles.
+// format: append-only lines of "FILENAME.EXT\tTitle Text\n".
+pub const TITLES_FILE: &str = "TITLES.BIN";
+
+// max length for a parsed display title
+pub const TITLE_CAP: usize = 48;
+
 #[derive(Clone, Copy)]
 pub struct DirEntry {
     pub name: [u8; 13],
     pub name_len: u8,
     pub is_dir: bool,
     pub size: u32,
+    // parsed display title (e.g. from EPUB OPF metadata).
+    // if title_len == 0, no parsed title is available.
+    pub title: [u8; TITLE_CAP],
+    pub title_len: u8,
 }
 
 impl DirEntry {
@@ -24,10 +34,29 @@ impl DirEntry {
         name_len: 0,
         is_dir: false,
         size: 0,
+        title: [0u8; TITLE_CAP],
+        title_len: 0,
     };
 
+    // raw 8.3 filename
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+
+    // parsed title if available, otherwise the 8.3 filename
+    pub fn display_name(&self) -> &str {
+        if self.title_len > 0 {
+            core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or(self.name_str())
+        } else {
+            self.name_str()
+        }
+    }
+
+    // set the parsed display title from a byte slice
+    pub fn set_title(&mut self, s: &[u8]) {
+        let n = s.len().min(TITLE_CAP);
+        self.title[..n].copy_from_slice(&s[..n]);
+        self.title_len = n as u8;
     }
 }
 
@@ -86,6 +115,8 @@ impl DirCache {
                     name_len: name_len as u8,
                     is_dir: entry.attributes.is_directory(),
                     size: entry.size,
+                    title: [0u8; TITLE_CAP],
+                    title_len: 0,
                 };
                 count += 1;
             }
@@ -95,7 +126,87 @@ impl DirCache {
         self.count = count;
         sort_entries(&mut self.entries[..count]);
         self.valid = true;
+
+        // try to load parsed titles from _PULP/TITLES.BIN
+        self.load_titles(sd);
+
         Ok(())
+    }
+
+    // read _PULP/TITLES.BIN and apply parsed titles to matching entries.
+    // append-only: later lines override earlier ones for the same name.
+    fn load_titles<SPI>(&mut self, sd: &SdStorage<SPI>)
+    where
+        SPI: embedded_hal::spi::SpiDevice,
+    {
+        let mut buf = [0u8; 1024];
+        let mut offset: u32 = 0;
+        let mut leftover = 0usize;
+
+        loop {
+            let space = buf.len() - leftover;
+            if space == 0 {
+                // line longer than buffer; skip it
+                leftover = 0;
+                continue;
+            }
+
+            let n = match read_pulp_file_chunk(sd, TITLES_FILE, offset, &mut buf[leftover..]) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                // process remaining leftover as final line
+                if leftover > 0 {
+                    self.apply_title_line(&buf[..leftover]);
+                }
+                break;
+            }
+
+            offset += n as u32;
+            let total = leftover + n;
+
+            // process complete lines
+            let mut start = 0;
+            for i in 0..total {
+                if buf[i] == b'\n' {
+                    if i > start {
+                        self.apply_title_line(&buf[start..i]);
+                    }
+                    start = i + 1;
+                }
+            }
+
+            // move leftover to front of buf
+            if start < total {
+                buf.copy_within(start..total, 0);
+                leftover = total - start;
+            } else {
+                leftover = 0;
+            }
+        }
+    }
+
+    // parse a single title line ("FILENAME.EXT\tTitle Text") and apply to
+    // matching DirEntry; last-writer-wins for duplicate names
+    fn apply_title_line(&mut self, line: &[u8]) {
+        let tab_pos = match line.iter().position(|&b| b == b'\t') {
+            Some(p) => p,
+            None => return,
+        };
+        let name_part = &line[..tab_pos];
+        let title_part = &line[tab_pos + 1..];
+        if title_part.is_empty() {
+            return;
+        }
+
+        for entry in self.entries[..self.count].iter_mut() {
+            let elen = entry.name_len as usize;
+            if elen == name_part.len() && entry.name[..elen].eq_ignore_ascii_case(name_part) {
+                entry.set_title(title_part);
+                break;
+            }
+        }
     }
 
     pub fn page(&self, skip: usize, buf: &mut [DirEntry]) -> DirPage {
@@ -115,7 +226,7 @@ impl DirCache {
     }
 }
 
-// insertion sort: dirs first, then case-insensitive
+// insertion sort: dirs first, then filenames case-insensitive
 fn sort_entries(entries: &mut [DirEntry]) {
     for i in 1..entries.len() {
         let key = entries[i];
@@ -194,7 +305,7 @@ where
     Ok(total)
 }
 
-// open file, return (size, bytes_read) from offset 0 in a single open
+// open file, return (size, bytes_read) from offset 0
 pub fn read_file_start<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -297,7 +408,7 @@ where
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
 
-    // ReadWriteCreateOrTruncate handles both first write and updates
+    // ReadWriteCreateOrTruncate handles both creation and updates
     let file = root
         .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| "open file for write failed")?;
@@ -308,8 +419,8 @@ where
     Ok(())
 }
 
-/// Create (or truncate) a file in the SD root and write an initial chunk.
-/// Use [`append_root_file`] for subsequent chunks.
+// create (or truncate) a file in the SD root and write an initial chunk;
+// use append_root_file for subsequent chunks
 pub fn create_or_truncate_root<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -336,8 +447,8 @@ where
     Ok(())
 }
 
-/// Append a chunk to an existing file in the SD root.
-/// The file must already exist (created via [`create_or_truncate_root`]).
+// append a chunk to an existing file in the SD root;
+// file must already exist (created via create_or_truncate_root)
 pub fn append_root_file<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -364,7 +475,7 @@ where
     Ok(())
 }
 
-// ── Subdirectory operations (EPUB chapter cache) ──────────────────────────
+// subdirectory operations (EPUB chapter cache)
 
 // create dir in root if it doesn't already exist
 pub fn ensure_dir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
@@ -377,18 +488,17 @@ where
         .map_err(|_| "open volume failed")?;
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
 
-    // already exists → done
+    // already exists; done
     if root.open_dir(name).is_ok() {
         return Ok(());
     }
 
-    // create it
     root.make_dir_in_dir(name).map_err(|_| "make dir failed")?;
 
     Ok(())
 }
 
-// write (create-or-truncate) a file inside a subdirectory of root
+// write (create-or-truncate) file inside a subdirectory of root
 pub fn write_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -417,7 +527,7 @@ where
     Ok(())
 }
 
-// append to file (or create) inside a subdirectory
+// append to file (or create) inside a subdirectory of root
 pub fn append_file_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -446,7 +556,7 @@ where
     Ok(())
 }
 
-// read chunk from file in subdir at `offset`
+// read chunk from file in subdir at offset
 pub fn read_file_chunk_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -485,7 +595,7 @@ where
     Ok(total)
 }
 
-// file size in subdir, or Err if not found
+// file size in subdir; Err if not found
 pub fn file_size_in_dir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -524,13 +634,12 @@ where
     let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
     let sub = root.open_dir(dir).map_err(|_| "open cache dir failed")?;
 
-    // idempotent: ignore "not found"
-    let _ = sub.delete_file_in_dir(name);
+    let _ = sub.delete_file_in_dir(name); // idempotent; ignore not-found
 
     Ok(())
 }
 
-// ── _PULP app-data directory ──────────────────────────────────────────────
+// _PULP app-data directory
 
 // create _PULP in root if it doesn't already exist
 pub fn ensure_pulp_dir<SPI>(sd: &SdStorage<SPI>) -> Result<(), &'static str>
@@ -540,7 +649,7 @@ where
     ensure_dir(sd, PULP_DIR)
 }
 
-// write (create-or-truncate) a file directly inside _PULP/
+// write (create-or-truncate) file directly inside _PULP/
 pub fn write_pulp_file<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -552,7 +661,7 @@ where
     write_file_in_dir(sd, PULP_DIR, name, data)
 }
 
-// read chunk from a file directly inside _PULP/
+// read chunk from file directly inside _PULP/
 pub fn read_pulp_file_chunk<SPI>(
     sd: &SdStorage<SPI>,
     name: &str,
@@ -577,7 +686,7 @@ where
     read_file_start_in_dir(sd, PULP_DIR, name, buf)
 }
 
-// ── Nested subdirectory operations (_PULP/<sub>/) ─────────────────────────
+// nested subdirectory operations (_PULP/<sub>/)
 
 // create _PULP/<name>/ (ensures _PULP exists first)
 pub fn ensure_pulp_subdir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
@@ -599,7 +708,7 @@ where
     Ok(())
 }
 
-// write (create-or-truncate) a file inside _PULP/<dir>/
+// write (create-or-truncate) file inside _PULP/<dir>/
 pub fn write_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -657,7 +766,7 @@ where
     Ok(())
 }
 
-// read chunk from _PULP/<dir>/<name> at offset
+// read chunk from _PULP/<dir>/<name> at given offset
 pub fn read_chunk_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -696,7 +805,7 @@ where
     Ok(total)
 }
 
-// file size inside _PULP/<dir>/<name>
+// file size inside _PULP/<dir>/<name>; Err if not found
 pub fn file_size_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,
@@ -719,7 +828,48 @@ where
     Ok(file.length())
 }
 
-// delete file inside _PULP/<dir>/; no-op if absent
+// append a title mapping line to _PULP/TITLES.BIN; format: "FILENAME.EXT\tTitle Text\n"
+pub fn save_title<SPI>(sd: &SdStorage<SPI>, filename: &str, title: &str) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let name_bytes = filename.as_bytes();
+    let title_bytes = title.as_bytes();
+    let title_len = title_bytes.len().min(TITLE_CAP);
+    let line_len = name_bytes.len() + 1 + title_len + 1; // name + \t + title + \n
+    if line_len > 128 {
+        return Err("title line too long");
+    }
+    let mut line = [0u8; 128];
+    line[..name_bytes.len()].copy_from_slice(name_bytes);
+    line[name_bytes.len()] = b'\t';
+    line[name_bytes.len() + 1..name_bytes.len() + 1 + title_len]
+        .copy_from_slice(&title_bytes[..title_len]);
+    line[name_bytes.len() + 1 + title_len] = b'\n';
+
+    append_in_pulp_dir(sd, TITLES_FILE, &line[..line_len])
+}
+
+// append data to a file inside _PULP/ (creates if it doesn't exist)
+fn append_in_pulp_dir<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir")?;
+    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP dir")?;
+    let f = pulp
+        .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
+        .map_err(|_| "open titles file")?;
+    f.seek_from_end(0).map_err(|_| "seek end")?;
+    f.write(data).map_err(|_| "write titles")?;
+    f.close().map_err(|_| "close titles")?;
+    Ok(())
+}
+
 pub fn delete_in_pulp_subdir<SPI>(
     sd: &SdStorage<SPI>,
     dir: &str,

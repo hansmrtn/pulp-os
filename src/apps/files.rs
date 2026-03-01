@@ -1,5 +1,4 @@
-// Paginated file browser for SD card root directory
-//
+// Paginated file browser for SD card root directory.
 // In-page scroll marks two rows dirty; cross-page sets needs_load
 // and defers to AppWork for SD read + render decision.
 
@@ -19,18 +18,15 @@ use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 const PAGE_SIZE: usize = 7;
 
-// Centered list column: 448 px wide with 16 px margins each side.
+// centered list column: 448px wide, 16px margins
 const LIST_X: u16 = 16;
 const LIST_W: u16 = 448;
 
-// STATUS_REGION is fixed next to the header; its y matches CONTENT_TOP + 8.
 const STATUS_REGION: Region = Region::new(320, CONTENT_TOP + 8, 144, 28);
 
 const ROW_H: u16 = 52;
-// Vertical gap between rows (border-to-border).
-const ROW_GAP: u16 = 4;
-// Vertical gap between the bottom of the heading and the first list row.
-const HEADER_LIST_GAP: u16 = 8;
+const ROW_GAP: u16 = 4; // gap between rows (border-to-border)
+const HEADER_LIST_GAP: u16 = 8; // gap between heading bottom and first row
 
 impl Default for FilesApp {
     fn default() -> Self {
@@ -129,6 +125,11 @@ impl FilesApp {
         } else if self.scroll > 0 {
             self.scroll = self.scroll.saturating_sub(1);
             self.needs_load = true;
+        } else if self.total > 0 {
+            // wrap to bottom
+            self.scroll = self.total.saturating_sub(PAGE_SIZE);
+            self.selected = self.total.saturating_sub(self.scroll) - 1;
+            self.needs_load = true;
         }
     }
 
@@ -141,22 +142,24 @@ impl FilesApp {
         } else if self.scroll + self.count < self.total {
             self.scroll += 1;
             self.needs_load = true;
+        } else if self.total > 0 {
+            // wrap to top
+            self.scroll = 0;
+            self.selected = 0;
+            self.needs_load = true;
         }
     }
 
-    // jump backward by a full page
     fn jump_up(&mut self) {
         if self.scroll > 0 {
             self.scroll = self.scroll.saturating_sub(PAGE_SIZE);
             self.selected = 0;
             self.needs_load = true;
         } else {
-            // Already at top — snap selection to first item
             self.selected = 0;
         }
     }
 
-    // jump forward by a full page
     fn jump_down(&mut self) {
         let remaining = self.total.saturating_sub(self.scroll + self.count);
         if remaining > 0 {
@@ -164,7 +167,6 @@ impl FilesApp {
             self.selected = 0;
             self.needs_load = true;
         } else {
-            // Already at end — snap selection to last item
             if self.count > 0 {
                 self.selected = self.count - 1;
             }
@@ -179,7 +181,7 @@ impl App for FilesApp {
         self.needs_load = true;
         self.stale_cache = true;
         self.error = None;
-        ctx.request_screen_redraw();
+        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
     }
 
     fn on_exit(&mut self) {
@@ -189,7 +191,7 @@ impl App for FilesApp {
     fn on_suspend(&mut self) {}
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
-        ctx.request_screen_redraw();
+        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
     }
 
     fn needs_work(&self) -> bool {
@@ -238,9 +240,7 @@ impl App for FilesApp {
 
             ActionEvent::Press(Action::PrevJump) => {
                 self.jump_up();
-                if self.needs_load {
-                    // on_work will mark dirty
-                } else {
+                if !self.needs_load {
                     ctx.mark_dirty(self.list_region());
                     ctx.mark_dirty(STATUS_REGION);
                 }
@@ -249,9 +249,7 @@ impl App for FilesApp {
 
             ActionEvent::Press(Action::NextJump) => {
                 self.jump_down();
-                if self.needs_load {
-                    // on_work will mark dirty
-                } else {
+                if !self.needs_load {
                     ctx.mark_dirty(self.list_region());
                     ctx.mark_dirty(STATUS_REGION);
                 }
@@ -302,6 +300,14 @@ impl App for FilesApp {
             return;
         }
 
+        if self.count == 0 && self.needs_load {
+            BitmapLabel::new(self.row_region(0), "Loading...", self.body_font)
+                .alignment(Alignment::CenterLeft)
+                .draw(strip)
+                .unwrap();
+            return;
+        }
+
         if self.count == 0 && !self.needs_load {
             BitmapLabel::new(self.row_region(0), "No files found", self.body_font)
                 .alignment(Alignment::CenterLeft)
@@ -315,7 +321,7 @@ impl App for FilesApp {
 
             if i < self.count {
                 let entry = &self.entries[i];
-                let name = entry.name_str();
+                let name = entry.display_name();
 
                 BitmapLabel::new(region, name, self.body_font)
                     .alignment(Alignment::CenterLeft)
@@ -323,7 +329,7 @@ impl App for FilesApp {
                     .draw(strip)
                     .unwrap();
             } else {
-                // Clear phantom rows below the list end.
+                // clear phantom rows below list end
                 region
                     .to_rect()
                     .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))

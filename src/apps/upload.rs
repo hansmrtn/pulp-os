@@ -1,25 +1,9 @@
-// WiFi upload mode — file upload server
-//
-// ┌────────────────────────────────────────────────────────────┐
-// │  SET YOUR WIFI CREDENTIALS IN THE CONSTANTS BELOW          │
-// └────────────────────────────────────────────────────────────┘
-//
-// Entered from the Home menu.  Renders connection status on the
-// e-paper display and runs a tiny HTTP server on port 80.
-// Press BACK to tear down WiFi and return to the home screen.
-//
-// GET  /        → HTML page with a file-picker form
-// POST /upload  → multipart/form-data handler that streams the
-//                 selected file to the SD card root directory
-//
-// No embassy tasks are spawned — the network runner, HTTP server,
-// mDNS responder and back-button monitor are multiplexed with
-// `select`, so everything cleans up naturally when the function
-// returns.
-//
-// A minimal mDNS responder advertises the device as `pulp.local`
-// so users can navigate to http://pulp.local/ instead of needing
-// to know the DHCP-assigned IP.
+// WiFi upload mode: HTTP file upload server run from Home menu.
+// SET WIFI CREDENTIALS IN THE CONSTANTS BELOW.
+// GET / -> HTML file-picker form.
+// POST /upload -> multipart/form-data streamed to SD root.
+// No embassy tasks; runner, server, mDNS and back-button multiplexed with select.
+// mDNS advertises as pulp.local so users don't need the DHCP IP.
 
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
@@ -42,14 +26,14 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::tasks;
-use crate::ui::{Alignment, BitmapLabel, CONTENT_TOP, Region};
+use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region};
 
-// ── WiFi credentials (edit these!) ──────────────────────────────────
+// WiFi credentials (edit these!)
 
 const SSID: &str = "all_ducks_quack";
 const PASSWORD: &str = "pissword";
 
-// ── Layout ──────────────────────────────────────────────────────────
+// layout
 
 const SCREEN_W: u16 = 480;
 const SCREEN_H: u16 = 800;
@@ -63,7 +47,7 @@ const BODY_LINE_GAP: u16 = 10;
 
 const FOOTER_Y: u16 = SCREEN_H - 60;
 
-// ── HTTP response fragments ─────────────────────────────────────────
+// HTTP response fragments
 
 const HTTP_200: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
 const HTTP_500: &[u8] =
@@ -84,11 +68,11 @@ const UPLOAD_OK: &[u8] = b"<title>Pulp</title>\
 const UPLOAD_ERR_PREFIX: &[u8] = b"<title>Pulp</title><p>Upload failed: ";
 const UPLOAD_ERR_SUFFIX: &[u8] = b"</p><a href=/>Try again</a>";
 
-// ── mDNS constants ──────────────────────────────────────────────────
+// mDNS constants
 
 const MDNS_PORT: u16 = 5353;
 
-/// "pulp.local" in DNS wire format: length-prefixed labels + NUL.
+// "pulp.local" in DNS wire format: length-prefixed labels + NUL
 const HOSTNAME_WIRE: [u8; 12] = [
     4, b'p', b'u', b'l', b'p', //
     5, b'l', b'o', b'c', b'a', b'l', //
@@ -97,16 +81,11 @@ const HOSTNAME_WIRE: [u8; 12] = [
 
 const MDNS_RESPONSE_LEN: usize = 38;
 
-// ── Upload streaming constants ──────────────────────────────────────
-
-/// Maximum boundary string length we support.
+// max boundary string length
 const MAX_BOUNDARY_LEN: usize = 120;
 
-/// Work buffer for accumulating file data during upload.
-/// Larger values → fewer SD card write operations → faster uploads.
+// work buffer for upload data; larger = fewer SD writes
 const WORK_BUF_SIZE: usize = 2048;
-
-// ── Server event ────────────────────────────────────────────────────
 
 enum ServerEvent {
     Nothing,
@@ -114,21 +93,21 @@ enum ServerEvent {
     UploadFailed,
 }
 
-// ── Public entry point ──────────────────────────────────────────────
-
 pub async fn run_upload_mode<SPI>(
     wifi: esp_hal::peripherals::WIFI<'static>,
     epd: &mut Epd,
     strip: &mut StripBuffer,
     delay: &mut Delay,
     sd: &SdStorage<SPI>,
+    ui_font_size_idx: u8,
+    bumps: &ButtonFeedback,
 ) where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let heading = fonts::heading_font(0);
-    let body = fonts::body_font(0);
+    let heading = fonts::heading_font(ui_font_size_idx);
+    let body = fonts::chrome_font(ui_font_size_idx);
 
-    // ── Phase 1 — Initialise radio & WiFi ───────────────────────────
+    // phase 1: initialise radio & WiFi
 
     render_screen(
         epd,
@@ -138,6 +117,7 @@ pub async fn run_upload_mode<SPI>(
         body,
         &["Initialising radio..."],
         None,
+        bumps,
     )
     .await;
 
@@ -153,6 +133,7 @@ pub async fn run_upload_mode<SPI>(
                 body,
                 &["Radio init failed!"],
                 Some("Press BACK to exit"),
+                bumps,
             )
             .await;
             drain_until_back().await;
@@ -172,6 +153,7 @@ pub async fn run_upload_mode<SPI>(
                 body,
                 &["WiFi init failed!"],
                 Some("Press BACK to exit"),
+                bumps,
             )
             .await;
             drain_until_back().await;
@@ -193,6 +175,7 @@ pub async fn run_upload_mode<SPI>(
             body,
             &["WiFi config error!"],
             Some("Press BACK to exit"),
+            bumps,
         )
         .await;
         drain_until_back().await;
@@ -209,6 +192,7 @@ pub async fn run_upload_mode<SPI>(
             body,
             &["WiFi start failed!"],
             Some("Press BACK to exit"),
+            bumps,
         )
         .await;
         drain_until_back().await;
@@ -217,7 +201,7 @@ pub async fn run_upload_mode<SPI>(
 
     info!("upload: wifi started, connecting to '{}'", SSID);
 
-    // ── Phase 2 — Connect to AP ─────────────────────────────────────
+    // phase 2: connect to AP
 
     {
         let mut msg_buf = [0u8; 64];
@@ -225,7 +209,7 @@ pub async fn run_upload_mode<SPI>(
             let _ = write!(w, "Connecting to '{}'...", SSID);
         });
         let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
-        render_screen(epd, strip, delay, heading, body, &[msg], None).await;
+        render_screen(epd, strip, delay, heading, body, &[msg], None, bumps).await;
     }
 
     if let Err(e) = wifi_ctrl.connect_async().await {
@@ -238,6 +222,7 @@ pub async fn run_upload_mode<SPI>(
             body,
             &["Connection failed!"],
             Some("Press BACK to exit"),
+            bumps,
         )
         .await;
         drain_until_back().await;
@@ -246,7 +231,7 @@ pub async fn run_upload_mode<SPI>(
 
     info!("upload: connected to '{}'", SSID);
 
-    // ── Phase 3 — DHCP ──────────────────────────────────────────────
+    // phase 3: DHCP
 
     render_screen(
         epd,
@@ -256,6 +241,7 @@ pub async fn run_upload_mode<SPI>(
         body,
         &["Connected!", "Obtaining IP address..."],
         None,
+        bumps,
     )
     .await;
 
@@ -315,10 +301,11 @@ pub async fn run_upload_mode<SPI>(
         body,
         &["http://pulp.local/", ip_str],
         Some("Press BACK to exit"),
+        bumps,
     )
     .await;
 
-    // ── Phase 4 — HTTP server + mDNS responder loop ─────────────────
+    // phase 4: HTTP server + mDNS responder loop
 
     let mut rx_buf = [0u8; 2048];
     let mut tx_buf = [0u8; 1536];
@@ -337,7 +324,7 @@ pub async fn run_upload_mode<SPI>(
         .await
         {
             Either::Second(Either::First(inner)) => inner,
-            Either::Second(Either::Second(_)) => break, // BACK pressed
+            Either::Second(Either::Second(_)) => break, // back pressed
             _ => unreachable!(),
         };
 
@@ -361,9 +348,9 @@ pub async fn run_upload_mode<SPI>(
     info!("upload: exiting, tearing down WiFi");
 }
 
-// ── HTTP request handling ───────────────────────────────────────────
+// HTTP request handling
 
-/// Accept one TCP connection, route the request, send a response.
+// accept one TCP connection, route the request, send a response
 async fn serve_one_request<SPI>(
     stack: embassy_net::Stack<'_>,
     rx_buf: &mut [u8],
@@ -388,7 +375,7 @@ where
         return ServerEvent::Nothing;
     }
 
-    // Read HTTP request headers (accumulate until \r\n\r\n)
+    // read HTTP request headers (accumulate until \r\n\r\n)
     let mut hdr = [0u8; 1024];
     let mut hdr_len = 0usize;
 
@@ -418,7 +405,7 @@ where
         }
     }
 
-    // Locate end of headers; body data may follow in the same read.
+    // locate end of headers; body data may follow in the same read
     let headers_end = match find_subsequence(&hdr[..hdr_len], b"\r\n\r\n") {
         Some(p) => p,
         None => {
@@ -430,7 +417,7 @@ where
     let initial_body = &hdr[body_offset..hdr_len];
     let headers = &hdr[..headers_end];
 
-    // Parse request line: "METHOD /path HTTP/x.x"
+    // parse request line: "METHOD /path HTTP/x.x"
     let first_line_end = headers
         .iter()
         .position(|&b| b == b'\r')
@@ -451,7 +438,7 @@ where
     }
 
     if is_post && path == b"/upload" {
-        // Extract boundary from Content-Type header
+        // extract boundary from Content-Type header
         let boundary = match find_boundary(headers) {
             Some(b) => b,
             None => {
@@ -461,7 +448,7 @@ where
             }
         };
 
-        // Handle the file upload
+        // handle the file upload
         match handle_upload(&mut socket, sd, boundary, initial_body).await {
             Ok((name_buf, name_len)) => {
                 let _ = socket.write_all(HTTP_200).await;
@@ -482,19 +469,15 @@ where
         }
     }
 
-    // Fallback: 404
+    // fallback: 404
     let _ = socket.write_all(HTTP_404).await;
     let _ = socket.flush().await;
     close_socket(&mut socket).await;
     ServerEvent::Nothing
 }
 
-/// Stream a multipart file upload body to the SD card.
-///
-/// `initial_body` contains any body bytes already read alongside the
-/// HTTP headers.  The remainder is read from `socket`.
-///
-/// Returns the sanitised 8.3 filename on success.
+// stream a multipart upload body to SD; initial_body = body bytes read with headers.
+// returns sanitised 8.3 filename on success.
 async fn handle_upload<SPI>(
     socket: &mut TcpSocket<'_>,
     sd: &SdStorage<SPI>,
@@ -508,7 +491,7 @@ where
         return Err("boundary too long");
     }
 
-    // Build the end-of-file-data marker: \r\n--<boundary>
+    // build end-of-file-data marker: \r\n--<boundary>
     let em_len = 4 + boundary.len();
     let mut end_marker_buf = [0u8; MAX_BOUNDARY_LEN + 4];
     end_marker_buf[0] = b'\r';
@@ -518,18 +501,9 @@ where
     end_marker_buf[4..em_len].copy_from_slice(boundary);
     let end_marker = &end_marker_buf[..em_len];
 
-    // ── Phase A: skip multipart preamble, find file data start ──────
-    //
-    // The body looks like:
-    //   --<boundary>\r\n
-    //   Content-Disposition: form-data; name="file"; filename="X"\r\n
-    //   Content-Type: ...\r\n
-    //   \r\n
-    //   <file data>
-    //   \r\n--<boundary>--\r\n
-    //
-    // We accumulate until we find the blank line (\r\n\r\n) that ends
-    // the part headers.  Everything after it is file data.
+    // phase A: skip multipart preamble, find file data start.
+    // accumulate until \r\n\r\n (blank line ending part headers);
+    // everything after is file data.
 
     let mut work = [0u8; WORK_BUF_SIZE];
     let init_len = initial_body.len().min(work.len());
@@ -540,14 +514,14 @@ where
         if let Some(pos) = find_subsequence(&work[..filled], b"\r\n\r\n") {
             let part_headers = &work[..pos];
 
-            // Extract raw filename from Content-Disposition
+            // extract raw filename from Content-Disposition
             let raw_name = extract_filename(part_headers).ok_or("no filename in upload")?;
             let (name_buf, name_len) = sanitize_83(raw_name);
             if name_len == 0 {
                 return Err("invalid filename");
             }
 
-            // Shift remaining file data to the front of work buffer
+            // shift remaining file data to front of work buffer
             let file_start = pos + 4;
             work.copy_within(file_start..filled, 0);
             filled -= file_start;
@@ -574,22 +548,19 @@ where
 
     info!("upload: receiving file '{}'", name_str);
 
-    // Create (or truncate) the file on the SD card.
+    // create (or truncate) file on SD
     storage::create_or_truncate_root(sd, name_str, &[])?;
 
-    // ── Phase B: stream file data to SD ─────────────────────────────
-    //
-    // Strategy: keep the last `end_marker.len()` bytes un-written
-    // ("holdback") so we can detect the boundary even if it spans two
-    // TCP reads.  Everything before the holdback zone is safe to flush
-    // to the SD card.
+    // phase B: stream file data to SD.
+    // keep last end_marker.len() bytes unwritten (holdback) to detect
+    // boundary spanning two TCP reads; everything before is safe to flush.
 
     let mut total_written: u32 = 0;
 
     loop {
-        // Check whether the end marker is present in the current buffer.
+        // check for end marker in current buffer
         if let Some(pos) = find_subsequence(&work[..filled], end_marker) {
-            // Write any remaining file data before the marker.
+            // write remaining file data before the marker
             if pos > 0 {
                 storage::append_root_file(sd, name_str, &work[..pos])?;
                 total_written += pos as u32;
@@ -598,26 +569,25 @@ where
             return Ok((file_name_buf, file_name_len));
         }
 
-        // Flush the safe prefix (everything except the holdback zone).
+        // flush safe prefix (everything except holdback zone)
         if filled > end_marker.len() {
             let safe = filled - end_marker.len();
             storage::append_root_file(sd, name_str, &work[..safe])?;
             total_written += safe as u32;
 
-            // Compact: move holdback to the front
+            // compact: move holdback to front
             work.copy_within(safe..filled, 0);
             filled = end_marker.len();
         }
 
-        // Read more data from the network.
+        // read more data from network
         let n = socket
             .read(&mut work[filled..])
             .await
             .map_err(|_| "read error during upload")?;
         if n == 0 {
-            // Connection closed before we found the end marker.
-            // Write whatever we have (may include partial boundary junk,
-            // but at least the file isn't silently truncated).
+            // connection closed before end marker found;
+            // write what we have (may include partial boundary junk)
             if filled > 0 {
                 let _ = storage::append_root_file(sd, name_str, &work[..filled]);
             }
@@ -627,29 +597,27 @@ where
     }
 }
 
-// ── HTTP helpers ────────────────────────────────────────────────────
+// HTTP helpers
 
-/// Extract the request path from a request line like `GET /path HTTP/1.1`.
+// extract request path from a request line like "GET /path HTTP/1.1"
 fn extract_path(line: &[u8]) -> &[u8] {
-    // Skip method (find first space)
+    // skip method
     let start = match line.iter().position(|&b| b == b' ') {
         Some(p) => p + 1,
         None => return b"/",
     };
-    // Find end of path (next space or end of line)
+    // find end of path
     let rest = &line[start..];
     let end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
-    // Strip query string
+    // strip query string
     let path = &rest[..end];
     let qmark = path.iter().position(|&b| b == b'?').unwrap_or(path.len());
     &path[..qmark]
 }
 
-/// Extract the multipart boundary from the full headers block.
-///
-/// Looks for `Content-Type: multipart/form-data; boundary=<value>`.
+// extract multipart boundary from headers block
 fn find_boundary(headers: &[u8]) -> Option<&[u8]> {
-    // Search case-insensitively for "boundary="
+    // search for "boundary=" case-insensitively
     let marker = b"boundary=";
     let pos = headers
         .windows(marker.len())
@@ -661,7 +629,7 @@ fn find_boundary(headers: &[u8]) -> Option<&[u8]> {
         return None;
     }
 
-    // Handle quoted or unquoted value
+    // handle quoted or unquoted value
     if rest[0] == b'"' {
         let inner = &rest[1..];
         let end = inner.iter().position(|&b| b == b'"')?;
@@ -681,9 +649,7 @@ fn find_boundary(headers: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Extract the raw filename bytes from multipart part headers.
-///
-/// Searches for `filename="<value>"` and returns the value.
+// extract raw filename bytes from multipart part headers
 fn extract_filename(headers: &[u8]) -> Option<&[u8]> {
     let marker = b"filename=\"";
     let pos = headers
@@ -698,18 +664,15 @@ fn extract_filename(headers: &[u8]) -> Option<&[u8]> {
     Some(&rest[..end])
 }
 
-/// Sanitise a raw filename into a valid FAT 8.3 name.
-///
-/// Returns (buffer, length) where `buffer[..length]` is the name
-/// string like `"MYBOOK.EPB"`.
+// sanitise raw filename to valid FAT 8.3; returns (buf, len)
 fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
-    // Strip any path components
+    // strip path components
     let name = match raw.iter().rposition(|&b| b == b'/' || b == b'\\') {
         Some(p) => &raw[p + 1..],
         None => raw,
     };
 
-    // Split into base and extension at the *last* dot
+    // split into base and extension at last dot
     let (base_src, ext_src) = match name.iter().rposition(|&b| b == b'.') {
         Some(dot) => (&name[..dot], &name[dot + 1..]),
         None => (name, &[] as &[u8]),
@@ -718,7 +681,7 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
     let mut out = [0u8; 13];
     let mut pos: usize = 0;
 
-    // Base name: up to 8 valid characters, uppercased
+    // base name: up to 8 chars, uppercased
     for &b in base_src.iter() {
         if pos >= 8 {
             break;
@@ -729,13 +692,13 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
         }
     }
 
-    // Fallback if base is empty after filtering
+    // fallback if base is empty after filtering
     if pos == 0 {
         out[..6].copy_from_slice(b"UPLOAD");
         pos = 6;
     }
 
-    // Extension: up to 3 valid characters, uppercased
+    // extension: up to 3 chars, uppercased
     if !ext_src.is_empty() {
         out[pos] = b'.';
         pos += 1;
@@ -749,7 +712,7 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
                 pos += 1;
             }
         }
-        // If no valid extension chars, remove the dot
+        // remove dot if no valid extension chars
         if pos == ext_start {
             pos -= 1;
         }
@@ -762,7 +725,7 @@ fn is_valid_83_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~' | b'!' | b'#' | b'$' | b'&')
 }
 
-/// Send an HTML error page.
+// send an HTML error page
 async fn send_error_page(socket: &mut TcpSocket<'_>, msg: &str) {
     let _ = socket.write_all(HTTP_500).await;
     let _ = socket.write_all(UPLOAD_ERR_PREFIX).await;
@@ -771,7 +734,7 @@ async fn send_error_page(socket: &mut TcpSocket<'_>, msg: &str) {
     let _ = socket.flush().await;
 }
 
-/// Gracefully close a TCP socket.
+// gracefully close a TCP socket
 async fn close_socket(socket: &mut TcpSocket<'_>) {
     Timer::after(Duration::from_millis(50)).await;
     socket.close();
@@ -779,7 +742,7 @@ async fn close_socket(socket: &mut TcpSocket<'_>) {
     socket.abort();
 }
 
-/// Find the first occurrence of `needle` in `haystack`.
+// find first occurrence of needle in haystack
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
@@ -789,7 +752,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-// ── mDNS responder ─────────────────────────────────────────────────
+// mDNS responder
 
 async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
@@ -878,7 +841,7 @@ fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
     MDNS_RESPONSE_LEN
 }
 
-// ── Input helpers ───────────────────────────────────────────────────
+// input helpers
 
 async fn drain_until_back() {
     let mapper = ButtonMapper::new();
@@ -894,7 +857,7 @@ async fn drain_until_back() {
     }
 }
 
-// ── Display helpers ─────────────────────────────────────────────────
+// display helpers
 
 async fn render_screen(
     epd: &mut Epd,
@@ -904,6 +867,7 @@ async fn render_screen(
     body: &'static BitmapFont,
     lines: &[&str],
     footer: Option<&str>,
+    bumps: &ButtonFeedback,
 ) {
     let heading_h = heading.line_height;
     let body_h = body.line_height;
@@ -947,11 +911,13 @@ async fn render_screen(
                 .draw(s)
                 .unwrap();
         }
+
+        bumps.draw(s);
     })
     .await;
 }
 
-// ── Stack-based fmt helper ──────────────────────────────────────────
+// stack-based fmt helper
 
 fn stack_fmt(buf: &mut [u8], f: impl FnOnce(&mut StackWriter<'_>)) -> usize {
     let mut w = StackWriter { buf, pos: 0 };

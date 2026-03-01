@@ -1,4 +1,4 @@
-// Pre-rasterised 1-bit bitmap font types
+// Pre-rasterised 1-bit bitmap font types.
 // Data in flash via &'static refs from build.rs. Packed MSB-first, row-major.
 
 use embedded_graphics_core::pixelcolor::BinaryColor;
@@ -43,13 +43,13 @@ impl BitmapFont {
         self.glyph(ch).advance
     }
 
-    // Sum of advance widths for every character in `text`.
+    // sum of advance widths for every character in text
     #[inline]
     pub fn measure_str(&self, text: &str) -> u16 {
         text.chars().map(|c| self.advance(c) as u16).sum()
     }
 
-    // Sum of advance widths for every byte; out-of-range bytes count as '?'.
+    // sum of advance widths for every byte; out-of-range bytes count as '?'
     #[inline]
     pub fn measure_bytes(&self, text: &[u8]) -> u16 {
         text.iter()
@@ -64,13 +64,13 @@ impl BitmapFont {
             .sum()
     }
 
-    // Draw a single glyph in BinaryColor::On (black); returns advance width.
+    // draw a single glyph in BinaryColor::On (black); return advance width
     #[inline]
     pub fn draw_char(&self, strip: &mut StripBuffer, ch: char, cx: i32, baseline: i32) -> u8 {
         self.draw_char_fg(strip, ch, BinaryColor::On, cx, baseline)
     }
 
-    // Draw a single glyph in the given foreground colour; returns advance width.
+    // draw a single glyph in the given foreground colour; return advance width
     #[inline]
     pub fn draw_char_fg(
         &self,
@@ -87,12 +87,12 @@ impl BitmapFont {
         g.advance
     }
 
-    // Draw `text` in BinaryColor::On; returns x after the last glyph.
+    // draw text in BinaryColor::On; return x after the last glyph
     pub fn draw_str(&self, strip: &mut StripBuffer, text: &str, cx: i32, baseline: i32) -> i32 {
         self.draw_str_fg(strip, text, BinaryColor::On, cx, baseline)
     }
 
-    // Draw `text` in the given foreground colour; returns x after the last glyph.
+    // draw text in the given foreground colour; return x after the last glyph
     pub fn draw_str_fg(
         &self,
         strip: &mut StripBuffer,

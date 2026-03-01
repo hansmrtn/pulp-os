@@ -1,12 +1,11 @@
-// Minimal CSS parser for EPUB stylesheets
-//
+// Minimal CSS parser for EPUB stylesheets.
 // Selectors: tag, .class, tag.class, grouped. Combinators reduced to
 // rightmost simple selector. @-rules and pseudo-classes skipped.
-// Rule table stack-allocated: MAX_CSS_RULES × ~16B = 2KB.
+// Rule table stack-allocated: MAX_CSS_RULES x ~16B = 2KB.
 
 pub const MAX_CSS_RULES: usize = 128;
 
-// ── Property flag bits (which fields in StyleProps are explicitly set) ─
+// property flag bits (which fields in StyleProps are explicitly set)
 
 pub const PROP_FONT_WEIGHT: u16 = 1 << 0;
 pub const PROP_FONT_STYLE: u16 = 1 << 1;
@@ -19,7 +18,7 @@ pub const PROP_MARGIN_BOTTOM: u16 = 1 << 7;
 pub const PROP_DISPLAY: u16 = 1 << 8;
 pub const PROP_TEXT_DECORATION: u16 = 1 << 9;
 
-// ── Property value constants ──────────────────────────────────────────
+// property value constants
 
 // font-weight
 pub const FW_NORMAL: u8 = 0;
@@ -46,11 +45,8 @@ pub const TD_NONE: u8 = 0;
 pub const TD_UNDERLINE: u8 = 1;
 pub const TD_LINE_THROUGH: u8 = 2;
 
-// ── StyleProps ────────────────────────────────────────────────────────
-//
-// Values for resolved CSS properties.  `set` tracks which properties
-// were explicitly specified; unset properties default to 0 / inherit.
-// Lengths are in quarter-em units (i8): 1em = 4, 0.5em = 2, 2em = 8.
+// resolved CSS properties; `set` tracks which are explicitly specified.
+// Lengths in quarter-em units (i8): 1em = 4, 0.5em = 2, 2em = 8.
 
 #[derive(Clone, Copy)]
 pub struct StyleProps {
@@ -121,7 +117,7 @@ impl StyleProps {
     }
 }
 
-// ── Selector ──────────────────────────────────────────────────────────
+// selector
 
 #[derive(Clone, Copy)]
 struct Selector {
@@ -144,7 +140,7 @@ impl Selector {
     }
 }
 
-// ── CssRule + CssRules ────────────────────────────────────────────────
+// CssRule + CssRules
 
 #[derive(Clone, Copy)]
 struct CssRule {
@@ -159,7 +155,7 @@ impl CssRule {
     };
 }
 
-// parsed CSS rule table, stack-allocated (~2 KB)
+// parsed CSS rule table, stack-allocated (~2KB)
 pub struct CssRules {
     rules: [CssRule; MAX_CSS_RULES],
     count: usize,
@@ -193,7 +189,7 @@ impl CssRules {
         self.count == 0
     }
 
-    // parse stylesheet; call multiple times to accumulate rules
+    // parse stylesheet; may be called multiple times to accumulate rules
     pub fn parse(&mut self, css: &[u8]) {
         let mut pos: usize = 0;
 
@@ -203,13 +199,13 @@ impl CssRules {
                 break;
             }
 
-            // Skip @-rules (may contain nested blocks)
+            // skip @-rules (may contain nested blocks)
             if css[pos] == b'@' {
                 pos = skip_at_rule(css, pos);
                 continue;
             }
 
-            // Selector(s) run until '{'
+            // selector(s) run until '{'
             let sel_start = pos;
             let Some(brace) = scan_to_byte(css, pos, b'{') else {
                 break;
@@ -217,20 +213,20 @@ impl CssRules {
             let sel_text = &css[sel_start..brace];
             pos = brace + 1;
 
-            // Declarations run until '}'
+            // declarations run until '}'
             let Some(end) = scan_to_byte(css, pos, b'}') else {
                 break;
             };
             let decl_text = &css[pos..end];
             pos = end + 1;
 
-            // Parse the declaration block
+            // parse the declaration block
             let props = parse_declarations(decl_text);
             if props.set == 0 {
                 continue; // no usable properties
             }
 
-            // Split grouped selectors on ',' and add a rule for each
+            // split grouped selectors on ',' and add a rule for each
             for sel_part in sel_text.split(|&b| b == b',') {
                 let sel = parse_selector(sel_part);
                 if sel.specificity == 0 && sel.tag == 0 && sel.class_hash == 0 {
@@ -280,7 +276,7 @@ impl CssRules {
     }
 }
 
-// ── CSS parser internals ──────────────────────────────────────────────
+// CSS parser internals
 
 // parse a single (possibly compound) selector
 fn parse_selector(raw: &[u8]) -> Selector {
@@ -289,8 +285,7 @@ fn parse_selector(raw: &[u8]) -> Selector {
         return Selector::EMPTY;
     }
 
-    // Take only the rightmost simple selector (ignore descendant/child combinators).
-    // Split on space/>/+/~ and take the last non-empty part.
+    // take only the rightmost simple selector (ignore descendant/child combinators)
     let mut last_start = 0;
     let mut i = 0;
     while i < raw.len() {
@@ -315,17 +310,17 @@ fn parse_selector(raw: &[u8]) -> Selector {
         return Selector::EMPTY;
     }
 
-    // Strip pseudo-classes/elements (:hover, ::before, etc.)
+    // strip pseudo-classes/elements (:hover, ::before, etc.)
     let sel = if let Some(p) = sel.iter().position(|&b| b == b':') {
         &sel[..p]
     } else {
         sel
     };
 
-    // Strip #id (take everything before '#')
+    // strip #id (take everything before '#')
     let sel = if let Some(p) = sel.iter().position(|&b| b == b'#') {
         if p == 0 {
-            // Bare #id selector — can't match by tag/class, skip
+            // bare #id selector; can't match by tag/class, skip
             return Selector::EMPTY;
         }
         &sel[..p]
@@ -333,7 +328,7 @@ fn parse_selector(raw: &[u8]) -> Selector {
         sel
     };
 
-    // Split tag.class
+    // split tag.class
     let (tag_part, class_part) = if let Some(dot) = sel.iter().position(|&b| b == b'.') {
         (&sel[..dot], &sel[dot + 1..])
     } else {
@@ -369,14 +364,14 @@ fn parse_selector(raw: &[u8]) -> Selector {
 fn parse_declarations(block: &[u8]) -> StyleProps {
     let mut props = StyleProps::EMPTY;
 
-    // Split on ';', handle each property:value pair
+    // split on ';', handle each property:value pair
     for decl in block.split(|&b| b == b';') {
         let decl = trim_css(decl);
         if decl.is_empty() {
             continue;
         }
 
-        // Split on first ':'
+        // split on first ':'
         let Some(colon) = decl.iter().position(|&b| b == b':') else {
             continue;
         };
@@ -470,21 +465,21 @@ fn parse_property(name: &[u8], value: &[u8], props: &mut StyleProps) {
             props.set |= PROP_TEXT_DECORATION;
         }
 
-        // Shorthand: margin: v1 [v2 [v3 [v4]]]
+        // shorthand: margin: v1 [v2 [v3 [v4]]]
         b"margin" | b"padding" => {
             parse_margin_shorthand(value, props);
         }
 
-        _ => {} // Unknown property — ignore
+        _ => {} // unknown property; ignore
     }
 }
 
-// parse margin shorthand (1–4 values)
+// parse margin shorthand (1-4 values)
 fn parse_margin_shorthand(value: &[u8], props: &mut StyleProps) {
     let mut vals = [0i8; 4];
     let mut count = 0usize;
 
-    // Split value on whitespace, parse each part
+    // split value on whitespace, parse each part
     let mut pos = 0;
     let value = trim_css(value);
 
@@ -542,10 +537,8 @@ fn parse_margin_shorthand(value: &[u8], props: &mut StyleProps) {
     }
 }
 
-// ── Tag ID mapping ────────────────────────────────────────────────────
-//
-// Maps lowercase tag name bytes to a compact u8 for selector matching.
-// 0 = unknown / any.  Known tags get stable IDs.
+// tag ID mapping: lowercase tag name -> compact u8 for selector matching.
+// 0 = unknown/any; known tags get stable IDs.
 
 pub fn tag_id(name: &[u8]) -> u8 {
     match name {
@@ -594,10 +587,8 @@ pub fn tag_id(name: &[u8]) -> u8 {
     }
 }
 
-// ── Class hash ────────────────────────────────────────────────────────
-//
-// FNV-1a folded to 16 bits.  0 is reserved for "no class constraint",
-// so a hash that computes to 0 is mapped to 1.
+// class hash: FNV-1a folded to 16 bits.
+// 0 reserved for "no class constraint"; hash of 0 is mapped to 1.
 
 pub fn class_hash(name: &[u8]) -> u16 {
     let mut h: u32 = 0x811c_9dc5;
@@ -609,7 +600,7 @@ pub fn class_hash(name: &[u8]) -> u16 {
     if h16 == 0 { 1 } else { h16 }
 }
 
-// ── CSS length parsing ────────────────────────────────────────────────
+// CSS length parsing
 
 // parse CSS length to quarter-em units; handles em/rem/px/pt/0
 fn parse_length_qem(val: &[u8]) -> i8 {
@@ -624,7 +615,7 @@ fn parse_length_qem(val: &[u8]) -> i8 {
         (false, val)
     };
 
-    // Parse integer + fractional parts
+    // parse integer + fractional parts
     let mut whole: i32 = 0;
     let mut frac: i32 = 0; // hundredths
     let mut i = 0;
@@ -650,20 +641,20 @@ fn parse_length_qem(val: &[u8]) -> i8 {
         i += 1;
     }
 
-    // Normalise fractional part to hundredths
+    // normalise fractional part to hundredths
     if frac_digits == 1 {
         frac *= 10;
     }
 
     let unit = trim_css(&rest[i..]);
 
-    // Convert to quarter-em (4 qem = 1em)
+    // convert to quarter-em (4 qem = 1em)
     let qem = if unit.starts_with(b"px") || unit.starts_with(b"pt") {
-        // 16px ≈ 1em → 4px ≈ 1 qem
+        // 16px ~= 1em -> 4px ~= 1 qem
         let total_px_100 = whole * 100 + frac;
         (total_px_100 + 200) / 400
     } else {
-        // em, rem, or unknown → treat as em
+        // em, rem, or unknown: treat as em
         whole * 4 + (frac * 4 + 50) / 100
     };
 
@@ -671,7 +662,7 @@ fn parse_length_qem(val: &[u8]) -> i8 {
     signed.clamp(-126, 126) as i8
 }
 
-// ── Scanning helpers ──────────────────────────────────────────────────
+// scanning helpers
 
 fn trim_css(data: &[u8]) -> &[u8] {
     let start = data
@@ -717,7 +708,7 @@ fn skip_at_rule(css: &[u8], pos: usize) -> usize {
     let mut p = pos + 1; // skip '@'
     while p < css.len() {
         if css[p] == b'{' {
-            // Block @-rule — count braces
+            // block @-rule; count braces
             let mut depth = 1u32;
             p += 1;
             while p < css.len() && depth > 0 {
@@ -731,7 +722,7 @@ fn skip_at_rule(css: &[u8], pos: usize) -> usize {
             return p;
         }
         if css[p] == b';' {
-            // Statement @-rule (@import, @charset)
+            // statement @-rule (@import, @charset)
             return p + 1;
         }
         p += 1;

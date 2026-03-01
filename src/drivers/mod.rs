@@ -1,7 +1,5 @@
-// Hardware drivers — chip-level and protocol-level, board-independent.
-//
-// Each module is reusable across boards; only pin assignments and bus
-// wiring (in board/) are board-specific.
+// Hardware drivers: chip-level and protocol-level, board-independent.
+// Each module is reusable across boards; pin assignments and bus wiring in board/.
 
 pub mod battery;
 pub mod input;

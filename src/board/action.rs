@@ -1,5 +1,4 @@
-// Semantic actions decoupled from physical buttons
-//
+// Semantic actions decoupled from physical buttons.
 // Apps match on Action, never on HwButton. ButtonMapper translates
 // physical events using the fixed portrait one-handed layout.
 
