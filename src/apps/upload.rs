@@ -107,19 +107,16 @@ pub async fn run_upload_mode<SPI>(
     let heading = fonts::heading_font(ui_font_size_idx);
     let body = fonts::chrome_font(ui_font_size_idx);
 
-    // phase 1: initialise radio & WiFi
+    // screen 1: connecting
 
-    render_screen(
-        epd,
-        strip,
-        delay,
-        heading,
-        body,
-        &["Initialising radio..."],
-        None,
-        bumps,
-    )
-    .await;
+    {
+        let mut msg_buf = [0u8; 64];
+        let msg_len = stack_fmt(&mut msg_buf, |w| {
+            let _ = write!(w, "Connecting to '{}'...", SSID);
+        });
+        let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
+        render_screen(epd, strip, delay, heading, body, &[msg], None, bumps).await;
+    }
 
     let radio = match esp_radio::init() {
         Ok(r) => r,
@@ -201,17 +198,6 @@ pub async fn run_upload_mode<SPI>(
 
     info!("upload: wifi started, connecting to '{}'", SSID);
 
-    // phase 2: connect to AP
-
-    {
-        let mut msg_buf = [0u8; 64];
-        let msg_len = stack_fmt(&mut msg_buf, |w| {
-            let _ = write!(w, "Connecting to '{}'...", SSID);
-        });
-        let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
-        render_screen(epd, strip, delay, heading, body, &[msg], None, bumps).await;
-    }
-
     if let Err(e) = wifi_ctrl.connect_async().await {
         info!("upload: connect failed: {:?}", e);
         render_screen(
@@ -230,20 +216,6 @@ pub async fn run_upload_mode<SPI>(
     }
 
     info!("upload: connected to '{}'", SSID);
-
-    // phase 3: DHCP
-
-    render_screen(
-        epd,
-        strip,
-        delay,
-        heading,
-        body,
-        &["Connected!", "Obtaining IP address..."],
-        None,
-        bumps,
-    )
-    .await;
 
     let net_config = embassy_net::Config::dhcpv4(Default::default());
     let seed = {
@@ -888,8 +860,8 @@ async fn render_screen(
     let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
 
     epd.full_refresh_async(strip, delay, &|s: &mut StripBuffer| {
-        BitmapLabel::new(heading_region, "Upload Mode", heading)
-            .alignment(Alignment::Center)
+        BitmapLabel::new(heading_region, "Upload", heading)
+            .alignment(Alignment::CenterLeft)
             .draw(s)
             .unwrap();
 
