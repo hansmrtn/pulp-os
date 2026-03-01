@@ -4,10 +4,11 @@
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeManager};
 use log::info;
 
+// No RTC on board; all file timestamps are set to 2025-01-01 00:00:00.
 #[derive(Default, Clone, Copy)]
-pub struct DummyTimeSource;
+pub struct FixedTimestamp;
 
-impl TimeSource for DummyTimeSource {
+impl TimeSource for FixedTimestamp {
     fn get_timestamp(&self) -> Timestamp {
         Timestamp {
             year_since_1970: 55,
@@ -24,7 +25,7 @@ pub struct SdStorage<SPI>
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    pub volume_mgr: VolumeManager<SdCard<SPI, esp_hal::delay::Delay>, DummyTimeSource>,
+    pub volume_mgr: VolumeManager<SdCard<SPI, esp_hal::delay::Delay>, FixedTimestamp>,
 }
 
 impl<SPI> SdStorage<SPI>
@@ -39,7 +40,7 @@ where
             Err(e) => info!("SD card probe failed: {:?}", e),
         }
 
-        let volume_mgr = VolumeManager::new(sdcard, DummyTimeSource);
+        let volume_mgr = VolumeManager::new(sdcard, FixedTimestamp);
         Self { volume_mgr }
     }
 }

@@ -4,6 +4,7 @@ use core::fmt::Write as _;
 
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
@@ -475,7 +476,12 @@ impl App for SettingsApp {
     fn on_enter(&mut self, ctx: &mut AppContext) {
         self.selected = 0;
         self.save_needed = false;
-        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
+        ctx.mark_dirty(Region::new(
+            0,
+            CONTENT_TOP,
+            SCREEN_W,
+            SCREEN_H - CONTENT_TOP,
+        ));
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {

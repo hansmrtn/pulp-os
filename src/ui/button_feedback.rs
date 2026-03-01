@@ -7,6 +7,7 @@ use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::Primiti
 use super::widget::{Alignment, Region};
 use crate::board::action::{Action, ButtonMapper};
 use crate::board::button::Button;
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
@@ -19,9 +20,6 @@ pub const BUTTON_BAR_H: u16 = TAB_H + BOTTOM_INSET;
 
 const RIDGE_W: u16 = 22;
 const RIDGE_H: u16 = 36;
-
-const SCREEN_W: u16 = 480;
-const SCREEN_H: u16 = 800;
 
 // center positions of each button on the screen edge (px)
 const CX_BACK: u16 = 84;

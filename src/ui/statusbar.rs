@@ -12,6 +12,8 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::ascii::FONT_6X13;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
+
+use crate::board::SCREEN_W;
 #[cfg(debug_assertions)]
 use embedded_graphics::primitives::PrimitiveStyle;
 #[cfg(debug_assertions)]
@@ -28,7 +30,7 @@ pub const BAR_HEIGHT: u16 = 4;
 
 pub const CONTENT_TOP: u16 = BAR_HEIGHT;
 
-pub const BAR_REGION: Region = Region::new(0, 0, 480, BAR_HEIGHT);
+pub const BAR_REGION: Region = Region::new(0, 0, SCREEN_W, BAR_HEIGHT);
 
 pub struct SystemStatus {
     pub uptime_secs: u32,

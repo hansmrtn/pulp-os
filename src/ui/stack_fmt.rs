@@ -7,6 +7,12 @@ pub struct StackFmt<const N: usize> {
     len: usize,
 }
 
+impl<const N: usize> Default for StackFmt<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> StackFmt<N> {
     pub const fn new() -> Self {
         Self {
@@ -18,6 +24,11 @@ impl<const N: usize> StackFmt<N> {
     #[inline]
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     #[inline]
@@ -55,6 +66,11 @@ impl<'a> BorrowedFmt<'a> {
     #[inline]
     pub fn len(&self) -> usize {
         self.pos
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pos == 0
     }
 }
 

@@ -42,7 +42,7 @@ use pulp_os::ui::{
     BAR_HEIGHT, ButtonFeedback, QuickMenu, StatusBar, SystemStatus, free_stack_bytes, paint_stack,
     stack_high_water_mark,
 };
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -73,6 +73,7 @@ impl Apps {
     }
 }
 
+// Static dispatch to the active app by AppId.
 macro_rules! with_app {
     ($id:expr, $apps:expr, |$app:ident| $body:expr) => {
         match $id {
@@ -99,6 +100,7 @@ macro_rules! with_app {
     };
 }
 
+// Execute a nav-stack transition: lifecycle callbacks, font propagation.
 macro_rules! apply_transition {
     ($nav:expr, $launcher:expr, $apps:expr, $bm_cache:expr,
      $quick_menu:expr, $bumps:expr) => {{
@@ -237,7 +239,8 @@ macro_rules! enter_sleep {
     }};
 }
 
-// draw all layers for a strip: optional statusbar, active app, quick-menu overlay, button labels.
+// Build the per-strip draw closure: statusbar, active app, quick-menu overlay, button labels.
+// Macro because it captures borrows of different concrete app types (via with_app!).
 macro_rules! draw_scene {
     ($app:expr, $statusbar:expr, $quick_menu:expr, $bumps:expr, $draw_bar:expr) => {
         |s: &mut StripBuffer| {
@@ -253,23 +256,9 @@ macro_rules! draw_scene {
     };
 }
 
-// heavy statics kept out of async future so Embassy's state machine stays ~200B.
-// const-fn types -> ConstStaticCell (zero stack, placed in .bss).
-// runtime-init types -> StaticCell.
-
-// value in .bss at link time; as_static_mut() called once
-struct ConstStaticCell<T>(core::cell::UnsafeCell<T>);
-unsafe impl<T> Sync for ConstStaticCell<T> {}
-impl<T> ConstStaticCell<T> {
-    const fn new(val: T) -> Self {
-        Self(core::cell::UnsafeCell::new(val))
-    }
-    // safety: called once per static before task spawn; single-core, single-thread
-    #[allow(clippy::mut_from_ref)]
-    fn as_static_mut(&self) -> &'static mut T {
-        unsafe { &mut *self.0.get() }
-    }
-}
+// Heavy statics kept out of the async future so Embassy's state machine stays ~200 B.
+// const-fn types  → ConstStaticCell  (value in .bss at link time; .take() panics on double-use).
+// runtime-init types → StaticCell     (.init(val) panics on double-use).
 
 static STRIP: ConstStaticCell<StripBuffer> = ConstStaticCell::new(StripBuffer::new());
 static STATUSBAR: ConstStaticCell<StatusBar> = ConstStaticCell::new(StatusBar::new());
@@ -311,9 +300,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     board.display.epd.init(&mut delay);
     info!("hardware initialized.");
 
-    let strip = STRIP.as_static_mut();
+    let strip = STRIP.take();
 
-    let statusbar = STATUSBAR.as_static_mut();
+    let statusbar = STATUSBAR.take();
     let mut sd_ok = board
         .storage
         .sd
@@ -333,16 +322,16 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut apps = Apps {
         home: HOME.init(HomeApp::new()),
         files: FILES.init(FilesApp::new()),
-        reader: READER.as_static_mut(),
+        reader: READER.take(),
         settings: SETTINGS.init(SettingsApp::new()),
     };
 
-    let launcher = LAUNCHER.as_static_mut();
-    let quick_menu = QUICK_MENU.as_static_mut();
-    let bumps = BUMPS.as_static_mut();
+    let launcher = LAUNCHER.take();
+    let quick_menu = QUICK_MENU.take();
+    let bumps = BUMPS.take();
 
-    let dir_cache = DIR_CACHE.as_static_mut();
-    let bm_cache = BM_CACHE.as_static_mut();
+    let dir_cache = DIR_CACHE.take();
+    let bm_cache = BM_CACHE.take();
 
     bm_cache.ensure_loaded(&board.storage.sd);
 

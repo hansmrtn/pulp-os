@@ -91,7 +91,6 @@ SOURCE LAYOUT
         mod.rs              SPI/DMA init, peripheral wiring
         action.rs           semantic actions, button-to-action mapper
         button.rs           button enum, ADC ladder decode
-        pins.rs             GPIO pin map (reference)
         raw_gpio.rs         register-level GPIO for unmapped pins
       drivers/
         ssd1677.rs          e-paper controller driver

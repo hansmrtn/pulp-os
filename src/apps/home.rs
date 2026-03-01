@@ -12,6 +12,7 @@ use crate::apps::bookmarks::{self, BmListEntry};
 use crate::apps::reader::RECENT_FILE;
 use crate::apps::{App, AppContext, AppId, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
@@ -22,15 +23,14 @@ const ITEM_W: u16 = 280;
 const ITEM_H: u16 = 52;
 const ITEM_GAP: u16 = 14;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
-const ITEM_X: u16 = (480 - ITEM_W) / 2;
+const ITEM_X: u16 = (SCREEN_W - ITEM_W) / 2;
 const TITLE_ITEM_GAP: u16 = 24;
 const MAX_ITEMS: usize = 5;
 
 // bookmark list layout
 const BM_MARGIN: u16 = 8;
 const BM_HEADER_GAP: u16 = 4;
-const BM_BOTTOM: u16 = 800 - BUTTON_BAR_H;
-const SCREEN_W: u16 = 480;
+const BM_BOTTOM: u16 = SCREEN_H - BUTTON_BAR_H;
 
 fn compute_item_regions(heading_line_h: u16) -> [Region; MAX_ITEMS] {
     let item_y = CONTENT_TOP + 8 + heading_line_h + TITLE_ITEM_GAP;
@@ -210,14 +210,24 @@ impl App for HomeApp {
         ctx.clear_message();
         self.state = HomeState::Menu;
         self.selected = 0;
-        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
+        ctx.mark_dirty(Region::new(
+            0,
+            CONTENT_TOP,
+            SCREEN_W,
+            SCREEN_H - CONTENT_TOP,
+        ));
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
         self.state = HomeState::Menu;
         self.selected = 0;
         self.needs_load_recent = true;
-        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
+        ctx.mark_dirty(Region::new(
+            0,
+            CONTENT_TOP,
+            SCREEN_W,
+            SCREEN_H - CONTENT_TOP,
+        ));
     }
 
     fn needs_work(&self) -> bool {

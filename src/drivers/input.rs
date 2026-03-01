@@ -22,7 +22,6 @@ pub enum Event {
     Repeat(Button),
 }
 
-// max 2: one debounce cycle pushes at most Release(old) + Press(new)
 struct EventQueue {
     buf: [Option<Event>; 2],
 }

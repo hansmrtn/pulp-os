@@ -7,6 +7,7 @@ use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::Primiti
 
 use super::stack_fmt::StackFmt;
 use super::widget::{Alignment, Region, wrap_next, wrap_prev};
+use crate::board::SCREEN_W;
 use crate::board::action::Action;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
@@ -15,7 +16,7 @@ use crate::fonts::font_data;
 // layout constants
 
 const OVERLAY_W: u16 = 400;
-const OVERLAY_X: u16 = (480 - OVERLAY_W) / 2;
+const OVERLAY_X: u16 = (SCREEN_W - OVERLAY_W) / 2;
 const OVERLAY_BOTTOM: u16 = 760; // above button widgets (~14px clearance)
 const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;

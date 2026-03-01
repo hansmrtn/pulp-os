@@ -1,5 +1,4 @@
 // SD card file operations and directory cache.
-// with_dir! opens volume/root/subdirs; do_*! macros handle file ops.
 // DirCache reads root entries once into RAM, serves pages from there.
 
 use embedded_sdmmc::{Mode, VolumeIdx};
@@ -60,7 +59,6 @@ pub struct DirPage {
 
 const MAX_DIR_ENTRIES: usize = 128;
 
-// with_dir!: open volume -> root, optionally descend 1 or 2 subdirs
 macro_rules! with_dir {
     // root only
     ($sd:expr, |$dir:ident| $body:expr) => {{
@@ -93,8 +91,6 @@ macro_rules! with_dir {
         $body
     }};
 }
-
-// inner-op macros; always invoked inside with_dir!
 
 macro_rules! read_loop {
     ($file:expr, $buf:expr) => {{

@@ -4,6 +4,7 @@
 
 pub mod bitmap;
 
+#[allow(clippy::all)]
 pub mod font_data {
     include!(concat!(env!("OUT_DIR"), "/font_data.rs"));
 }

@@ -10,6 +10,9 @@ pub use crate::drivers::ssd1677::{DisplayDriver, HEIGHT, SPI_FREQ_MHZ, WIDTH};
 pub use crate::drivers::strip::StripBuffer;
 pub use button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
 
+pub const SCREEN_W: u16 = HEIGHT; // 480
+pub const SCREEN_H: u16 = WIDTH; // 800
+
 use core::cell::RefCell;
 
 use critical_section::Mutex;
@@ -91,6 +94,9 @@ impl Board {
         }
     }
 
+    // Takes &Peripherals so init_spi_peripherals can consume them by value.
+    // Safety: each clone_unchecked targets a distinct GPIO/ADC peripheral;
+    // no pin is used by both init_input and init_spi_peripherals.
     fn init_input(p: &Peripherals) -> InputHw {
         let mut adc_cfg = AdcConfig::new();
 

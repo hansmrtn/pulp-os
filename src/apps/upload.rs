@@ -19,8 +19,8 @@ use esp_radio::wifi::{ClientConfig, Config, ModeConfig};
 use log::info;
 
 use crate::apps::settings::WifiConfig;
-use crate::board::Epd;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
+use crate::board::{Epd, SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
 use crate::drivers::strip::StripBuffer;
@@ -30,9 +30,6 @@ use crate::kernel::tasks;
 use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region, stack_fmt};
 
 // layout
-
-const SCREEN_W: u16 = 480;
-const SCREEN_H: u16 = 800;
 
 const HEADING_X: u16 = 16;
 const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;

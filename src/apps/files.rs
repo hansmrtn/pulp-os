@@ -10,6 +10,7 @@ use embedded_graphics::primitives::PrimitiveStyle;
 
 use crate::apps::{App, AppContext, AppId, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::storage::DirEntry;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
@@ -179,7 +180,12 @@ impl App for FilesApp {
         self.needs_load = true;
         self.stale_cache = true;
         self.error = None;
-        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
+        ctx.mark_dirty(Region::new(
+            0,
+            CONTENT_TOP,
+            SCREEN_W,
+            SCREEN_H - CONTENT_TOP,
+        ));
     }
 
     fn on_exit(&mut self) {
@@ -189,7 +195,12 @@ impl App for FilesApp {
     fn on_suspend(&mut self) {}
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
-        ctx.mark_dirty(Region::new(0, CONTENT_TOP, 480, 800 - CONTENT_TOP));
+        ctx.mark_dirty(Region::new(
+            0,
+            CONTENT_TOP,
+            SCREEN_W,
+            SCREEN_H - CONTENT_TOP,
+        ));
     }
 
     fn needs_work(&self) -> bool {

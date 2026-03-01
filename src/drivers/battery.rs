@@ -44,6 +44,9 @@ pub fn battery_percentage(battery_mv: u16) -> u8 {
         let (mv_lo, pct_lo) = DISCHARGE_CURVE[i + 1];
         if mv >= mv_lo {
             let span_mv = mv_hi - mv_lo;
+            if span_mv == 0 {
+                return pct_hi;
+            }
             let span_pct = (pct_hi - pct_lo) as u32;
             let frac = mv - mv_lo;
             return (pct_lo as u32 + frac * span_pct / span_mv) as u8;

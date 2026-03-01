@@ -21,6 +21,7 @@ use embedded_graphics::text::Text;
 use crate::apps::bookmarks;
 use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::ui::quick_menu::QuickAction;
@@ -47,12 +48,12 @@ const MAX_PAGES: usize = 1024;
 const HEADER_REGION: Region = Region::new(MARGIN, HEADER_Y, 300, HEADER_H);
 const STATUS_REGION: Region = Region::new(308, HEADER_Y, 164, HEADER_H);
 
-const PAGE_REGION: Region = Region::new(0, HEADER_Y, 480, 800 - HEADER_Y);
+const PAGE_REGION: Region = Region::new(0, HEADER_Y, SCREEN_W, SCREEN_H - HEADER_Y);
 
 const NO_PREFETCH: usize = usize::MAX;
 
-const TEXT_W: u32 = (480 - 2 * MARGIN) as u32;
-const TEXT_AREA_H: u16 = 800 - TEXT_Y - BUTTON_BAR_H;
+const TEXT_W: u32 = (SCREEN_W - 2 * MARGIN) as u32;
+const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - BUTTON_BAR_H;
 const EOCD_TAIL: usize = 512;
 const INDENT_PX: u32 = 24; // px per blockquote indent level
 
@@ -64,15 +65,15 @@ const IMAGE_DISPLAY_H: u16 = 200;
 const CHAPTER_CACHE_MAX: usize = 98304;
 
 const PROGRESS_H: u16 = 2;
-const PROGRESS_Y: u16 = 800 - PROGRESS_H - 1;
-const PROGRESS_W: u16 = 480 - 2 * MARGIN;
+const PROGRESS_Y: u16 = SCREEN_H - PROGRESS_H - 1;
+const PROGRESS_W: u16 = SCREEN_W - 2 * MARGIN;
 
 // position overlay: centered banner shown while Next/Prev is held
 const POSITION_OVERLAY_W: u16 = 280;
 const POSITION_OVERLAY_H: u16 = 40;
 const POSITION_OVERLAY: Region = Region::new(
-    (480 - POSITION_OVERLAY_W) / 2,
-    (800 - POSITION_OVERLAY_H) / 2,
+    (SCREEN_W - POSITION_OVERLAY_W) / 2,
+    (SCREEN_H - POSITION_OVERLAY_H) / 2,
     POSITION_OVERLAY_W,
     POSITION_OVERLAY_H,
 );
@@ -80,13 +81,12 @@ const POSITION_OVERLAY: Region = Region::new(
 const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, 464, 20);
 
 const QA_FONT_SIZE: u8 = 1;
-const QA_SAVE_BOOKMARK: u8 = 2;
 const QA_PREV_CHAPTER: u8 = 3;
 const QA_NEXT_CHAPTER: u8 = 4;
 const QA_TOC: u8 = 5;
 
 const QA_FONT_OPTIONS: &[&str] = &["Small", "Medium", "Large"];
-const QA_MAX: usize = 5;
+const QA_MAX: usize = 4;
 
 pub const RECENT_FILE: &str = "RECENT";
 
@@ -322,9 +322,6 @@ impl ReaderApp {
             self.book_font_size_idx,
             QA_FONT_OPTIONS,
         );
-        n += 1;
-
-        self.qa_buf[n] = QuickAction::trigger(QA_SAVE_BOOKMARK, "Bookmark", "Save pos");
         n += 1;
 
         // chapter nav only for multi-chapter EPUBs
@@ -2033,9 +2030,6 @@ impl App for ReaderApp {
 
     fn on_quick_trigger(&mut self, id: u8, ctx: &mut AppContext) {
         match id {
-            QA_SAVE_BOOKMARK => {
-                log::info!("reader: bookmark save requested via quick menu");
-            }
             QA_PREV_CHAPTER => {
                 if self.is_epub && self.chapter > 0 {
                     self.chapter -= 1;
@@ -2206,10 +2200,13 @@ impl App for ReaderApp {
                     let selected = idx == self.toc_selected;
 
                     if selected {
-                        Rectangle::new(Point::new(0, y_top), Size::new(480, line_h as u32))
-                            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                            .draw(strip)
-                            .unwrap();
+                        Rectangle::new(
+                            Point::new(0, y_top),
+                            Size::new(SCREEN_W as u32, line_h as u32),
+                        )
+                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                        .draw(strip)
+                        .unwrap();
                     }
 
                     let fg = if selected {

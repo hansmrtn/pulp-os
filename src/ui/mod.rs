@@ -18,3 +18,5 @@ pub use statusbar::{
     stack_high_water_mark,
 };
 pub use widget::{Alignment, Region, wrap_next, wrap_prev};
+
+pub use crate::board::{SCREEN_H, SCREEN_W};
