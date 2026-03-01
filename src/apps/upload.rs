@@ -27,12 +27,29 @@ use log::info;
 use crate::board::Epd;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::drivers::strip::StripBuffer;
+use crate::fonts;
+use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::tasks;
+use crate::ui::{Alignment, BitmapLabel, CONTENT_TOP, Region};
 
 // ── WiFi credentials (edit these!) ──────────────────────────────────
 
 const SSID: &str = "all_ducks_quack";
 const PASSWORD: &str = "pissword";
+
+// ── Layout ──────────────────────────────────────────────────────────
+
+const SCREEN_W: u16 = 480;
+const SCREEN_H: u16 = 800;
+
+const HEADING_X: u16 = 16;
+const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;
+
+const BODY_X: u16 = 24;
+const BODY_W: u16 = SCREEN_W - BODY_X * 2;
+const BODY_LINE_GAP: u16 = 10;
+
+const FOOTER_Y: u16 = SCREEN_H - 60;
 
 // ── Public entry point ──────────────────────────────────────────────
 
@@ -45,13 +62,19 @@ pub async fn run_upload_mode(
     strip: &mut StripBuffer,
     delay: &mut Delay,
 ) {
+    let heading = fonts::heading_font(0);
+    let body = fonts::body_font(0);
+
     // ── Phase 1 — Initialise radio & WiFi ───────────────────────────
 
-    render_status(
+    render_screen(
         epd,
         strip,
         delay,
-        &["Upload Mode", "", "Initialising radio..."],
+        heading,
+        body,
+        &["Initialising radio..."],
+        None,
     )
     .await;
 
@@ -59,17 +82,14 @@ pub async fn run_upload_mode(
         Ok(r) => r,
         Err(e) => {
             info!("upload: radio init failed: {:?}", e);
-            render_status(
+            render_screen(
                 epd,
                 strip,
                 delay,
-                &[
-                    "Upload Mode",
-                    "",
-                    "Radio init failed!",
-                    "",
-                    "Press BACK to exit",
-                ],
+                heading,
+                body,
+                &["Radio init failed!"],
+                Some("Press BACK to exit"),
             )
             .await;
             drain_until_back().await;
@@ -81,17 +101,14 @@ pub async fn run_upload_mode(
         Ok(pair) => pair,
         Err(e) => {
             info!("upload: wifi::new failed: {:?}", e);
-            render_status(
+            render_screen(
                 epd,
                 strip,
                 delay,
-                &[
-                    "Upload Mode",
-                    "",
-                    "WiFi init failed!",
-                    "",
-                    "Press BACK to exit",
-                ],
+                heading,
+                body,
+                &["WiFi init failed!"],
+                Some("Press BACK to exit"),
             )
             .await;
             drain_until_back().await;
@@ -105,17 +122,14 @@ pub async fn run_upload_mode(
 
     if let Err(e) = wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
         info!("upload: set_config failed: {:?}", e);
-        render_status(
+        render_screen(
             epd,
             strip,
             delay,
-            &[
-                "Upload Mode",
-                "",
-                "WiFi config error!",
-                "",
-                "Press BACK to exit",
-            ],
+            heading,
+            body,
+            &["WiFi config error!"],
+            Some("Press BACK to exit"),
         )
         .await;
         drain_until_back().await;
@@ -124,17 +138,14 @@ pub async fn run_upload_mode(
 
     if let Err(e) = wifi_ctrl.start_async().await {
         info!("upload: start failed: {:?}", e);
-        render_status(
+        render_screen(
             epd,
             strip,
             delay,
-            &[
-                "Upload Mode",
-                "",
-                "WiFi start failed!",
-                "",
-                "Press BACK to exit",
-            ],
+            heading,
+            body,
+            &["WiFi start failed!"],
+            Some("Press BACK to exit"),
         )
         .await;
         drain_until_back().await;
@@ -147,29 +158,23 @@ pub async fn run_upload_mode(
 
     {
         let mut msg_buf = [0u8; 64];
-        let msg_len;
-        {
-            let mut w = StackFmt::new(&mut msg_buf);
+        let msg_len = stack_fmt(&mut msg_buf, |w| {
             let _ = write!(w, "Connecting to '{}'...", SSID);
-            msg_len = w.len();
-        }
+        });
         let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
-        render_status(epd, strip, delay, &["Upload Mode", "", msg]).await;
+        render_screen(epd, strip, delay, heading, body, &[msg], None).await;
     }
 
     if let Err(e) = wifi_ctrl.connect_async().await {
         info!("upload: connect failed: {:?}", e);
-        render_status(
+        render_screen(
             epd,
             strip,
             delay,
-            &[
-                "Upload Mode",
-                "",
-                "Connection failed!",
-                "",
-                "Press BACK to exit",
-            ],
+            heading,
+            body,
+            &["Connection failed!"],
+            Some("Press BACK to exit"),
         )
         .await;
         drain_until_back().await;
@@ -180,11 +185,14 @@ pub async fn run_upload_mode(
 
     // ── Phase 3 — DHCP ──────────────────────────────────────────────
 
-    render_status(
+    render_screen(
         epd,
         strip,
         delay,
-        &["Upload Mode", "", "Connected!", "Obtaining IP address..."],
+        heading,
+        body,
+        &["Connected!", "Obtaining IP address..."],
+        None,
     )
     .await;
 
@@ -219,25 +227,25 @@ pub async fn run_upload_mode(
 
     // Format IP address
     let mut ip_buf = [0u8; 48];
-    let ip_len;
-    {
-        let mut w = StackFmt::new(&mut ip_buf);
+    let ip_len = stack_fmt(&mut ip_buf, |w| {
         if let Some(cfg) = stack.config_v4() {
             let _ = write!(w, "http://{}/", cfg.address.address());
         } else {
             let _ = write!(w, "(no IP address)");
         }
-        ip_len = w.len();
-    }
+    });
     let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("???");
 
     info!("upload: serving at {}", ip_str);
 
-    render_status(
+    render_screen(
         epd,
         strip,
         delay,
-        &["Upload Mode", "", ip_str, "", "Press BACK to exit"],
+        heading,
+        body,
+        &[ip_str],
+        Some("Press BACK to exit"),
     )
     .await;
 
@@ -335,52 +343,95 @@ async fn drain_until_back() {
 
 // ── Display helpers ─────────────────────────────────────────────────
 
-/// Full-refresh the e-paper with a set of horizontally-centred text
-/// lines.  Uses the small mono font (6×13) so we don't depend on the
-/// bitmap font atlas.
-async fn render_status(epd: &mut Epd, strip: &mut StripBuffer, delay: &mut Delay, lines: &[&str]) {
-    use embedded_graphics::mono_font::MonoTextStyle;
-    use embedded_graphics::mono_font::ascii::FONT_6X13;
-    use embedded_graphics::pixelcolor::BinaryColor;
-    use embedded_graphics::prelude::*;
-    use embedded_graphics::text::Text;
+/// Full-refresh the e-paper with the upload-mode screen layout:
+///
+///     ┌──────────────────────────┐
+///     │      Upload Mode         │  ← heading font, centred
+///     │                          │
+///     │                          │
+///     │     body line 1          │  ← body font, centred
+///     │     body line 2          │
+///     │                          │
+///     │                          │
+///     │     footer hint          │  ← body font, centred, near bottom
+///     └──────────────────────────┘
+///
+async fn render_screen(
+    epd: &mut Epd,
+    strip: &mut StripBuffer,
+    delay: &mut Delay,
+    heading: &'static BitmapFont,
+    body: &'static BitmapFont,
+    lines: &[&str],
+    footer: Option<&str>,
+) {
+    let heading_h = heading.line_height;
+    let body_h = body.line_height;
+    let body_stride = body_h + BODY_LINE_GAP;
 
-    let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
+    // Heading region: just below the status-bar area
+    let heading_region = Region::new(HEADING_X, CONTENT_TOP + 12, HEADING_W, heading_h);
+
+    // Body lines: vertically centred between heading and footer
+    let body_area_top = CONTENT_TOP + 12 + heading_h + 40;
+    let body_area_bottom = FOOTER_Y.saturating_sub(20);
+    let body_area_h = body_area_bottom.saturating_sub(body_area_top);
+    let total_body_h = if lines.is_empty() {
+        0
+    } else {
+        (lines.len() as u16 - 1) * body_stride + body_h
+    };
+    let body_start_y = body_area_top + body_area_h.saturating_sub(total_body_h) / 2;
+
+    // Footer region: near the bottom of the screen
+    let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
 
     epd.full_refresh_async(strip, delay, &|s: &mut StripBuffer| {
-        let start_y: i32 = 350;
+        // Heading
+        BitmapLabel::new(heading_region, "Upload Mode", heading)
+            .alignment(Alignment::Center)
+            .draw(s)
+            .unwrap();
+
+        // Body lines
         for (i, line) in lines.iter().enumerate() {
             if line.is_empty() {
-                continue; // blank line = vertical spacer
+                continue;
             }
-            let y = start_y + (i as i32) * 24;
-            let x = ((480 - line.len() as i32 * 6) / 2).max(8);
-            let _ = Text::new(line, Point::new(x, y), style).draw(s);
+            let y = body_start_y + (i as u16) * body_stride;
+            let region = Region::new(BODY_X, y, BODY_W, body_h);
+            BitmapLabel::new(region, line, body)
+                .alignment(Alignment::Center)
+                .draw(s)
+                .unwrap();
+        }
+
+        // Footer
+        if let Some(text) = footer {
+            BitmapLabel::new(footer_region, text, body)
+                .alignment(Alignment::Center)
+                .draw(s)
+                .unwrap();
         }
     })
     .await;
 }
 
-// ── Stack-based fmt::Write adapter ──────────────────────────────────
+// ── Stack-based fmt helper ──────────────────────────────────────────
 
-/// Tiny `core::fmt::Write` backed by a `&mut [u8]` — avoids a heap
-/// allocation when all we need is a short formatted string.
-struct StackFmt<'a> {
+/// Format into a stack buffer, return the number of bytes written.
+fn stack_fmt(buf: &mut [u8], f: impl FnOnce(&mut StackWriter<'_>)) -> usize {
+    let mut w = StackWriter { buf, pos: 0 };
+    f(&mut w);
+    w.pos
+}
+
+struct StackWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
 }
 
-impl<'a> StackFmt<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn len(&self) -> usize {
-        self.pos
-    }
-}
-
-impl core::fmt::Write for StackFmt<'_> {
+impl core::fmt::Write for StackWriter<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();
         let room = self.buf.len() - self.pos;
