@@ -92,10 +92,6 @@ impl AppContext {
         self.redraw = Redraw::Full;
     }
 
-    pub fn request_screen_redraw(&mut self) {
-        self.request_full_redraw();
-    }
-
     pub fn request_partial_redraw(&mut self, region: Region) {
         match self.redraw {
             Redraw::Full => {}

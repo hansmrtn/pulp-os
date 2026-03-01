@@ -395,7 +395,7 @@ impl App for SettingsApp {
     ) {
         if !self.loaded {
             self.load(services);
-            ctx.request_screen_redraw();
+            ctx.request_full_redraw();
             return;
         }
 

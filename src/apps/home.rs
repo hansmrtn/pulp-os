@@ -245,7 +245,7 @@ impl App for HomeApp {
             self.rebuild_item_count();
             self.needs_load_recent = false;
             if self.item_count != old_count {
-                ctx.request_screen_redraw();
+                ctx.request_full_redraw();
             }
         }
 
@@ -304,7 +304,7 @@ impl HomeApp {
                     self.bm_scroll = 0;
                     self.needs_load_bookmarks = true;
                     self.state = HomeState::ShowBookmarks;
-                    ctx.request_screen_redraw();
+                    ctx.request_full_redraw();
                     Transition::None
                 }
             },
@@ -316,7 +316,7 @@ impl HomeApp {
         match event {
             ActionEvent::Press(Action::Back) | ActionEvent::LongPress(Action::Back) => {
                 self.state = HomeState::Menu;
-                ctx.request_screen_redraw();
+                ctx.request_full_redraw();
                 Transition::None
             }
 

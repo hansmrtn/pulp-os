@@ -80,6 +80,22 @@ macro_rules! with_app {
     };
 }
 
+macro_rules! propagate_font_settings {
+    ($settings:expr, $home:expr, $files:expr, $reader:expr,
+     $quick_menu:expr, $bumps:expr) => {{
+        let ui_idx = $settings.system_settings().ui_font_size_idx;
+        let book_idx = $settings.system_settings().book_font_size_idx;
+        $home.set_ui_font_size(ui_idx);
+        $files.set_ui_font_size(ui_idx);
+        $settings.set_ui_font_size(ui_idx);
+        $reader.set_book_font_size(book_idx);
+        let chrome = fonts::chrome_font(ui_idx);
+        $quick_menu.set_chrome_font(chrome);
+        $bumps.set_chrome_font(chrome);
+        $reader.set_chrome_font(chrome);
+    }};
+}
+
 macro_rules! apply_transition {
     ($nav:expr, $launcher:expr, $home:expr, $files:expr,
      $reader:expr, $settings:expr, $bm_cache:expr,
@@ -104,20 +120,7 @@ macro_rules! apply_transition {
         }
 
         // propagate persisted prefs before lifecycle callbacks
-        {
-            let ui_idx = $settings.system_settings().ui_font_size_idx;
-            let book_idx = $settings.system_settings().book_font_size_idx;
-            if nav.to == AppId::Reader {
-                $reader.set_book_font_size(book_idx);
-            }
-            $home.set_ui_font_size(ui_idx);
-            $files.set_ui_font_size(ui_idx);
-            $settings.set_ui_font_size(ui_idx);
-            let chrome = fonts::chrome_font(ui_idx);
-            $quick_menu.set_chrome_font(chrome);
-            $bumps.set_chrome_font(chrome);
-            $reader.set_chrome_font(chrome);
-        }
+        propagate_font_settings!($settings, $home, $files, $reader, $quick_menu, $bumps);
 
         if nav.to != AppId::Upload {
             if nav.resume {
@@ -191,6 +194,46 @@ macro_rules! busy_wait_with_input {
             }
         }
         _deferred
+    }};
+}
+
+// flush bookmarks, render sleep screen, deep-sleep display + MCU.
+// macro because it borrows locals and .awaits inside the main async fn.
+macro_rules! enter_sleep {
+    ($reason:expr, $bm_cache:expr, $board:expr, $strip:expr, $delay:expr) => {{
+        info!("{}: entering sleep...", $reason);
+
+        if $bm_cache.is_dirty() {
+            $bm_cache.flush(&$board.storage.sd);
+        }
+
+        $board
+            .display
+            .epd
+            .full_refresh_async($strip, &mut $delay, &|s: &mut StripBuffer| {
+                use embedded_graphics::mono_font::MonoTextStyle;
+                use embedded_graphics::mono_font::ascii::FONT_6X13;
+                use embedded_graphics::pixelcolor::BinaryColor;
+                use embedded_graphics::prelude::*;
+                use embedded_graphics::text::Text;
+
+                let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
+                let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
+            })
+            .await;
+        info!("display: sleep screen rendered");
+
+        $board.display.epd.enter_deep_sleep();
+        info!("display: deep sleep mode 1");
+
+        let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
+        let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
+        let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
+            &mut [(&mut gpio3, WakeupLevel::Low)];
+        let rtcio = RtcioWakeupSource::new(wakeup_pins);
+
+        info!("mcu: entering deep sleep (power button to wake)");
+        rtc.sleep_deep(&[&rtcio]);
     }};
 }
 
@@ -288,16 +331,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     {
         let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
         settings.load_eager(&mut svc);
-        let ui_idx = settings.system_settings().ui_font_size_idx;
-        let book_idx = settings.system_settings().book_font_size_idx;
-        home.set_ui_font_size(ui_idx);
-        files.set_ui_font_size(ui_idx);
-        settings.set_ui_font_size(ui_idx);
-        reader.set_book_font_size(book_idx);
-        let chrome = fonts::chrome_font(ui_idx);
-        quick_menu.set_chrome_font(chrome);
-        bumps.set_chrome_font(chrome);
-        reader.set_chrome_font(chrome);
+        propagate_font_settings!(settings, home, files, reader, quick_menu, bumps);
         home.load_recent(&mut svc);
     }
 
@@ -391,43 +425,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             if hw_event
                 == pulp_os::drivers::input::Event::LongPress(pulp_os::board::button::Button::Power)
             {
-                info!("power held: entering sleep...");
-
-                // flush dirty bookmarks
-                if bm_cache.is_dirty() {
-                    bm_cache.flush(&board.storage.sd);
-                }
-
-                // render sleep screen (~1.6s GC waveform)
-                board
-                    .display
-                    .epd
-                    .full_refresh_async(strip, &mut delay, &|s: &mut StripBuffer| {
-                        use embedded_graphics::mono_font::MonoTextStyle;
-                        use embedded_graphics::mono_font::ascii::FONT_6X13;
-                        use embedded_graphics::pixelcolor::BinaryColor;
-                        use embedded_graphics::prelude::*;
-                        use embedded_graphics::text::Text;
-
-                        let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
-                        let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
-                    })
-                    .await;
-                info!("display: sleep screen rendered");
-
-                // SSD1677 deep-sleep mode 1 (~3uA, image retained; hw reset to wake)
-                board.display.epd.enter_deep_sleep();
-                info!("display: deep sleep mode 1");
-
-                // ESP32-C3 deep sleep (~5uA); GPIO3 RTC wake; MCU resets on wake
-                let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
-                let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
-                let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
-                    &mut [(&mut gpio3, WakeupLevel::Low)];
-                let rtcio = RtcioWakeupSource::new(wakeup_pins);
-
-                info!("mcu: entering deep sleep (power button to wake)");
-                rtc.sleep_deep(&[&rtcio]);
+                enter_sleep!("power held", bm_cache, board, strip, delay);
             }
 
             let event = mapper.map_event(hw_event);
@@ -586,44 +584,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
         // idle sleep: flush, sleep screen, deep sleep; wake = full reset
         if tasks::IDLE_SLEEP_DUE.try_take().is_some() {
-            info!("idle timeout: entering sleep...");
-
-            // flush dirty bookmarks
-            if bm_cache.is_dirty() {
-                bm_cache.flush(&board.storage.sd);
-            }
-
-            // render sleep screen (~1.6s GC waveform)
-            board
-                .display
-                .epd
-                .full_refresh_async(strip, &mut delay, &|s: &mut StripBuffer| {
-                    use embedded_graphics::mono_font::MonoTextStyle;
-                    use embedded_graphics::mono_font::ascii::FONT_6X13;
-                    use embedded_graphics::pixelcolor::BinaryColor;
-                    use embedded_graphics::prelude::*;
-                    use embedded_graphics::text::Text;
-
-                    let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
-                    let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
-                })
-                .await;
-            info!("display: sleep screen rendered");
-
-            // SSD1677 deep-sleep mode 1 (~3uA, image retained; hw reset to wake)
-            board.display.epd.enter_deep_sleep();
-            info!("display: deep sleep mode 1");
-
-            // ESP32-C3 deep sleep (~5uA); GPIO3 RTC wake; MCU resets on wake
-            // steal peripherals: ownership irrelevant, sleep_deep() is -> !
-            let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
-            let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
-            let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
-                &mut [(&mut gpio3, WakeupLevel::Low)];
-            let rtcio = RtcioWakeupSource::new(wakeup_pins);
-
-            info!("mcu: entering deep sleep (power button to wake)");
-            rtc.sleep_deep(&[&rtcio]);
+            enter_sleep!("idle timeout", bm_cache, board, strip, delay);
         }
 
         // 5. render

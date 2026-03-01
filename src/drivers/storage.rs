@@ -429,22 +429,7 @@ pub fn create_or_truncate_root<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-
-    let file = root
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| "create file failed")?;
-
-    if !data.is_empty() {
-        file.write(data).map_err(|_| "write failed")?;
-    }
-    file.flush().map_err(|_| "flush failed")?;
-
-    Ok(())
+    write_file(sd, name, data)
 }
 
 // append a chunk to an existing file in the SD root;
@@ -688,6 +673,20 @@ where
 
 // nested subdirectory operations (_PULP/<sub>/)
 
+// open _PULP/<dir>/ and execute body with the subdir handle
+macro_rules! with_pulp_subdir {
+    ($sd:expr, $dir:expr, |$sub:ident| $body:expr) => {{
+        let volume = $sd
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| "open volume failed")?;
+        let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+        let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP failed")?;
+        let $sub = pulp.open_dir($dir).map_err(|_| "open cache dir failed")?;
+        $body
+    }};
+}
+
 // create _PULP/<name>/ (ensures _PULP exists first)
 pub fn ensure_pulp_subdir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
 where
@@ -718,23 +717,16 @@ pub fn write_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP failed")?;
-    let sub = pulp.open_dir(dir).map_err(|_| "open cache dir failed")?;
-
-    let file = sub
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| "create file in dir failed")?;
-
-    if !data.is_empty() {
-        file.write(data).map_err(|_| "write in dir failed")?;
-    }
-    file.flush().map_err(|_| "flush in dir failed")?;
-    Ok(())
+    with_pulp_subdir!(sd, dir, |sub| {
+        let file = sub
+            .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+            .map_err(|_| "create file in dir failed")?;
+        if !data.is_empty() {
+            file.write(data).map_err(|_| "write in dir failed")?;
+        }
+        file.flush().map_err(|_| "flush in dir failed")?;
+        Ok(())
+    })
 }
 
 // append to file (or create) inside _PULP/<dir>/
@@ -747,23 +739,16 @@ pub fn append_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP failed")?;
-    let sub = pulp.open_dir(dir).map_err(|_| "open cache dir failed")?;
-
-    let file = sub
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
-        .map_err(|_| "open file for append failed")?;
-
-    if !data.is_empty() {
-        file.write(data).map_err(|_| "append write failed")?;
-    }
-    file.flush().map_err(|_| "append flush failed")?;
-    Ok(())
+    with_pulp_subdir!(sd, dir, |sub| {
+        let file = sub
+            .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
+            .map_err(|_| "open file for append failed")?;
+        if !data.is_empty() {
+            file.write(data).map_err(|_| "append write failed")?;
+        }
+        file.flush().map_err(|_| "append flush failed")?;
+        Ok(())
+    })
 }
 
 // read chunk from _PULP/<dir>/<name> at given offset
@@ -777,32 +762,24 @@ pub fn read_chunk_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP failed")?;
-    let sub = pulp.open_dir(dir).map_err(|_| "open cache dir failed")?;
-
-    let file = sub
-        .open_file_in_dir(name, Mode::ReadOnly)
-        .map_err(|_| "open file in dir failed")?;
-
-    file.seek_from_start(offset)
-        .map_err(|_| "seek in dir failed")?;
-
-    let mut total = 0;
-    while !file.is_eof() && total < buf.len() {
-        let n = file
-            .read(&mut buf[total..])
-            .map_err(|_| "read in dir failed")?;
-        if n == 0 {
-            break;
+    with_pulp_subdir!(sd, dir, |sub| {
+        let file = sub
+            .open_file_in_dir(name, Mode::ReadOnly)
+            .map_err(|_| "open file in dir failed")?;
+        file.seek_from_start(offset)
+            .map_err(|_| "seek in dir failed")?;
+        let mut total = 0;
+        while !file.is_eof() && total < buf.len() {
+            let n = file
+                .read(&mut buf[total..])
+                .map_err(|_| "read in dir failed")?;
+            if n == 0 {
+                break;
+            }
+            total += n;
         }
-        total += n;
-    }
-    Ok(total)
+        Ok(total)
+    })
 }
 
 // file size inside _PULP/<dir>/<name>; Err if not found
@@ -814,18 +791,12 @@ pub fn file_size_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP failed")?;
-    let sub = pulp.open_dir(dir).map_err(|_| "open cache dir failed")?;
-
-    let file = sub
-        .open_file_in_dir(name, Mode::ReadOnly)
-        .map_err(|_| "open file for size failed")?;
-    Ok(file.length())
+    with_pulp_subdir!(sd, dir, |sub| {
+        let file = sub
+            .open_file_in_dir(name, Mode::ReadOnly)
+            .map_err(|_| "open file for size failed")?;
+        Ok(file.length())
+    })
 }
 
 // append a title mapping line to _PULP/TITLES.BIN; format: "FILENAME.EXT\tTitle Text\n"
@@ -855,19 +826,7 @@ fn append_in_pulp_dir<SPI>(sd: &SdStorage<SPI>, name: &str, data: &[u8]) -> Resu
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir")?;
-    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP dir")?;
-    let f = pulp
-        .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
-        .map_err(|_| "open titles file")?;
-    f.seek_from_end(0).map_err(|_| "seek end")?;
-    f.write(data).map_err(|_| "write titles")?;
-    f.close().map_err(|_| "close titles")?;
-    Ok(())
+    append_file_in_dir(sd, PULP_DIR, name, data)
 }
 
 pub fn delete_in_pulp_subdir<SPI>(
@@ -878,14 +837,8 @@ pub fn delete_in_pulp_subdir<SPI>(
 where
     SPI: embedded_hal::spi::SpiDevice,
 {
-    let volume = sd
-        .volume_mgr
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| "open volume failed")?;
-    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
-    let pulp = root.open_dir(PULP_DIR).map_err(|_| "open _PULP failed")?;
-    let sub = pulp.open_dir(dir).map_err(|_| "open cache dir failed")?;
-
-    let _ = sub.delete_file_in_dir(name);
-    Ok(())
+    with_pulp_subdir!(sd, dir, |sub| {
+        let _ = sub.delete_file_in_dir(name);
+        Ok(())
+    })
 }

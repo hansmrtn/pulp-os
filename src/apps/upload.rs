@@ -231,17 +231,15 @@ pub async fn run_upload_mode<SPI>(
     let mut resources = embassy_net::StackResources::<4>::new();
     let (stack, mut runner) = embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
 
-    let got_ip = loop {
-        match select(
-            runner.run(),
-            select(stack.wait_config_up(), drain_until_back()),
-        )
-        .await
-        {
-            Either::Second(Either::First(_)) => break true,
-            Either::Second(Either::Second(_)) => break false,
-            _ => unreachable!(),
-        }
+    let got_ip = match select(
+        runner.run(),
+        select(stack.wait_config_up(), drain_until_back()),
+    )
+    .await
+    {
+        Either::Second(Either::First(_)) => true,
+        Either::Second(Either::Second(_)) => false,
+        _ => unreachable!(),
     };
 
     if !got_ip {

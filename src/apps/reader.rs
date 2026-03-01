@@ -23,16 +23,16 @@ use crate::apps::{App, AppContext, Services, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
-use crate::formats::cache;
-use crate::formats::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
-use crate::formats::html_strip::{
+use crate::ui::quick_menu::QuickAction;
+use crate::ui::{Alignment, CONTENT_TOP, Region};
+use smol_epub::cache;
+use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
+use smol_epub::html_strip::{
     BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF,
     QUOTE_ON,
 };
-use crate::formats::png::DecodedImage;
-use crate::formats::zip::{self, ZipIndex};
-use crate::ui::quick_menu::QuickAction;
-use crate::ui::{Alignment, CONTENT_TOP, Region};
+use smol_epub::png::DecodedImage;
+use smol_epub::zip::{self, ZipIndex};
 
 const MARGIN: u16 = 8;
 const HEADER_Y: u16 = CONTENT_TOP + 2;
@@ -771,7 +771,7 @@ impl ReaderApp {
         let result = if is_jpeg && entry.method == zip::METHOD_STORED {
             // stored JPEG: stream directly from SD
             let svc_ref = &*svc;
-            crate::formats::jpeg::decode_jpeg_sd(
+            smol_epub::jpeg::decode_jpeg_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
                 data_offset,
                 entry.uncomp_size,
@@ -781,7 +781,7 @@ impl ReaderApp {
         } else if is_jpeg {
             // deflate JPEG: stream-decompress + decode
             let svc_ref = &*svc;
-            crate::formats::jpeg::decode_jpeg_deflate_sd(
+            smol_epub::jpeg::decode_jpeg_deflate_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
                 data_offset,
                 entry.comp_size,
@@ -792,7 +792,7 @@ impl ReaderApp {
         } else if entry.method == zip::METHOD_STORED {
             // stored PNG: stream directly from SD
             let svc_ref = &*svc;
-            crate::formats::png::decode_png_sd(
+            smol_epub::png::decode_png_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
                 data_offset,
                 entry.uncomp_size,
@@ -802,7 +802,7 @@ impl ReaderApp {
         } else {
             // deflate PNG: stream-decompress + decode
             let svc_ref = &*svc;
-            crate::formats::png::decode_png_deflate_sd(
+            smol_epub::png::decode_png_deflate_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
                 data_offset,
                 entry.comp_size,

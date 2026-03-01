@@ -57,85 +57,55 @@ impl Default for FontSet {
 }
 
 impl FontSet {
-    pub fn small() -> Self {
-        let regular = &font_data::REGULAR_BODY_SMALL;
-
-        let bold = if font_data::BOLD_BODY_SMALL.glyph('A').advance > 0 {
-            &font_data::BOLD_BODY_SMALL
+    fn from_fonts(
+        regular: &'static BitmapFont,
+        bold_candidate: &'static BitmapFont,
+        italic_candidate: &'static BitmapFont,
+        heading: &'static BitmapFont,
+    ) -> Self {
+        let bold = if bold_candidate.glyph('A').advance > 0 {
+            bold_candidate
         } else {
             regular
         };
-
-        let italic = if font_data::ITALIC_BODY_SMALL.glyph('A').advance > 0 {
-            &font_data::ITALIC_BODY_SMALL
+        let italic = if italic_candidate.glyph('A').advance > 0 {
+            italic_candidate
         } else {
             regular
         };
-
         Self {
             regular,
             bold,
             italic,
-            heading: &font_data::REGULAR_HEADING_SMALL,
-        }
-    }
-
-    pub fn medium() -> Self {
-        let regular = &font_data::REGULAR_BODY_MEDIUM;
-
-        let bold = if font_data::BOLD_BODY_MEDIUM.glyph('A').advance > 0 {
-            &font_data::BOLD_BODY_MEDIUM
-        } else {
-            regular
-        };
-
-        let italic = if font_data::ITALIC_BODY_MEDIUM.glyph('A').advance > 0 {
-            &font_data::ITALIC_BODY_MEDIUM
-        } else {
-            regular
-        };
-
-        Self {
-            regular,
-            bold,
-            italic,
-            heading: &font_data::REGULAR_HEADING_MEDIUM,
-        }
-    }
-
-    pub fn large() -> Self {
-        let regular = &font_data::REGULAR_BODY_LARGE;
-
-        let bold = if font_data::BOLD_BODY_LARGE.glyph('A').advance > 0 {
-            &font_data::BOLD_BODY_LARGE
-        } else {
-            regular
-        };
-
-        let italic = if font_data::ITALIC_BODY_LARGE.glyph('A').advance > 0 {
-            &font_data::ITALIC_BODY_LARGE
-        } else {
-            regular
-        };
-
-        Self {
-            regular,
-            bold,
-            italic,
-            heading: &font_data::REGULAR_HEADING_LARGE,
+            heading,
         }
     }
 
     pub fn for_size(idx: u8) -> Self {
         match idx {
-            1 => Self::medium(),
-            2 => Self::large(),
-            _ => Self::small(),
+            1 => Self::from_fonts(
+                &font_data::REGULAR_BODY_MEDIUM,
+                &font_data::BOLD_BODY_MEDIUM,
+                &font_data::ITALIC_BODY_MEDIUM,
+                &font_data::REGULAR_HEADING_MEDIUM,
+            ),
+            2 => Self::from_fonts(
+                &font_data::REGULAR_BODY_LARGE,
+                &font_data::BOLD_BODY_LARGE,
+                &font_data::ITALIC_BODY_LARGE,
+                &font_data::REGULAR_HEADING_LARGE,
+            ),
+            _ => Self::from_fonts(
+                &font_data::REGULAR_BODY_SMALL,
+                &font_data::BOLD_BODY_SMALL,
+                &font_data::ITALIC_BODY_SMALL,
+                &font_data::REGULAR_HEADING_SMALL,
+            ),
         }
     }
 
     pub fn new() -> Self {
-        Self::small()
+        Self::for_size(0)
     }
 
     #[inline]
