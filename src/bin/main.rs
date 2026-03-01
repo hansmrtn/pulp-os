@@ -51,7 +51,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // on_work cadence: lets multi-step ops (EPUB init, caching) progress between events
 const TICK_MS: u64 = 10;
 
-const DEFAULT_GHOST_CLEAR_EVERY: u32 = 6;
+const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
 
 macro_rules! with_app {
     ($id:expr, $home:expr, $files:expr, $reader:expr, $settings:expr,
@@ -385,6 +385,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 &board.storage.sd,
                 settings.system_settings().ui_font_size_idx,
                 bumps,
+                settings.wifi_config(),
             )
             .await;
 

@@ -1,7 +1,5 @@
 // System settings with persistent storage.
-// #[repr(C)] struct written as raw bytes to SETTINGS.BIN.
-// Load/save deferred to on_work() so render is never blocked.
-
+// Text-based key=value format in _PULP/SETTINGS.TXT.
 use core::fmt::Write as _;
 
 use crate::apps::{App, AppContext, Services, Transition};
@@ -12,8 +10,6 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::ui::{
     Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region, wrap_next, wrap_prev,
 };
-
-// layout: 480x800 logical (Deg270); status bar at y 0..CONTENT_TOP (18px)
 
 const ROW_H: u16 = 40;
 const ROW_GAP: u16 = 6;
@@ -30,25 +26,14 @@ const HEADING_ITEMS_GAP: u16 = 8; // gap between heading bottom and first row
 
 // persistent settings
 
-const SETTINGS_FILE: &str = "SETTINGS.BIN";
-
-// on-disk layout (#[repr(C)], 8 bytes):
-//   sleep_timeout      u16   bytes 0-1
-//   contrast           u8    byte  2
-//   ghost_clear_every  u8    byte  3
-//   book_font_size_idx u8    byte  4
-//   ui_font_size_idx   u8    byte  5
-//   _pad               [u8;2] bytes 6-7
-// add new fields before _pad and shrink it by the same count
+const SETTINGS_FILE: &str = "SETTINGS.TXT";
 #[derive(Clone, Copy)]
-#[repr(C)]
 pub struct SystemSettings {
     pub sleep_timeout: u16,     // minutes idle before sleep; 0 = never
     pub contrast: u8,           // SSD1677 VCOM 0x2C; higher = darker
     pub ghost_clear_every: u8,  // partial refreshes before a forced full refresh
     pub book_font_size_idx: u8, // 0 = Small, 1 = Medium, 2 = Large
     pub ui_font_size_idx: u8,   // 0 = Small, 1 = Medium, 2 = Large
-    _pad: [u8; 2],              // reserved
 }
 
 impl Default for SystemSettings {
@@ -65,17 +50,6 @@ impl SystemSettings {
             ghost_clear_every: 10,
             book_font_size_idx: 1,
             ui_font_size_idx: 1,
-            _pad: [0u8; 2],
-        }
-    }
-
-    // reinterpret self as byte slice for writing to SD
-    pub fn to_bytes(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                self as *const Self as *const u8,
-                core::mem::size_of::<Self>(),
-            )
         }
     }
 
@@ -85,23 +59,196 @@ impl SystemSettings {
         self.book_font_size_idx = self.book_font_size_idx.min(2);
         self.ui_font_size_idx = self.ui_font_size_idx.min(2);
     }
+}
 
-    // deserialise from raw bytes; return defaults on short input
-    pub fn from_bytes(data: &[u8]) -> Self {
-        let size = core::mem::size_of::<Self>();
-        if data.len() >= size {
-            let mut s = Self::defaults();
-            unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), &mut s as *mut Self as *mut u8, size);
+// wifi config (in settings.txt)
+pub const WIFI_SSID_CAP: usize = 32;
+pub const WIFI_PASS_CAP: usize = 63;
+
+pub struct WifiConfig {
+    ssid: [u8; WIFI_SSID_CAP],
+    ssid_len: u8,
+    pass: [u8; WIFI_PASS_CAP],
+    pass_len: u8,
+}
+
+impl WifiConfig {
+    pub const fn empty() -> Self {
+        Self {
+            ssid: [0u8; WIFI_SSID_CAP],
+            ssid_len: 0,
+            pass: [0u8; WIFI_PASS_CAP],
+            pass_len: 0,
+        }
+    }
+
+    pub fn ssid(&self) -> &str {
+        core::str::from_utf8(&self.ssid[..self.ssid_len as usize]).unwrap_or("")
+    }
+
+    pub fn password(&self) -> &str {
+        core::str::from_utf8(&self.pass[..self.pass_len as usize]).unwrap_or("")
+    }
+
+    pub fn has_credentials(&self) -> bool {
+        self.ssid_len > 0
+    }
+
+    fn set_ssid(&mut self, val: &[u8]) {
+        let n = val.len().min(WIFI_SSID_CAP);
+        self.ssid[..n].copy_from_slice(&val[..n]);
+        self.ssid_len = n as u8;
+    }
+
+    fn set_pass(&mut self, val: &[u8]) {
+        let n = val.len().min(WIFI_PASS_CAP);
+        self.pass[..n].copy_from_slice(&val[..n]);
+        self.pass_len = n as u8;
+    }
+}
+
+// Text format parser / writer
+fn trim(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = s.len();
+    while start < end && matches!(s[start], b' ' | b'\t' | b'\r') {
+        start += 1;
+    }
+    while end > start && matches!(s[end - 1], b' ' | b'\t' | b'\r') {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
+fn parse_u16(s: &[u8]) -> Option<u16> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut val: u16 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u16)?;
+    }
+    Some(val)
+}
+
+fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiConfig) {
+    match key {
+        b"sleep_timeout" => {
+            if let Some(v) = parse_u16(val) {
+                s.sleep_timeout = v;
             }
-            s.sanitize();
-            s
-        } else {
-            Self::defaults()
+        }
+        b"contrast" => {
+            if let Some(v) = parse_u16(val) {
+                s.contrast = v as u8;
+            }
+        }
+        b"ghost_clear" => {
+            if let Some(v) = parse_u16(val) {
+                s.ghost_clear_every = v as u8;
+            }
+        }
+        b"book_font" => {
+            if let Some(v) = parse_u16(val) {
+                s.book_font_size_idx = v as u8;
+            }
+        }
+        b"ui_font" => {
+            if let Some(v) = parse_u16(val) {
+                s.ui_font_size_idx = v as u8;
+            }
+        }
+        b"wifi_ssid" => w.set_ssid(val),
+        b"wifi_pass" => w.set_pass(val),
+        _ => {} // unknown keys silently ignored for forward compat
+    }
+}
+
+fn parse_settings_txt(data: &[u8], settings: &mut SystemSettings, wifi: &mut WifiConfig) {
+    for line in data.split(|&b| b == b'\n') {
+        let line = trim(line);
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        if let Some(eq) = line.iter().position(|&b| b == b'=') {
+            let key = trim(&line[..eq]);
+            let val = trim(&line[eq + 1..]);
+            apply_setting(key, val, settings, wifi);
         }
     }
 }
 
+// tiny cursor writer for building the text representation
+struct TxtWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> TxtWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn put(&mut self, data: &[u8]) {
+        let n = data.len().min(self.buf.len() - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
+        self.pos += n;
+    }
+
+    fn put_u16(&mut self, val: u16) {
+        if val == 0 {
+            self.put(b"0");
+            return;
+        }
+        let mut digits = [0u8; 5];
+        let mut i = 5;
+        let mut v = val;
+        while v > 0 {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        self.put(&digits[i..5]);
+    }
+
+    fn kv_num(&mut self, key: &[u8], val: u16) {
+        self.put(key);
+        self.put(b"=");
+        self.put_u16(val);
+        self.put(b"\n");
+    }
+
+    fn kv_str(&mut self, key: &[u8], val: &[u8]) {
+        self.put(key);
+        self.put(b"=");
+        self.put(val);
+        self.put(b"\n");
+    }
+
+    fn len(&self) -> usize {
+        self.pos
+    }
+}
+
+fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) -> usize {
+    let mut wr = TxtWriter::new(buf);
+    wr.put(b"# pulp-os settings\n");
+    wr.put(b"# lines starting with # are ignored\n\n");
+    wr.kv_num(b"sleep_timeout", s.sleep_timeout);
+    wr.kv_num(b"contrast", s.contrast as u16);
+    wr.kv_num(b"ghost_clear", s.ghost_clear_every as u16);
+    wr.kv_num(b"book_font", s.book_font_size_idx as u16);
+    wr.kv_num(b"ui_font", s.ui_font_size_idx as u16);
+    wr.put(b"\n# wifi credentials for upload mode\n");
+    wr.kv_str(b"wifi_ssid", &w.ssid[..w.ssid_len as usize]);
+    wr.kv_str(b"wifi_pass", &w.pass[..w.pass_len as usize]);
+    wr.len()
+}
+
+// SettingsApp
 impl Default for SettingsApp {
     fn default() -> Self {
         Self::new()
@@ -110,6 +257,7 @@ impl Default for SettingsApp {
 
 pub struct SettingsApp {
     settings: SystemSettings,
+    wifi: WifiConfig,
     selected: usize,
     loaded: bool,
     save_needed: bool,
@@ -123,6 +271,7 @@ impl SettingsApp {
         let hf = fonts::heading_font(0);
         Self {
             settings: SystemSettings::defaults(),
+            wifi: WifiConfig::empty(),
             selected: 0,
             loaded: false,
             save_needed: false,
@@ -146,6 +295,10 @@ impl SettingsApp {
         &mut self.settings
     }
 
+    pub fn wifi_config(&self) -> &WifiConfig {
+        &self.wifi
+    }
+
     pub fn mark_save_needed(&mut self) {
         self.save_needed = true;
     }
@@ -165,23 +318,29 @@ impl SettingsApp {
     }
 
     fn load<SPI: embedded_hal::spi::SpiDevice>(&mut self, services: &mut Services<'_, SPI>) {
-        // buf must be >= size_of::<SystemSettings>() = 8 bytes
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 512];
+
+        self.settings = SystemSettings::defaults();
+        self.wifi = WifiConfig::empty();
+
         match services.read_pulp_start(SETTINGS_FILE, &mut buf) {
-            Ok((size, n)) if n > 0 => {
-                self.settings = SystemSettings::from_bytes(&buf[..n.min(size as usize)]);
+            Ok((_size, n)) if n > 0 => {
+                parse_settings_txt(&buf[..n], &mut self.settings, &mut self.wifi);
+                self.settings.sanitize();
                 log::info!("settings: loaded from {}", SETTINGS_FILE);
             }
             _ => {
-                self.settings = SystemSettings::defaults();
-                log::info!("settings: file absent or empty, using defaults");
+                log::info!("settings: no file found, using defaults");
             }
         }
+
         self.loaded = true;
     }
 
     fn save<SPI: embedded_hal::spi::SpiDevice>(&self, services: &Services<'_, SPI>) -> bool {
-        match services.write_pulp(SETTINGS_FILE, self.settings.to_bytes()) {
+        let mut buf = [0u8; 512];
+        let len = write_settings_txt(&self.settings, &self.wifi, &mut buf);
+        match services.write_pulp(SETTINGS_FILE, &buf[..len]) {
             Ok(_) => {
                 log::info!("settings: saved to {}", SETTINGS_FILE);
                 true

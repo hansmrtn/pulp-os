@@ -53,6 +53,7 @@ pub fn dir_name_str(buf: &[u8; 8]) -> &str {
 
 // 8.3 chapter filename: CH000.TXT to CH255.TXT
 pub fn chapter_file_name(idx: u16) -> [u8; 9] {
+    debug_assert!(idx < 1000, "chapter index out of 3-digit range");
     let mut n = *b"CH000.TXT";
     n[2] = b'0' + ((idx / 100) % 10) as u8;
     n[3] = b'0' + ((idx / 10) % 10) as u8;

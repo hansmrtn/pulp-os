@@ -14,6 +14,7 @@
 
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
+pub use smol_epub::cache::fnv1a;
 
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
@@ -111,16 +112,6 @@ impl BmListEntry {
     pub fn filename_str(&self) -> &str {
         core::str::from_utf8(&self.filename[..self.name_len as usize]).unwrap_or("?")
     }
-}
-
-// FNV-1a 32-bit hash
-pub fn fnv1a(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in data {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    h
 }
 
 // in-memory bookmark table; loaded once, reads from RAM, writes mark dirty (~780B)

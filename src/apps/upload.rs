@@ -1,5 +1,5 @@
 // WiFi upload mode: HTTP file upload server run from Home menu.
-// SET WIFI CREDENTIALS IN THE CONSTANTS BELOW.
+// WiFi credentials are read from _PULP/SETTINGS.TXT (wifi_ssid / wifi_pass).
 // GET / -> HTML file-picker form.
 // POST /upload -> multipart/form-data streamed to SD root.
 // No embassy tasks; runner, server, mDNS and back-button multiplexed with select.
@@ -18,6 +18,7 @@ use esp_hal::delay::Delay;
 use esp_radio::wifi::{ClientConfig, Config, ModeConfig};
 use log::info;
 
+use crate::apps::settings::WifiConfig;
 use crate::board::Epd;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::drivers::sdcard::SdStorage;
@@ -27,11 +28,6 @@ use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::tasks;
 use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region};
-
-// WiFi credentials (edit these!)
-
-const SSID: &str = "all_ducks_quack";
-const PASSWORD: &str = "pissword";
 
 // layout
 
@@ -101,18 +97,43 @@ pub async fn run_upload_mode<SPI>(
     sd: &SdStorage<SPI>,
     ui_font_size_idx: u8,
     bumps: &ButtonFeedback,
+    wifi_cfg: &WifiConfig,
 ) where
     SPI: embedded_hal::spi::SpiDevice,
 {
     let heading = fonts::heading_font(ui_font_size_idx);
     let body = fonts::chrome_font(ui_font_size_idx);
 
+    if !wifi_cfg.has_credentials() {
+        render_screen(
+            epd,
+            strip,
+            delay,
+            heading,
+            body,
+            &[
+                "No WiFi credentials!",
+                "Set wifi_ssid in",
+                "_PULP/SETTINGS.TXT",
+            ],
+            Some("Press BACK to exit"),
+            bumps,
+            false,
+        )
+        .await;
+        drain_until_back().await;
+        return;
+    }
+
+    let ssid = wifi_cfg.ssid();
+    let password = wifi_cfg.password();
+
     // screen 1: connecting
 
     {
         let mut msg_buf = [0u8; 64];
         let msg_len = stack_fmt(&mut msg_buf, |w| {
-            let _ = write!(w, "Connecting to '{}'...", SSID);
+            let _ = write!(w, "Connecting to '{}'...", ssid);
         });
         let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
         render_screen(epd, strip, delay, heading, body, &[msg], None, bumps, true).await;
@@ -161,8 +182,8 @@ pub async fn run_upload_mode<SPI>(
     };
 
     let client_cfg = ClientConfig::default()
-        .with_ssid(String::from(SSID))
-        .with_password(String::from(PASSWORD));
+        .with_ssid(String::from(ssid))
+        .with_password(String::from(password));
 
     if let Err(e) = wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
         info!("upload: set_config failed: {:?}", e);
@@ -200,7 +221,7 @@ pub async fn run_upload_mode<SPI>(
         return;
     }
 
-    info!("upload: wifi started, connecting to '{}'", SSID);
+    info!("upload: wifi started, connecting to '{}'", ssid);
 
     if let Err(e) = wifi_ctrl.connect_async().await {
         info!("upload: connect failed: {:?}", e);
@@ -220,7 +241,7 @@ pub async fn run_upload_mode<SPI>(
         return;
     }
 
-    info!("upload: connected to '{}'", SSID);
+    info!("upload: connected to '{}'", ssid);
 
     let net_config = embassy_net::Config::dhcpv4(Default::default());
     let seed = {
