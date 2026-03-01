@@ -366,8 +366,14 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         // When it returns the radio is torn down and we pop back to Home.
         if launcher.active() == AppId::Upload {
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            pulp_os::apps::upload::run_upload_mode(wifi, &mut board.display.epd, strip, &mut delay)
-                .await;
+            pulp_os::apps::upload::run_upload_mode(
+                wifi,
+                &mut board.display.epd,
+                strip,
+                &mut delay,
+                &board.storage.sd,
+            )
+            .await;
 
             // Pop back to the previous screen and re-render
             if let Some(nav) = launcher.apply(Transition::Pop) {

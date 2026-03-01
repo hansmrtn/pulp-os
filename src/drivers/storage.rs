@@ -308,6 +308,62 @@ where
     Ok(())
 }
 
+/// Create (or truncate) a file in the SD root and write an initial chunk.
+/// Use [`append_root_file`] for subsequent chunks.
+pub fn create_or_truncate_root<SPI>(
+    sd: &SdStorage<SPI>,
+    name: &str,
+    data: &[u8],
+) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+
+    let file = root
+        .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+        .map_err(|_| "create file failed")?;
+
+    if !data.is_empty() {
+        file.write(data).map_err(|_| "write failed")?;
+    }
+    file.flush().map_err(|_| "flush failed")?;
+
+    Ok(())
+}
+
+/// Append a chunk to an existing file in the SD root.
+/// The file must already exist (created via [`create_or_truncate_root`]).
+pub fn append_root_file<SPI>(
+    sd: &SdStorage<SPI>,
+    name: &str,
+    data: &[u8],
+) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    let volume = sd
+        .volume_mgr
+        .open_volume(VolumeIdx(0))
+        .map_err(|_| "open volume failed")?;
+    let root = volume.open_root_dir().map_err(|_| "open root dir failed")?;
+
+    let file = root
+        .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
+        .map_err(|_| "open file for append failed")?;
+
+    if !data.is_empty() {
+        file.write(data).map_err(|_| "append write failed")?;
+    }
+    file.flush().map_err(|_| "append flush failed")?;
+
+    Ok(())
+}
+
 // ── Subdirectory operations (EPUB chapter cache) ──────────────────────────
 
 // create dir in root if it doesn't already exist
