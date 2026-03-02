@@ -455,6 +455,48 @@ where
     with_dir!(sd, |root| do_append!(root, name, data))
 }
 
+pub fn delete_file<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, |root| do_delete!(root, name))
+}
+
+pub fn list_root_files<SPI>(
+    sd: &SdStorage<SPI>,
+    buf: &mut [DirEntry],
+) -> Result<usize, &'static str>
+where
+    SPI: embedded_hal::spi::SpiDevice,
+{
+    with_dir!(sd, |root| {
+        let mut count = 0usize;
+        root.iterate_dir(|entry| {
+            if matches!(entry.name.base_name()[0], b'.' | b'_') {
+                return;
+            }
+            if entry.attributes.is_directory() {
+                return;
+            }
+            if count < buf.len() {
+                let mut name_buf = [0u8; 13];
+                let name_len = format_83_name(&entry.name, &mut name_buf);
+                buf[count] = DirEntry {
+                    name: name_buf,
+                    name_len: name_len as u8,
+                    is_dir: false,
+                    size: entry.size,
+                    title: [0u8; TITLE_CAP],
+                    title_len: 0,
+                };
+                count += 1;
+            }
+        })
+        .map_err(|_| "iterate dir failed")?;
+        Ok(count)
+    })
+}
+
 // subdirectory operations
 
 pub fn ensure_dir<SPI>(sd: &SdStorage<SPI>, name: &str) -> Result<(), &'static str>

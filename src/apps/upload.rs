@@ -42,24 +42,19 @@ const FOOTER_Y: u16 = SCREEN_H - 60;
 
 // HTTP response fragments
 
-const HTTP_200: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
-const HTTP_500: &[u8] =
-    b"HTTP/1.0 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+const HTTP_200_HTML: &[u8] =
+    b"HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
+const HTTP_200_JSON: &[u8] =
+    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+const HTTP_200_TEXT: &[u8] =
+    b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
+const HTTP_500_TEXT: &[u8] =
+    b"HTTP/1.0 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
 const HTTP_404: &[u8] = b"HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
 
-const UPLOAD_FORM: &[u8] = b"<title>Pulp</title>\
-    <h1>Pulp</h1>\
-    <form method=POST action=/upload enctype=multipart/form-data>\
-    <input type=file name=file required><br><br>\
-    <input type=submit value=Upload>\
-    </form>";
-
-const UPLOAD_OK: &[u8] = b"<title>Pulp</title>\
-    <p>Upload complete.</p>\
-    <a href=/>Upload another</a>";
-
-const UPLOAD_ERR_PREFIX: &[u8] = b"<title>Pulp</title><p>Upload failed: ";
-const UPLOAD_ERR_SUFFIX: &[u8] = b"</p><a href=/>Try again</a>";
+// Embedded HTML page with drag-and-drop, file listing, and delete support.
+// JS is minimal: XHR upload with progress, fetch /files for listing, POST /delete.
+const UPLOAD_PAGE: &[u8] = include_bytes!("../../assets/upload.html");
 
 // mDNS constants
 
@@ -84,6 +79,8 @@ enum ServerEvent {
     Nothing,
     Uploaded { name: [u8; 13], name_len: u8 },
     UploadFailed,
+    Deleted { name: [u8; 13], name_len: u8 },
+    DeleteFailed,
 }
 
 pub async fn run_upload_mode<SPI>(
@@ -335,6 +332,13 @@ pub async fn run_upload_mode<SPI>(
             ServerEvent::UploadFailed => {
                 info!("upload: file upload failed");
             }
+            ServerEvent::Deleted { name, name_len } => {
+                let fname = core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
+                info!("upload: deleted '{}'", fname);
+            }
+            ServerEvent::DeleteFailed => {
+                info!("upload: file delete failed");
+            }
             ServerEvent::Nothing => {}
         }
     }
@@ -423,30 +427,76 @@ where
 
     let path = extract_path(request_line);
 
+    // ── GET / ── serve the upload page HTML ──────────────────────────
     if is_get && path == b"/" {
-        let _ = socket.write_all(HTTP_200).await;
-        let _ = socket.write_all(UPLOAD_FORM).await;
+        let _ = socket.write_all(HTTP_200_HTML).await;
+        let _ = socket.write_all(UPLOAD_PAGE).await;
         let _ = socket.flush().await;
         close_socket(&mut socket).await;
         return ServerEvent::Nothing;
     }
 
+    // ── GET /files ── JSON array of {name, size} ────────────────────
+    if is_get && path == b"/files" {
+        let _ = socket.write_all(HTTP_200_JSON).await;
+
+        let mut entries = [storage::DirEntry::EMPTY; 64];
+        let count = match storage::list_root_files(sd, &mut entries) {
+            Ok(n) => n,
+            Err(_) => {
+                let _ = socket.write_all(b"[]").await;
+                let _ = socket.flush().await;
+                close_socket(&mut socket).await;
+                return ServerEvent::Nothing;
+            }
+        };
+
+        let _ = socket.write_all(b"[").await;
+        let mut json_buf = [0u8; 80]; // per-entry scratch: {"name":"XXXXXXXX.XXX","size":4294967295}
+        for i in 0..count {
+            let e = &entries[i];
+            let name = e.name_str();
+            let mut pos = 0usize;
+            let prefix = b"{\"name\":\"";
+            json_buf[..prefix.len()].copy_from_slice(prefix);
+            pos += prefix.len();
+            let nb = name.as_bytes();
+            json_buf[pos..pos + nb.len()].copy_from_slice(nb);
+            pos += nb.len();
+            let mid = b"\",\"size\":";
+            json_buf[pos..pos + mid.len()].copy_from_slice(mid);
+            pos += mid.len();
+            // format u32 without alloc
+            pos += fmt_u32(e.size, &mut json_buf[pos..]);
+            json_buf[pos] = b'}';
+            pos += 1;
+            if i + 1 < count {
+                json_buf[pos] = b',';
+                pos += 1;
+            }
+            let _ = socket.write_all(&json_buf[..pos]).await;
+        }
+        let _ = socket.write_all(b"]").await;
+        let _ = socket.flush().await;
+        close_socket(&mut socket).await;
+        return ServerEvent::Nothing;
+    }
+
+    // ── POST /upload ── multipart file upload ───────────────────────
     if is_post && path == b"/upload" {
-        // extract boundary from Content-Type header
         let boundary = match find_boundary(headers) {
             Some(b) => b,
             None => {
-                send_error_page(&mut socket, "Missing multipart boundary").await;
+                send_error_response(&mut socket, "Missing multipart boundary").await;
                 close_socket(&mut socket).await;
                 return ServerEvent::UploadFailed;
             }
         };
 
-        // handle the file upload
         match handle_upload(&mut socket, sd, boundary, initial_body).await {
             Ok((name_buf, name_len)) => {
-                let _ = socket.write_all(HTTP_200).await;
-                let _ = socket.write_all(UPLOAD_OK).await;
+                let _ = socket.write_all(HTTP_200_TEXT).await;
+                let _ = socket.write_all(b"OK").await;
                 let _ = socket.flush().await;
                 close_socket(&mut socket).await;
                 return ServerEvent::Uploaded {
@@ -456,9 +506,68 @@ where
             }
             Err(e) => {
                 info!("upload: handle_upload error: {}", e);
-                send_error_page(&mut socket, e).await;
+                send_error_response(&mut socket, e).await;
                 close_socket(&mut socket).await;
                 return ServerEvent::UploadFailed;
+            }
+        }
+    }
+
+    // ── POST /delete ── body = filename to delete ───────────────────
+    if is_post && path == b"/delete" {
+        // read body (filename); may need to read more beyond initial_body
+        let content_len = extract_content_length(headers).unwrap_or(0);
+        let max_body = content_len.min(13); // 8.3 filename max
+        let mut body = [0u8; 16];
+        let have = initial_body.len().min(body.len());
+        body[..have].copy_from_slice(&initial_body[..have]);
+        let mut body_len = have;
+
+        while body_len < max_body && body_len < body.len() {
+            match socket.read(&mut body[body_len..]).await {
+                Ok(0) => break,
+                Ok(n) => body_len += n,
+                Err(_) => break,
+            }
+        }
+
+        let name = match core::str::from_utf8(&body[..body_len]) {
+            Ok(s) => s.trim(),
+            Err(_) => {
+                send_error_response(&mut socket, "Invalid filename").await;
+                close_socket(&mut socket).await;
+                return ServerEvent::DeleteFailed;
+            }
+        };
+
+        if name.is_empty() || name.len() > 12 {
+            send_error_response(&mut socket, "Invalid filename").await;
+            close_socket(&mut socket).await;
+            return ServerEvent::DeleteFailed;
+        }
+
+        // copy name into fixed buffer before passing to storage
+        let mut name_buf = [0u8; 13];
+        let name_bytes = name.as_bytes();
+        name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
+        let name_len = name_bytes.len() as u8;
+
+        match storage::delete_file(sd, name) {
+            Ok(()) => {
+                let _ = socket.write_all(HTTP_200_TEXT).await;
+                let _ = socket.write_all(b"OK").await;
+                let _ = socket.flush().await;
+                close_socket(&mut socket).await;
+                return ServerEvent::Deleted {
+                    name: name_buf,
+                    name_len,
+                };
+            }
+            Err(e) => {
+                info!("upload: delete failed for '{}': {}", name, e);
+                send_error_response(&mut socket, e).await;
+                close_socket(&mut socket).await;
+                return ServerEvent::DeleteFailed;
             }
         }
     }
@@ -719,13 +828,57 @@ fn is_valid_83_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~' | b'!' | b'#' | b'$' | b'&')
 }
 
-// send an HTML error page
-async fn send_error_page(socket: &mut TcpSocket<'_>, msg: &str) {
-    let _ = socket.write_all(HTTP_500).await;
-    let _ = socket.write_all(UPLOAD_ERR_PREFIX).await;
+// send a plain-text error response
+async fn send_error_response(socket: &mut TcpSocket<'_>, msg: &str) {
+    let _ = socket.write_all(HTTP_500_TEXT).await;
     let _ = socket.write_all(msg.as_bytes()).await;
-    let _ = socket.write_all(UPLOAD_ERR_SUFFIX).await;
     let _ = socket.flush().await;
+}
+
+// format a u32 into decimal ASCII; returns number of bytes written
+fn fmt_u32(mut n: u32, buf: &mut [u8]) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut pos = 0;
+    while n > 0 {
+        tmp[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        pos += 1;
+    }
+    for i in 0..pos {
+        buf[i] = tmp[pos - 1 - i];
+    }
+    pos
+}
+
+// extract Content-Length value from headers
+fn extract_content_length(headers: &[u8]) -> Option<usize> {
+    let marker = b"content-length:";
+    let pos = headers
+        .windows(marker.len())
+        .position(|w| w.eq_ignore_ascii_case(marker))?;
+    let start = pos + marker.len();
+    let rest = &headers[start..];
+    // skip whitespace
+    let trimmed = rest.iter().position(|&b| b != b' ' && b != b'\t')?;
+    let rest = &rest[trimmed..];
+    let end = rest
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(rest.len());
+    let digits = &rest[..end];
+    let mut val: usize = 0;
+    for &b in digits {
+        if b.is_ascii_digit() {
+            val = val.saturating_mul(10).saturating_add((b - b'0') as usize);
+        } else {
+            break;
+        }
+    }
+    Some(val)
 }
 
 // gracefully close a TCP socket

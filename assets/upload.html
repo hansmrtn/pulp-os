@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>pulp manager</title>
+        <link rel="icon" href="data:," />
+        <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            body {
+                font-family: system-ui, sans-serif;
+                background: #f5f5f0;
+                color: #222;
+                max-width: 540px;
+                margin: 0 auto;
+                padding: 16px;
+            }
+            h1 {
+                font-size: 1.4em;
+                margin-bottom: 12px;
+            }
+            #drop {
+                border: 2px dashed #bbb;
+                border-radius: 8px;
+                padding: 32px 16px;
+                text-align: center;
+                cursor: pointer;
+                background: #fff;
+                transition:
+                    border-color 0.2s,
+                    background 0.2s;
+                margin-bottom: 12px;
+            }
+            #drop.over {
+                border-color: #333;
+                background: #eef6ee;
+            }
+            #drop p {
+                pointer-events: none;
+            }
+            #drop .hint {
+                color: #888;
+                font-size: 0.85em;
+                margin-top: 6px;
+            }
+            #fin {
+                display: none;
+            }
+            #bar {
+                height: 6px;
+                border-radius: 3px;
+                background: #ddd;
+                margin-bottom: 4px;
+                overflow: hidden;
+            }
+            #bar > div {
+                height: 100%;
+                width: 0;
+                background: #3a3;
+                border-radius: 3px;
+                transition: width 0.15s;
+            }
+            #status {
+                font-size: 0.85em;
+                color: #666;
+                min-height: 1.2em;
+                margin-bottom: 12px;
+                word-break: break-all;
+            }
+            #status.err {
+                color: #c33;
+            }
+            #status.ok {
+                color: #2a2;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 0.9em;
+            }
+            th {
+                text-align: left;
+                border-bottom: 1px solid #ccc;
+                padding: 6px 4px;
+                color: #777;
+                font-weight: 500;
+            }
+            td {
+                padding: 6px 4px;
+                border-bottom: 1px solid #e5e5e5;
+            }
+            .sz {
+                text-align: right;
+                white-space: nowrap;
+                color: #888;
+            }
+            .del {
+                background: none;
+                border: 1px solid #ccc;
+                color: #c33;
+                border-radius: 4px;
+                padding: 2px 8px;
+                cursor: pointer;
+                font-size: 0.85em;
+            }
+            .del:hover {
+                background: #c33;
+                color: #fff;
+            }
+            #empty {
+                color: #999;
+                padding: 24px 0;
+                text-align: center;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Pulp</h1>
+
+        <div id="drop" onclick="fin.click()">
+            <p>Drop files here or tap to browse</p>
+            <p class="hint">.epub &middot; .txt &middot; any file</p>
+        </div>
+        <input type="file" id="fin" multiple onchange="upload(this.files)" />
+        <div id="bar"><div id="fill"></div></div>
+        <div id="status"></div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th class="sz">Size</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="list"></tbody>
+        </table>
+        <div id="empty"></div>
+
+        <script>
+            var D = document,
+                drop = D.getElementById("drop"),
+                list = D.getElementById("list"),
+                fill = D.getElementById("fill"),
+                st = D.getElementById("status"),
+                empty = D.getElementById("empty"),
+                queue = [],
+                busy = 0;
+
+            function s(msg, cls) {
+                st.textContent = msg;
+                st.className = cls || "";
+            }
+
+            function fmt(b) {
+                if (b < 1024) return b + " B";
+                if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+                return (b / 1048576).toFixed(1) + " MB";
+            }
+
+            function load(retries, delay) {
+                if (retries === undefined) retries = 3;
+                if (delay === undefined) delay = 400;
+                var x = new XMLHttpRequest();
+                x.timeout = 5000;
+                x.open("GET", "/files");
+                x.onload = function () {
+                    if (x.status !== 200) {
+                        list.innerHTML = "";
+                        empty.textContent = "Could not list files";
+                        return;
+                    }
+                    var f;
+                    try {
+                        f = JSON.parse(x.responseText);
+                    } catch (e) {
+                        empty.textContent = "Bad response";
+                        return;
+                    }
+                    list.innerHTML = "";
+                    if (!f.length) {
+                        empty.textContent = "No files on device";
+                        return;
+                    }
+                    empty.textContent = "";
+                    for (var i = 0; i < f.length; i++)
+                        (function (n) {
+                            var tr = D.createElement("tr"),
+                                td1 = D.createElement("td"),
+                                td2 = D.createElement("td"),
+                                td3 = D.createElement("td"),
+                                btn = D.createElement("button");
+                            td1.textContent = n.name;
+                            td2.textContent = fmt(n.size);
+                            td2.className = "sz";
+                            btn.textContent = "\u00d7";
+                            btn.className = "del";
+                            btn.title = "Delete " + n.name;
+                            btn.onclick = function () {
+                                del(n.name, tr);
+                            };
+                            td3.appendChild(btn);
+                            tr.appendChild(td1);
+                            tr.appendChild(td2);
+                            tr.appendChild(td3);
+                            list.appendChild(tr);
+                        })(f[i]);
+                };
+                x.onerror = x.ontimeout = function () {
+                    if (retries > 0) {
+                        setTimeout(function () {
+                            load(retries - 1, Math.min(delay * 2, 3000));
+                        }, delay);
+                    } else {
+                        empty.textContent = "Connection error";
+                    }
+                };
+                x.send();
+            }
+
+            function del(name, tr) {
+                if (!confirm("Delete " + name + "?")) return;
+                var x = new XMLHttpRequest();
+                x.open("POST", "/delete");
+                x.setRequestHeader("Content-Type", "text/plain");
+                x.onload = function () {
+                    if (x.status === 200) {
+                        tr.remove();
+                        if (!list.children.length)
+                            empty.textContent = "No files on device";
+                        s(name + " deleted", "ok");
+                    } else s("Delete failed: " + x.responseText, "err");
+                };
+                x.onerror = function () {
+                    s("Delete failed: network error", "err");
+                };
+                x.send(name);
+            }
+
+            function upload(files) {
+                for (var i = 0; i < files.length; i++) queue.push(files[i]);
+                fin.value = "";
+                pump();
+            }
+
+            function pump() {
+                if (busy || !queue.length) return;
+                busy = 1;
+                var f = queue.shift(),
+                    rest = queue.length,
+                    fd = new FormData();
+                fd.append("file", f);
+                var x = new XMLHttpRequest();
+                x.open("POST", "/upload");
+                x.upload.onprogress = function (e) {
+                    if (e.lengthComputable) {
+                        var pct = Math.round((100 * e.loaded) / e.total);
+                        fill.style.width = pct + "%";
+                        s(
+                            "Uploading " +
+                                f.name +
+                                "... " +
+                                pct +
+                                "%" +
+                                (rest ? " (" + rest + " queued)" : ""),
+                        );
+                    }
+                };
+                x.onload = function () {
+                    busy = 0;
+                    if (x.status === 200) {
+                        fill.style.width = "100%";
+                        s(
+                            f.name +
+                                " uploaded" +
+                                (rest ? " \u2014 " + rest + " remaining" : ""),
+                            "ok",
+                        );
+                        setTimeout(function () {
+                            load();
+                        }, 300);
+                    } else {
+                        s(
+                            "Upload failed: " +
+                                (x.responseText || "server error"),
+                            "err",
+                        );
+                    }
+                    setTimeout(function () {
+                        fill.style.width = "0";
+                    }, 800);
+                    pump();
+                };
+                x.onerror = function () {
+                    busy = 0;
+                    fill.style.width = "0";
+                    s("Upload failed: network error", "err");
+                    pump();
+                };
+                x.send(fd);
+            }
+
+            // drag and drop
+            drop.ondragover = drop.ondragenter = function (e) {
+                e.preventDefault();
+                drop.classList.add("over");
+            };
+            drop.ondragleave = function (e) {
+                e.preventDefault();
+                drop.classList.remove("over");
+            };
+            drop.ondrop = function (e) {
+                e.preventDefault();
+                drop.classList.remove("over");
+                if (e.dataTransfer.files.length) upload(e.dataTransfer.files);
+            };
+
+            // wait for page to fully load so the GET / TCP connection is
+            // closed and the single-connection server can accept /files
+            window.onload = function () {
+                load();
+            };
+        </script>
+    </body>
+</html>
