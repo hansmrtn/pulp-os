@@ -26,13 +26,13 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt};
+use smol_epub::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
     BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF,
     QUOTE_ON,
 };
-use smol_epub::png::DecodedImage;
 use smol_epub::zip::{self, ZipIndex};
 
 const MARGIN: u16 = 8;

@@ -1,15 +1,21 @@
-// Minimal PNG decoder for monochrome e-ink display.
-// Decodes to 1-bit Floyd-Steinberg dithered bitmap; streams row-by-row
-// through miniz_oxide; peak RAM ~90KB (32KB dict + 11KB decomp + bitmap).
-// Colour types: 0=greyscale, 2=RGB, 3=palette, 4=grey+alpha, 6=RGBA.
-// Interlaced (Adam7) rejected; rare in EPUB and doubles code complexity.
-// Output packed 1-bit MSB-first, row-major; pass to StripBuffer::blit_1bpp.
+//! Minimal PNG decoder producing 1-bit Floyd–Steinberg dithered bitmaps.
+//!
+//! Streams row-by-row through `miniz_oxide`; peak RAM ≈ 90 KB
+//! (32 KB dictionary + 11 KB decompressor + output bitmap).
+//!
+//! Supported colour types: greyscale, RGB, palette, grey+alpha, RGBA.
+//! Interlaced (Adam7) images are rejected (rare in EPUB content and
+//! would double code complexity).
+//!
+//! Output is packed 1-bit MSB-first, row-major — see [`DecodedImage`](crate::DecodedImage).
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+
+use crate::DecodedImage;
 
 // PNG constants
 
@@ -37,27 +43,13 @@ const MAX_PIXELS: u32 = 800 * 800;
 // miniz_oxide LZ dictionary size; must be a power of two >= 32768
 const DICT_SIZE: usize = 32_768;
 
-// public types
-
-// decoded 1-bit image, packed MSB-first, row-major.
-// set bit = black (ink); clear bit = white (paper).
-pub struct DecodedImage {
-    pub width: u16,
-    pub height: u16,
-    pub data: Vec<u8>, // stride * height bytes
-    pub stride: usize, // bytes per row: ceil(width / 8)
-}
-
-// backward-compatible alias
+/// Backward-compatible alias for [`DecodedImage`](crate::DecodedImage).
 pub type PngImage = DecodedImage;
 
-// decode a PNG buffer to a 1-bit dithered bitmap;
-// images wider or taller than max_w/max_h are nearest-neighbour down-scaled
-pub fn decode_png(data: &[u8]) -> Result<DecodedImage, &'static str> {
-    decode_png_fit(data, 800, 480)
-}
-
-// decode, scaling down by integer factor so result fits inside max_w x max_h
+/// Decode a PNG from an in-memory buffer to a 1-bit dithered bitmap.
+///
+/// The image is integer-downscaled so the result fits within
+/// `max_w` × `max_h` pixels.
 pub fn decode_png_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImage, &'static str> {
     let header = parse_ihdr(data)?;
     let idat = collect_idat(data)?;
@@ -223,13 +215,14 @@ pub fn decode_png_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImag
     })
 }
 
-// streaming PNG decoders: decode PNG images from ZIP entries without
-// extracting to a contiguous buffer; IDAT fed directly into zlib row-by-row
+// ── streaming PNG decoders ──────────────────────────────────────────
+// Decode PNG images from ZIP entries without extracting to a contiguous
+// buffer; IDAT data is fed directly into zlib row-by-row.
 
-// chunk size for streaming SD reads
-const SD_READ_BUF: usize = 4096;
+/// Read-chunk size used by the streaming decoders (bytes).
+const STREAMING_READ_BUF: usize = 4096;
 
-// DEFLATE sliding-window for outer ZIP decompression
+/// DEFLATE sliding-window for outer ZIP decompression (bytes).
 const ZIP_DEFLATE_WINDOW: usize = 32_768;
 
 // sequential byte source for streaming PNG decoder
@@ -247,14 +240,14 @@ trait ReadExact {
     }
 }
 
-// reads sequentially from a STORED ZIP entry on SD
-struct SdSource<F> {
+// reads sequentially from a STORED ZIP entry via a user-supplied closure
+struct StoredSource<F> {
     read_fn: F,
     offset: u32,
     end: u32,
 }
 
-impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> ReadExact for SdSource<F> {
+impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> ReadExact for StoredSource<F> {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), &'static str> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -283,7 +276,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> ReadExact for SdSo
     }
 }
 
-// reads sequentially from a DEFLATE-compressed ZIP entry on SD
+// reads sequentially from a DEFLATE-compressed ZIP entry via a user-supplied closure
 struct DeflateSource<F> {
     read_fn: F,
     file_pos: u32,
@@ -316,9 +309,9 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateSource<F> {
         window.resize(ZIP_DEFLATE_WINDOW, 0);
 
         let mut rbuf = Vec::new();
-        rbuf.try_reserve_exact(SD_READ_BUF)
+        rbuf.try_reserve_exact(STREAMING_READ_BUF)
             .map_err(|_| "png: OOM for DEFLATE read buffer")?;
-        rbuf.resize(SD_READ_BUF, 0);
+        rbuf.resize(STREAMING_READ_BUF, 0);
 
         Ok(Self {
             read_fn,
@@ -343,8 +336,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateSource<F> {
             return Ok(());
         }
 
-        if self.in_avail < SD_READ_BUF && self.comp_left > 0 {
-            let space = SD_READ_BUF - self.in_avail;
+        if self.in_avail < STREAMING_READ_BUF && self.comp_left > 0 {
+            let space = STREAMING_READ_BUF - self.in_avail;
             let want = space.min(self.comp_left);
             match (self.read_fn)(
                 self.file_pos,
@@ -358,7 +351,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateSource<F> {
                 Ok(_) => {
                     self.comp_left = 0;
                 }
-                Err(_) => return Err("png: SD read failed during DEFLATE"),
+                Err(_) => return Err("png: read failed during DEFLATE"),
             }
         }
 
@@ -422,6 +415,30 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> ReadExact for Defl
 }
 
 // decode a PNG from a STORED ZIP entry by streaming from SD
+/// Decode a PNG from a **stored** (uncompressed) ZIP entry by streaming
+/// reads through `read_fn`.
+///
+/// `read_fn(offset, buf)` reads bytes at the given absolute offset and
+/// returns the number of bytes actually read.
+pub fn decode_png_streaming<F>(
+    read_fn: F,
+    data_offset: u32,
+    data_size: u32,
+    max_w: u16,
+    max_h: u16,
+) -> Result<DecodedImage, &'static str>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    let mut src = StoredSource {
+        read_fn,
+        offset: data_offset,
+        end: data_offset + data_size,
+    };
+    decode_png_from(&mut src, max_w, max_h)
+}
+
+/// Backward-compatible alias for [`decode_png_streaming`].
 pub fn decode_png_sd<F>(
     read_fn: F,
     data_offset: u32,
@@ -432,16 +449,15 @@ pub fn decode_png_sd<F>(
 where
     F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
 {
-    let mut src = SdSource {
-        read_fn,
-        offset: data_offset,
-        end: data_offset + data_size,
-    };
-    decode_png_from(&mut src, max_w, max_h)
+    decode_png_streaming(read_fn, data_offset, data_size, max_w, max_h)
 }
 
-// decode a PNG from a DEFLATE-compressed ZIP entry by streaming
-pub fn decode_png_deflate_sd<F>(
+/// Decode a PNG from a **DEFLATE-compressed** ZIP entry by streaming
+/// reads through `read_fn`.
+///
+/// Both ZIP decompression and PNG IDAT inflation are streamed
+/// concurrently, so the full entry is never held in memory.
+pub fn decode_png_deflate_streaming<F>(
     read_fn: F,
     data_offset: u32,
     comp_size: u32,
@@ -455,8 +471,23 @@ where
     decode_png_from(&mut src, max_w, max_h)
 }
 
-// core streaming PNG decoder; generic over byte source.
-// reads chunks sequentially, feeds IDAT into zlib row-by-row; never holds full PNG in RAM.
+/// Backward-compatible alias for [`decode_png_deflate_streaming`].
+pub fn decode_png_deflate_sd<F>(
+    read_fn: F,
+    data_offset: u32,
+    comp_size: u32,
+    max_w: u16,
+    max_h: u16,
+) -> Result<DecodedImage, &'static str>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    decode_png_deflate_streaming(read_fn, data_offset, comp_size, max_w, max_h)
+}
+
+/// Core streaming PNG decoder; generic over byte source.
+/// Reads chunks sequentially, feeds IDAT into zlib row-by-row;
+/// never holds the full PNG in RAM.
 fn decode_png_from<R: ReadExact>(
     src: &mut R,
     max_w: u16,
@@ -591,16 +622,16 @@ fn decode_png_from<R: ReadExact>(
     let mut out_y: usize = 0;
 
     // feed IDAT chunks into zlib row-by-row
-    let mut idat_buf = [0u8; SD_READ_BUF];
+    let mut idat_buf = [0u8; STREAMING_READ_BUF];
     let mut in_avail: usize = 0;
     let mut idat_chunk_left = first_idat_len;
     let mut more_idat = true;
 
     loop {
         // top up input buffer from the IDAT stream
-        while in_avail < SD_READ_BUF {
+        while in_avail < STREAMING_READ_BUF {
             if idat_chunk_left > 0 {
-                let space = SD_READ_BUF - in_avail;
+                let space = STREAMING_READ_BUF - in_avail;
                 let want = idat_chunk_left.min(space);
                 src.read_exact(&mut idat_buf[in_avail..in_avail + want])?;
                 in_avail += want;
@@ -685,7 +716,7 @@ fn decode_png_from<R: ReadExact>(
                 if !has_more && in_avail == 0 {
                     return Err("png: truncated IDAT stream");
                 }
-                if consumed == 0 && produced == 0 && in_avail >= SD_READ_BUF {
+                if consumed == 0 && produced == 0 && in_avail >= STREAMING_READ_BUF {
                     return Err("png: IDAT decompression stuck");
                 }
             }

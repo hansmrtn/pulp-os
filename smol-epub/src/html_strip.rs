@@ -1,25 +1,41 @@
-// Single-pass HTML to styled-text converter for EPUB XHTML.
-// HtmlStripStream: streaming feed/finish; emits 2-byte [MARKER, tag] style codes.
-// strip_html_inplace(): in-place variant for container.xml/OPF/TOC.
-// Marker: [0x01, tag]. Inline: B/b I/i. Block: H/h Q/q S(hr).
+//! Single-pass HTML to styled-text converter for EPUB XHTML.
+//!
+//! [`HtmlStripStream`]: streaming `feed`/`finish` interface; emits 2-byte
+//! `[MARKER, tag]` style codes inline with plain text.
+//!
+//! [`strip_html_inplace`]: in-place variant for `container.xml` / OPF / TOC.
+//!
+//! Marker encoding: `[0x01, tag]`. Inline: `B`/`b` `I`/`i`.
+//! Block: `H`/`h` `Q`/`q` `S` (hr). Image: `P` (path follows).
 
 use alloc::vec::Vec;
 
-pub const MARKER: u8 = 0x01; // escape byte for style markers
+/// Escape byte that introduces a 2-byte style marker in the output stream.
+pub const MARKER: u8 = 0x01;
 
+/// Style tag: bold **on** (`[MARKER, BOLD_ON]`).
 pub const BOLD_ON: u8 = b'B';
+/// Style tag: bold **off** (`[MARKER, BOLD_OFF]`).
 pub const BOLD_OFF: u8 = b'b';
+/// Style tag: italic **on** (`[MARKER, ITALIC_ON]`).
 pub const ITALIC_ON: u8 = b'I';
+/// Style tag: italic **off** (`[MARKER, ITALIC_OFF]`).
 pub const ITALIC_OFF: u8 = b'i';
+/// Style tag: heading **on** (`[MARKER, HEADING_ON]`).
 pub const HEADING_ON: u8 = b'H';
+/// Style tag: heading **off** (`[MARKER, HEADING_OFF]`).
 pub const HEADING_OFF: u8 = b'h';
+/// Style tag: block-quote **on** (`[MARKER, QUOTE_ON]`).
 pub const QUOTE_ON: u8 = b'Q';
+/// Style tag: block-quote **off** (`[MARKER, QUOTE_OFF]`).
 pub const QUOTE_OFF: u8 = b'q';
 
-// Standalone
+/// Style tag: thematic break / horizontal rule (`[MARKER, BREAK]`).
 pub const BREAK: u8 = b'S';
-pub const IMG_REF: u8 = b'P'; // image ref: [MARKER, IMG_REF, len, path...]
+/// Style tag: inline image reference (`[MARKER, IMG_REF, len, path…]`).
+pub const IMG_REF: u8 = b'P';
 
+/// Returns `true` if `b` is the [`MARKER`] escape byte.
 #[inline]
 pub const fn is_marker(b: u8) -> bool {
     b == MARKER
@@ -64,7 +80,11 @@ impl Default for HtmlStripStream {
     }
 }
 
-// stateful streaming HTML-to-styled-text converter; ~80 bytes of state
+/// Stateful, streaming HTML-to-styled-text converter (~80 bytes of state).
+///
+/// Feed chunks of EPUB XHTML via [`feed`](Self::feed), then call
+/// [`finish`](Self::finish) to flush any trailing state. The output is
+/// plain text interspersed with 2-byte `[MARKER, tag]` style codes.
 pub struct HtmlStripStream {
     phase: Phase,
 
@@ -116,6 +136,7 @@ pub struct HtmlStripStream {
 }
 
 impl HtmlStripStream {
+    /// Create a new stream in its initial state.
     pub const fn new() -> Self {
         Self {
             phase: Phase::Text,
@@ -147,7 +168,10 @@ impl HtmlStripStream {
         }
     }
 
-    // process a chunk of HTML; returns (consumed, written); call again if input not fully consumed
+    /// Process a chunk of HTML input.
+    ///
+    /// Returns `(consumed, written)`. If `consumed < input.len()`, call
+    /// again with the remaining input (the output buffer was full).
     pub fn feed(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize) {
         let ilen = input.len();
         let olen = output.len();
@@ -572,7 +596,8 @@ impl HtmlStripStream {
         }
     }
 
-    // flush pending state; append terminal newline if content was produced; return bytes written
+    /// Flush any pending state and append a terminal newline if content
+    /// was produced. Returns the number of bytes written to `output`.
     pub fn finish(&mut self, output: &mut [u8]) -> usize {
         let mut op: usize = 0;
 
@@ -756,8 +781,11 @@ impl HtmlStripStream {
     }
 }
 
-// in-place HTML stripper: operates on a complete buffer, produces plain text
-// without style markers. write cursor never passes read cursor (w <= r always).
+/// Strip HTML tags from a complete buffer **in place**, producing plain text
+/// without style markers.
+///
+/// The write cursor never passes the read cursor, so no extra allocation
+/// is needed.
 pub fn strip_html_inplace(buf: &mut Vec<u8>) {
     let len = buf.len();
     if len == 0 {

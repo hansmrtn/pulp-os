@@ -1,6 +1,8 @@
-// ZIP central directory parser and streaming entry extraction.
-// ZipIndex: 256 entries inline (~5KB); names heap-allocated during parse.
-// DEFLATE in 4KB chunks; try_reserve throughout for graceful OOM.
+//! ZIP central-directory parser and streaming entry extraction.
+//!
+//! [`ZipIndex`] holds up to 256 entries inline (~5 KB); entry names are
+//! heap-allocated during parse. DEFLATE decompression streams in 4 KB
+//! chunks; `try_reserve` is used throughout for graceful OOM handling.
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -12,7 +14,9 @@ const EOCD_SIG: u32 = 0x0605_4b50;
 const CD_SIG: u32 = 0x0201_4b50;
 const LOCAL_SIG: u32 = 0x0403_4b50;
 
+/// ZIP compression method: stored (no compression).
 pub const METHOD_STORED: u16 = 0;
+/// ZIP compression method: DEFLATE.
 pub const METHOD_DEFLATE: u16 = 8;
 
 #[inline]
@@ -25,13 +29,20 @@ fn le_u32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
+/// A single entry in the ZIP central directory.
 #[derive(Clone, Copy)]
 pub struct ZipEntry {
+    /// Byte offset into the name pool where this entry's name starts.
     pub name_start: u16,
+    /// Length of the entry name in bytes.
     pub name_len: u16,
+    /// Byte offset of the local file header in the ZIP file.
     pub local_offset: u32,
+    /// Compressed size in bytes.
     pub comp_size: u32,
+    /// Uncompressed size in bytes.
     pub uncomp_size: u32,
+    /// Compression method ([`METHOD_STORED`] or [`METHOD_DEFLATE`]).
     pub method: u16,
 }
 
@@ -46,8 +57,13 @@ impl ZipEntry {
     };
 }
 
+/// Maximum number of entries the [`ZipIndex`] can hold.
 pub const MAX_ENTRIES: usize = 256;
 
+/// In-memory index of a ZIP archive's central directory.
+///
+/// Holds up to [`MAX_ENTRIES`] entries inline (~5 KB); entry names are
+/// stored in a single heap-allocated byte pool.
 pub struct ZipIndex {
     entries: [ZipEntry; MAX_ENTRIES],
     count: u16,
@@ -61,6 +77,7 @@ impl Default for ZipIndex {
 }
 
 impl ZipIndex {
+    /// Create a new, empty index.
     pub const fn new() -> Self {
         Self {
             entries: [ZipEntry::EMPTY; MAX_ENTRIES],
@@ -69,12 +86,17 @@ impl ZipIndex {
         }
     }
 
+    /// Remove all entries and free the name pool.
     pub fn clear(&mut self) {
         self.count = 0;
         self.names = Vec::new();
     }
 
-    // parse EOCD from file tail; return (cd_offset, cd_size)
+    /// Parse the End-of-Central-Directory record from the last bytes of a
+    /// ZIP file. Returns `(cd_offset, cd_size)`.
+    ///
+    /// `tail` should be the final ≤ 65557 bytes of the file (22 bytes is
+    /// the minimum for a ZIP with no comment).
     pub fn parse_eocd(tail: &[u8], file_size: u32) -> Result<(u32, u32), &'static str> {
         if tail.len() < 22 {
             return Err("zip: tail too short for EOCD");
@@ -101,7 +123,8 @@ impl ZipIndex {
         Ok((cd_offset, cd_size))
     }
 
-    // parse central directory into entry index
+    /// Parse a central-directory blob into this index, replacing any
+    /// previously stored entries.
     pub fn parse_central_directory(&mut self, cd: &[u8]) -> Result<(), &'static str> {
         self.count = 0;
         self.names.clear();
@@ -158,17 +181,20 @@ impl ZipIndex {
         Ok(())
     }
 
+    /// Number of entries in the index.
     #[inline]
     pub fn count(&self) -> usize {
         self.count as usize
     }
 
+    /// Return a reference to the entry at `idx`. Panics if out of range.
     #[inline]
     pub fn entry(&self, idx: usize) -> &ZipEntry {
         assert!(idx < self.count as usize);
         &self.entries[idx]
     }
 
+    /// Return the filename of the entry at `idx` as a `&str`.
     pub fn entry_name(&self, idx: usize) -> &str {
         let e = self.entry(idx);
         let start = e.name_start as usize;
@@ -176,6 +202,7 @@ impl ZipIndex {
         core::str::from_utf8(&self.names[start..end]).unwrap_or("")
     }
 
+    /// Find an entry by exact (case-sensitive) name. Returns its index.
     pub fn find(&self, name: &str) -> Option<usize> {
         let name_bytes = name.as_bytes();
         for i in 0..self.count as usize {
@@ -189,6 +216,7 @@ impl ZipIndex {
         None
     }
 
+    /// Find an entry by case-insensitive ASCII name. Returns its index.
     pub fn find_icase(&self, name: &str) -> Option<usize> {
         let target = name.as_bytes();
         for i in 0..self.count as usize {
@@ -203,7 +231,8 @@ impl ZipIndex {
         None
     }
 
-    // bytes past local file header to entry data
+    /// Given the first 30+ bytes of a local file header, return the number
+    /// of bytes to skip past the header to reach the entry's data.
     pub fn local_header_data_skip(header: &[u8]) -> Result<u32, &'static str> {
         if header.len() < 30 {
             return Err("zip: local header too short");
@@ -217,8 +246,12 @@ impl ZipIndex {
     }
 }
 
-// entry extraction
+// ── entry extraction ────────────────────────────────────────────────
 
+/// Extract a complete ZIP entry into a heap-allocated `Vec<u8>`.
+///
+/// Supports both stored and DEFLATE-compressed entries. The `read_fn`
+/// closure reads bytes at a given absolute offset.
 pub fn extract_entry<E, F>(
     entry: &ZipEntry,
     local_offset: u32,

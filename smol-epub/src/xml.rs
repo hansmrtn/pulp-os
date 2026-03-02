@@ -1,7 +1,12 @@
-// Minimal XML tag/attribute scanner for EPUB metadata.
-// Not a general parser; handles container.xml and OPF only.
-// Single-pass, forward-only, namespace-aware, lenient.
+//! Minimal XML tag/attribute scanner for EPUB metadata.
+//!
+//! Not a general-purpose XML parser — handles `container.xml` and OPF
+//! documents only. Single-pass, forward-only, namespace-aware, lenient.
 
+/// Extract the value of an attribute from a raw XML opening-tag byte slice.
+///
+/// `tag_bytes` should start at the tag name (after `<`) and end before `>`.
+/// Returns `None` if the attribute is not found.
 pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
     let len = tag_bytes.len();
@@ -69,7 +74,8 @@ pub fn get_attr<'a>(tag_bytes: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-// text of first element matching tag_name (namespace-aware)
+/// Return the text content of the first element whose local name matches
+/// `tag_name` (namespace-aware: `dc:title` matches `title`).
 pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
 
@@ -121,7 +127,9 @@ pub fn tag_text<'a>(data: &'a [u8], tag_name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-// invoke cb for every opening tag matching tag_name (namespace-aware)
+/// Invoke `cb` for every opening tag whose local name matches `tag_name`
+/// (namespace-aware). The callback receives the tag body bytes (from the
+/// tag name up to but not including `>`).
 pub fn for_each_tag<'a>(data: &'a [u8], tag_name: &[u8], mut cb: impl FnMut(&'a [u8])) {
     let mut pos = 0;
 

@@ -1,22 +1,32 @@
-// EPUB structure parser: container.xml -> OPF -> spine + metadata.
-// container.xml gives the OPF path; the OPF gives metadata, a
-// manifest (id->href), and a spine (ordered idrefs). Spine idrefs
-// are resolved through the manifest to ZIP entry indices.
+//! EPUB structure parser: `container.xml` → OPF → spine + metadata.
+//!
+//! `container.xml` gives the OPF path; the OPF gives metadata, a
+//! manifest (`id` → `href`), and a spine (ordered `idref`s). Spine
+//! references are resolved through the manifest to ZIP entry indices.
 
 use alloc::vec::Vec;
 
 use crate::xml;
 use crate::zip::ZipIndex;
 
+/// Maximum byte length of an EPUB title.
 pub const TITLE_CAP: usize = 96;
+/// Maximum byte length of an EPUB author name.
 pub const AUTHOR_CAP: usize = 64;
+/// Maximum number of spine entries (reading-order items).
 pub const MAX_SPINE: usize = 256;
+/// Maximum byte length of the OPF file path inside the ZIP.
 pub const OPF_PATH_CAP: usize = 256;
 
+/// EPUB book metadata (title and author), stored inline with fixed-size buffers.
 pub struct EpubMeta {
+    /// Raw UTF-8 bytes of the title (up to [`TITLE_CAP`] bytes).
     pub title: [u8; TITLE_CAP],
+    /// Number of valid bytes in [`title`](Self::title).
     pub title_len: u8,
+    /// Raw UTF-8 bytes of the author name (up to [`AUTHOR_CAP`] bytes).
     pub author: [u8; AUTHOR_CAP],
+    /// Number of valid bytes in [`author`](Self::author).
     pub author_len: u8,
 }
 
@@ -27,6 +37,7 @@ impl Default for EpubMeta {
 }
 
 impl EpubMeta {
+    /// Create a new, empty `EpubMeta`.
     pub const fn new() -> Self {
         Self {
             title: [0u8; TITLE_CAP],
@@ -36,10 +47,12 @@ impl EpubMeta {
         }
     }
 
+    /// Return the title as a `&str`, or `""` if it is not valid UTF-8.
     pub fn title_str(&self) -> &str {
         core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or("")
     }
 
+    /// Return the author as a `&str`, or `""` if it is not valid UTF-8.
     pub fn author_str(&self) -> &str {
         core::str::from_utf8(&self.author[..self.author_len as usize]).unwrap_or("")
     }
@@ -57,8 +70,11 @@ impl EpubMeta {
     }
 }
 
+/// The EPUB reading-order spine: an ordered list of ZIP entry indices.
 pub struct EpubSpine {
+    /// ZIP entry indices in reading order.
     pub items: [u16; MAX_SPINE],
+    /// Number of valid entries in [`items`](Self::items).
     pub count: u16,
 }
 
@@ -69,6 +85,7 @@ impl Default for EpubSpine {
 }
 
 impl EpubSpine {
+    /// Create a new, empty spine.
     pub const fn new() -> Self {
         Self {
             items: [0u16; MAX_SPINE],
@@ -77,43 +94,55 @@ impl EpubSpine {
     }
 
     #[inline]
+    /// Number of items in the spine.
     pub fn len(&self) -> usize {
         self.count as usize
     }
 
     #[inline]
+    /// Returns `true` if the spine contains no items.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 }
 
-// table of contents
+// ── table of contents ───────────────────────────────────────────────
 
+/// Maximum number of entries in the table of contents.
 pub const MAX_TOC: usize = 128;
+/// Maximum byte length of a single TOC entry title.
 pub const TOC_TITLE_CAP: usize = 48;
 
+/// A single entry in the EPUB table of contents.
 #[derive(Clone, Copy)]
 pub struct TocEntry {
+    /// Raw UTF-8 bytes of the entry title.
     pub title: [u8; TOC_TITLE_CAP],
+    /// Number of valid bytes in [`title`](Self::title).
     pub title_len: u8,
-    // index into EpubSpine::items; 0xFFFF = unresolved
+    /// Index into [`EpubSpine::items`]; `0xFFFF` means unresolved.
     pub spine_idx: u16,
 }
 
 impl TocEntry {
+    /// An empty, unresolved TOC entry.
     pub const EMPTY: Self = Self {
         title: [0u8; TOC_TITLE_CAP],
         title_len: 0,
         spine_idx: 0xFFFF,
     };
 
+    /// Return the entry title as a `&str`, or `""` if not valid UTF-8.
     pub fn title_str(&self) -> &str {
         core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or("")
     }
 }
 
+/// EPUB table of contents (flat list of [`TocEntry`] items).
 pub struct EpubToc {
+    /// TOC entries in document order.
     pub entries: [TocEntry; MAX_TOC],
+    /// Number of valid entries.
     pub count: u16,
 }
 
@@ -124,6 +153,7 @@ impl Default for EpubToc {
 }
 
 impl EpubToc {
+    /// Create a new, empty table of contents.
     pub const fn new() -> Self {
         Self {
             entries: [TocEntry::EMPTY; MAX_TOC],
@@ -131,16 +161,19 @@ impl EpubToc {
         }
     }
 
+    /// Remove all entries.
     pub fn clear(&mut self) {
         self.count = 0;
     }
 
     #[inline]
+    /// Number of entries in the TOC.
     pub fn len(&self) -> usize {
         self.count as usize
     }
 
     #[inline]
+    /// Returns `true` if the TOC contains no entries.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
@@ -159,14 +192,17 @@ impl EpubToc {
     }
 }
 
-// where the TOC data lives inside the EPUB ZIP
+/// Identifies where the table-of-contents data lives inside the EPUB ZIP.
 #[derive(Clone, Copy, Debug)]
 pub enum TocSource {
-    Ncx(usize), // EPUB 2
-    Nav(usize), // EPUB 3
+    /// EPUB 2 NCX document (ZIP entry index).
+    Ncx(usize),
+    /// EPUB 3 Navigation Document (ZIP entry index).
+    Nav(usize),
 }
 
 impl TocSource {
+    /// Return the ZIP entry index regardless of variant.
     pub fn zip_index(&self) -> usize {
         match *self {
             TocSource::Ncx(i) | TocSource::Nav(i) => i,
@@ -175,6 +211,9 @@ impl TocSource {
 }
 
 // parse container.xml to find the OPF path; write into out
+/// Parse `META-INF/container.xml` and extract the OPF file path.
+///
+/// Writes the path into `out` and returns its byte length.
 pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usize, &'static str> {
     let mut found_len: Option<usize> = None;
 
@@ -192,9 +231,11 @@ pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usiz
     found_len.ok_or("epub: no rootfile full-path in container.xml")
 }
 
-// parse OPF: extract metadata and build the reading-order spine as ZIP entry indices.
-// Two-pass, zero heap: phase 1 collects idref byte offsets (MAX_SPINE*4 = 1KB stack);
-// phase 2 resolves each idref to a manifest href and then a ZIP index.
+/// Parse an OPF document: extract metadata and build the reading-order spine.
+///
+/// Two-pass, zero heap: phase 1 collects `idref` byte offsets
+/// (`MAX_SPINE` × 4 = 1 KB stack); phase 2 resolves each `idref`
+/// through the manifest to a ZIP entry index.
 pub fn parse_opf(
     opf: &[u8],
     opf_dir: &str,
@@ -284,6 +325,10 @@ pub fn parse_opf(
 }
 
 // locate TOC in ZIP: EPUB 3 nav first, EPUB 2 NCX fallback
+/// Search the OPF manifest for a table-of-contents source.
+///
+/// Tries, in order: EPUB 3 `<item properties="nav">`, EPUB 2
+/// `<spine toc="id">`, and a media-type fallback for NCX files.
 pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocSource> {
     let mut path_buf = [0u8; 512];
 
@@ -400,7 +445,10 @@ pub fn find_toc_source(opf: &[u8], opf_dir: &str, zip: &ZipIndex) -> Option<TocS
     None
 }
 
-// dispatch TOC parse by format (NCX vs nav)
+/// Parse a TOC document (NCX or Navigation Document) into `toc`.
+///
+/// Dispatches to [`parse_ncx_toc`] or [`parse_nav_toc`] based on
+/// the [`TocSource`] variant.
 pub fn parse_toc(
     source: TocSource,
     data: &[u8],
@@ -415,7 +463,9 @@ pub fn parse_toc(
     }
 }
 
-// parse EPUB 2 NCX into flat TOC entries (nested navPoints flattened)
+/// Parse an EPUB 2 NCX document into flat TOC entries.
+///
+/// Nested `<navPoint>` elements are flattened into a linear list.
 pub fn parse_ncx_toc(
     ncx: &[u8],
     ncx_dir: &str,
@@ -497,7 +547,10 @@ pub fn parse_ncx_toc(
     }
 }
 
-// parse EPUB 3 nav document; extract <a> entries, flatten nested <ol>
+/// Parse an EPUB 3 Navigation Document into flat TOC entries.
+///
+/// Extracts `<a>` elements from the `<nav epub:type="toc">` region
+/// and flattens nested `<ol>` lists.
 pub fn parse_nav_toc(
     nav: &[u8],
     nav_dir: &str,
@@ -787,8 +840,12 @@ fn toc_trim_ws(data: &[u8]) -> &[u8] {
     if start >= end { &[] } else { &data[start..end] }
 }
 
-// -- path helpers --
+// ── path helpers ────────────────────────────────────────────────────
 
+/// Resolve a relative `href` against `base_dir`, writing the result
+/// into `out`. Returns the number of bytes written.
+///
+/// Handles `../` segments, leading `./`, and absolute paths.
 pub fn resolve_path(base_dir: &str, href: &str, out: &mut [u8; 512]) -> usize {
     let href = href.split('#').next().unwrap_or(href);
 
@@ -893,7 +950,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-// check if filename looks like an EPUB (.epub or .epu for FAT 8.3 truncation)
+/// Check if a filename looks like an EPUB (`.epub` or `.epu` for FAT 8.3 truncation).
 pub fn is_epub_filename(name: &str) -> bool {
     let b = name.as_bytes();
 

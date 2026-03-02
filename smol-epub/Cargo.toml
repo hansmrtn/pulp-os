@@ -1,10 +1,14 @@
 [package]
 name = "smol-epub"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.0"
-description = "Minimal no_std EPUB parser with streaming image decoders"
+description = "Minimal no_std EPUB parser with streaming decompression, HTML stripping, and optional 1-bit image decoders"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/pluots/smol-epub"
+keywords = ["epub", "no_std", "embedded", "e-ink", "ebook"]
+categories = ["no-std", "parser-implementations", "embedded"]
+readme = "README.md"
 
 [dependencies]
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

@@ -1,9 +1,13 @@
-// Baseline JPEG decoder for e-ink display.
-// Streams MCU-row-by-row via ChunkReader (4KB chunks from SD); peak RAM ~30KB.
-// Luminance (Y) only; chrominance Huffman-decoded to advance bitstream, discarded.
-// Progressive JPEG (SOF2) partially supported: first scan only (DC + low-freq AC).
-// Full progressive not feasible: ~1.5MB coefficient buffer exceeds ESP32-C3 heap.
-// Output: png::DecodedImage, packed 1-bit MSB-first, Floyd-Steinberg dithered.
+//! Minimal baseline JPEG decoder producing 1-bit Floyd–Steinberg dithered bitmaps.
+//!
+//! Streams MCU-row-by-row via 4 KB chunked reads; peak RAM ≈ 30 KB.
+//! Luminance (Y) channel only — chrominance is Huffman-decoded to
+//! advance the bitstream, then discarded.
+//!
+//! Progressive JPEG (SOF2) is partially supported: first scan only
+//! (DC + low-frequency AC).
+//!
+//! Output is packed 1-bit MSB-first, row-major — see [`DecodedImage`](crate::DecodedImage).
 
 extern crate alloc;
 
@@ -11,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::png::DecodedImage;
+use crate::DecodedImage;
 
 // JPEG marker bytes
 
@@ -34,7 +38,7 @@ const MAX_PIXELS: u32 = 2048 * 2048;
 // header bytes to read for marker parsing; large APP/EXIF segments skipped by length
 const HEADER_READ: usize = 32768;
 
-// chunk size for streaming SD reads during MCU decode
+// chunk size for streaming reads during MCU decode
 const CHUNK_SIZE: usize = 4096;
 
 // DEFLATE sliding-window size for streaming ZIP decompression
@@ -175,7 +179,7 @@ impl JpegRead for SliceReader<'_> {
 // reads from SD via closure, buffering 4KB chunks
 struct ChunkReader<F> {
     read_fn: F,
-    offset: u32, // absolute SD offset of next byte to fetch
+    offset: u32, // absolute offset of next byte to fetch
     end: u32,    // end-of-data offset (exclusive)
     buf: [u8; CHUNK_SIZE],
     pos: usize,
@@ -234,7 +238,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Chunk
 // peak heap: ~47KB (11KB decompressor + 32KB window + 4KB read buf).
 struct DeflateReader<F> {
     read_fn: F,
-    file_pos: u32,    // absolute SD offset of next compressed byte
+    file_pos: u32,    // absolute offset of next compressed byte
     comp_left: usize, // compressed bytes remaining in ZIP entry
     rbuf: Vec<u8>,    // compressed-data read buffer
     in_avail: usize,  // valid bytes in rbuf
@@ -515,6 +519,10 @@ impl<R: JpegRead> BitReader<R> {
 // public API
 
 // decode a baseline JPEG from an in-memory buffer
+/// Decode a JPEG from an in-memory buffer to a 1-bit dithered bitmap.
+///
+/// The image is integer-downscaled so the result fits within
+/// `max_w` × `max_h` pixels.
 pub fn decode_jpeg_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImage, &'static str> {
     let st = parse_markers(data)?;
 
@@ -524,9 +532,13 @@ pub fn decode_jpeg_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedIma
     decode_baseline(&st, BitReader::new(reader), max_w, max_h)
 }
 
-// decode a JPEG by streaming 4KB chunks from SD.
-// read_fn(abs_offset, buf) -> Ok(bytes_read). progressive = first scan only.
-pub fn decode_jpeg_sd<F>(
+/// Decode a JPEG from a **stored** (uncompressed) ZIP entry by streaming
+/// 4 KB chunks through `read_fn`.
+///
+/// `read_fn(offset, buf)` reads bytes at the given absolute offset and
+/// returns the number of bytes actually read. Progressive JPEGs are
+/// decoded using the first scan only.
+pub fn decode_jpeg_streaming<F>(
     mut read_fn: F,
     data_offset: u32,
     data_size: u32,
@@ -559,9 +571,26 @@ where
     decode_baseline(&st, BitReader::new(reader), max_w, max_h)
 }
 
-// decode a DEFLATE-compressed JPEG from SD, streaming both decompression and MCU decode.
-// peak heap: ~79KB (47KB deflate reader + 32KB header buf + ~30KB decode bufs).
-pub fn decode_jpeg_deflate_sd<F>(
+/// Backward-compatible alias for [`decode_jpeg_streaming`].
+pub fn decode_jpeg_sd<F>(
+    read_fn: F,
+    data_offset: u32,
+    data_size: u32,
+    max_w: u16,
+    max_h: u16,
+) -> Result<DecodedImage, &'static str>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    decode_jpeg_streaming(read_fn, data_offset, data_size, max_w, max_h)
+}
+
+/// Decode a JPEG from a **DEFLATE-compressed** ZIP entry by streaming
+/// reads through `read_fn`.
+///
+/// Both ZIP decompression and MCU decode are streamed concurrently,
+/// so the full entry is never held in memory. Peak heap ≈ 79 KB.
+pub fn decode_jpeg_deflate_streaming<F>(
     read_fn: F,
     data_offset: u32,
     comp_size: u32,
@@ -614,6 +643,21 @@ where
     drop(hdr);
 
     decode_baseline(&st, BitReader::new(deflate), max_w, max_h)
+}
+
+/// Backward-compatible alias for [`decode_jpeg_deflate_streaming`].
+pub fn decode_jpeg_deflate_sd<F>(
+    read_fn: F,
+    data_offset: u32,
+    comp_size: u32,
+    uncomp_size: u32,
+    max_w: u16,
+    max_h: u16,
+) -> Result<DecodedImage, &'static str>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    decode_jpeg_deflate_streaming(read_fn, data_offset, comp_size, uncomp_size, max_w, max_h)
 }
 
 // baseline decode core (generic over byte source)

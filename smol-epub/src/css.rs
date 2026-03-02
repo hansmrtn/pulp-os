@@ -1,69 +1,107 @@
-// Minimal CSS parser for EPUB stylesheets.
-// Selectors: tag, .class, tag.class, grouped. Combinators reduced to
-// rightmost simple selector. @-rules and pseudo-classes skipped.
-// Rule table stack-allocated: MAX_CSS_RULES x ~16B = 2KB.
+//! Minimal CSS parser for EPUB stylesheets.
+//!
+//! Selectors: tag, `.class`, `tag.class`, grouped. Combinators are
+//! reduced to the rightmost simple selector. `@`-rules and
+//! pseudo-classes are skipped.
+//!
+//! Rule table is stack-allocated: `MAX_CSS_RULES` × ~16 B = 2 KB.
 
+/// Maximum number of CSS rules the parser will store.
 pub const MAX_CSS_RULES: usize = 128;
 
-// property flag bits (which fields in StyleProps are explicitly set)
+// ── property flag bits (which fields in StyleProps are explicitly set) ──
 
+/// Flag: `font-weight` is explicitly set.
 pub const PROP_FONT_WEIGHT: u16 = 1 << 0;
+/// Flag: `font-style` is explicitly set.
 pub const PROP_FONT_STYLE: u16 = 1 << 1;
+/// Flag: `text-align` is explicitly set.
 pub const PROP_TEXT_ALIGN: u16 = 1 << 2;
+/// Flag: `text-indent` is explicitly set.
 pub const PROP_TEXT_INDENT: u16 = 1 << 3;
+/// Flag: `margin-left` is explicitly set.
 pub const PROP_MARGIN_LEFT: u16 = 1 << 4;
+/// Flag: `margin-right` is explicitly set.
 pub const PROP_MARGIN_RIGHT: u16 = 1 << 5;
+/// Flag: `margin-top` is explicitly set.
 pub const PROP_MARGIN_TOP: u16 = 1 << 6;
+/// Flag: `margin-bottom` is explicitly set.
 pub const PROP_MARGIN_BOTTOM: u16 = 1 << 7;
+/// Flag: `display` is explicitly set.
 pub const PROP_DISPLAY: u16 = 1 << 8;
+/// Flag: `text-decoration` is explicitly set.
 pub const PROP_TEXT_DECORATION: u16 = 1 << 9;
 
-// property value constants
+// ── property value constants ────────────────────────────────────────
 
-// font-weight
+/// `font-weight: normal`.
 pub const FW_NORMAL: u8 = 0;
+/// `font-weight: bold`.
 pub const FW_BOLD: u8 = 1;
 
-// font-style
+/// `font-style: normal`.
 pub const FS_NORMAL: u8 = 0;
+/// `font-style: italic`.
 pub const FS_ITALIC: u8 = 1;
 
-// text-align
+/// `text-align: left`.
 pub const TA_LEFT: u8 = 0;
+/// `text-align: center`.
 pub const TA_CENTER: u8 = 1;
+/// `text-align: right`.
 pub const TA_RIGHT: u8 = 2;
+/// `text-align: justify`.
 pub const TA_JUSTIFY: u8 = 3;
 
-// display
+/// `display` not explicitly set (inherit / default).
 pub const DISP_DEFAULT: u8 = 0;
+/// `display: none`.
 pub const DISP_NONE: u8 = 1;
+/// `display: block`.
 pub const DISP_BLOCK: u8 = 2;
+/// `display: inline`.
 pub const DISP_INLINE: u8 = 3;
 
-// text-decoration (bitmask)
+/// `text-decoration: none`.
 pub const TD_NONE: u8 = 0;
+/// `text-decoration: underline`.
 pub const TD_UNDERLINE: u8 = 1;
+/// `text-decoration: line-through`.
 pub const TD_LINE_THROUGH: u8 = 2;
 
-// resolved CSS properties; `set` tracks which are explicitly specified.
-// Lengths in quarter-em units (i8): 1em = 4, 0.5em = 2, 2em = 8.
-
+/// Resolved CSS properties for a single element.
+///
+/// The `set` bitmask tracks which fields have been explicitly specified
+/// by a stylesheet rule. Lengths are stored in **quarter-em** units
+/// (`i8`): 1 em = 4, 0.5 em = 2, 2 em = 8.
 #[derive(Clone, Copy)]
 pub struct StyleProps {
+    /// Bitmask of `PROP_*` flags indicating which fields are set.
     pub set: u16,
+    /// `font-weight` — see [`FW_NORMAL`], [`FW_BOLD`].
     pub font_weight: u8,
+    /// `font-style` — see [`FS_NORMAL`], [`FS_ITALIC`].
     pub font_style: u8,
+    /// `text-align` — see [`TA_LEFT`], [`TA_CENTER`], etc.
     pub text_align: u8,
+    /// `text-indent` in quarter-em units.
     pub text_indent: i8,
+    /// `margin-left` in quarter-em units.
     pub margin_left: i8,
+    /// `margin-right` in quarter-em units.
     pub margin_right: i8,
+    /// `margin-top` in quarter-em units.
     pub margin_top: i8,
+    /// `margin-bottom` in quarter-em units.
     pub margin_bottom: i8,
+    /// `display` — see [`DISP_DEFAULT`], [`DISP_NONE`], etc.
     pub display: u8,
+    /// `text-decoration` bitmask — see [`TD_NONE`], [`TD_UNDERLINE`], etc.
     pub text_decoration: u8,
 }
 
 impl StyleProps {
+    /// A `StyleProps` with no fields set and all values at their defaults.
     pub const EMPTY: Self = Self {
         set: 0,
         font_weight: FW_NORMAL,
@@ -102,16 +140,19 @@ impl StyleProps {
     }
 
     #[inline]
+    /// Returns `true` if `font-weight` is set to bold.
     pub fn is_bold(&self) -> bool {
         self.set & PROP_FONT_WEIGHT != 0 && self.font_weight == FW_BOLD
     }
 
     #[inline]
+    /// Returns `true` if `font-style` is set to italic.
     pub fn is_italic(&self) -> bool {
         self.set & PROP_FONT_STYLE != 0 && self.font_style == FS_ITALIC
     }
 
     #[inline]
+    /// Returns `true` if `display` is set to `none`.
     pub fn is_hidden(&self) -> bool {
         self.set & PROP_DISPLAY != 0 && self.display == DISP_NONE
     }
@@ -156,6 +197,7 @@ impl CssRule {
 }
 
 // parsed CSS rule table, stack-allocated (~2KB)
+/// Parsed CSS rule table (stack-allocated, up to [`MAX_CSS_RULES`] entries).
 pub struct CssRules {
     rules: [CssRule; MAX_CSS_RULES],
     count: usize,
@@ -168,6 +210,7 @@ impl Default for CssRules {
 }
 
 impl CssRules {
+    /// Create an empty rule table.
     pub const fn new() -> Self {
         Self {
             rules: [CssRule::EMPTY; MAX_CSS_RULES],
@@ -175,21 +218,25 @@ impl CssRules {
         }
     }
 
+    /// Remove all parsed rules.
     pub fn clear(&mut self) {
         self.count = 0;
     }
 
     #[inline]
+    /// Number of rules currently stored.
     pub fn len(&self) -> usize {
         self.count
     }
 
     #[inline]
+    /// Returns `true` if no rules have been parsed.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     // parse stylesheet; may be called multiple times to accumulate rules
+    /// Parse a CSS stylesheet and append rules to the table.
     pub fn parse(&mut self, css: &[u8]) {
         let mut pos: usize = 0;
 
@@ -241,6 +288,7 @@ impl CssRules {
     }
 
     // resolve effective style for tag + class; merged by specificity
+    /// Resolve the effective style for an element given its tag and class names.
     pub fn resolve(&self, tag_name: &[u8], class_name: &[u8]) -> StyleProps {
         let tid = tag_id(tag_name);
         let chash = if class_name.is_empty() {
@@ -262,6 +310,7 @@ impl CssRules {
     }
 
     // resolve by pre-computed tag ID and class hash
+    /// Resolve the effective style using precomputed tag-id and class-hash.
     pub fn resolve_by_id(&self, tid: u8, chash: u16) -> StyleProps {
         let mut result = StyleProps::EMPTY;
         let mut best = [0u8; 16];
@@ -540,6 +589,7 @@ fn parse_margin_shorthand(value: &[u8], props: &mut StyleProps) {
 // tag ID mapping: lowercase tag name -> compact u8 for selector matching.
 // 0 = unknown/any; known tags get stable IDs.
 
+/// Map an HTML tag name to a compact numeric id used by [`CssRules::resolve_by_id`].
 pub fn tag_id(name: &[u8]) -> u8 {
     match name {
         b"p" => 1,
@@ -590,6 +640,7 @@ pub fn tag_id(name: &[u8]) -> u8 {
 // class hash: FNV-1a folded to 16 bits.
 // 0 reserved for "no class constraint"; hash of 0 is mapped to 1.
 
+/// Compute a 16-bit hash of a CSS class name for [`CssRules::resolve_by_id`].
 pub fn class_hash(name: &[u8]) -> u16 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in name {

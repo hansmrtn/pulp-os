@@ -1,6 +1,8 @@
-// EPUB chapter cache: streaming decompress + HTML strip to SD.
-// No persistent heap; ~51KB temp per chapter. Cache dir: _XXXXXXX/
-// with META.BIN + CHnnn.TXT files.
+//! EPUB chapter cache: streaming decompress + HTML strip pipeline.
+//!
+//! No persistent heap; ≈ 51 KB temporary per chapter.
+//! Cache directory layout uses 8.3-safe names: `_XXXXXXX/` with
+//! `META.BIN` + `CHnnn.TXT` files.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -12,7 +14,9 @@ const CACHE_MAGIC: u32 = 0x504C_5043; // "PLPC"
 const CACHE_VERSION: u8 = 1;
 const META_HEADER: usize = 16;
 
+/// Maximum number of chapters that can be tracked in a single cache.
 pub const MAX_CACHE_CHAPTERS: usize = 256;
+/// Maximum byte size of a `META.BIN` file (header + one `u32` per chapter).
 pub const META_MAX_SIZE: usize = META_HEADER + 4 * MAX_CACHE_CHAPTERS;
 
 const WINDOW_SIZE: usize = 32768; // DEFLATE sliding window
@@ -20,6 +24,7 @@ const READ_BUF_SIZE: usize = 4096; // compressed read chunk
 const STRIP_BUF_SIZE: usize = 4096; // strip output accumulator
 const FLUSH_THRESHOLD: usize = STRIP_BUF_SIZE - 128;
 
+/// Compute the FNV-1a hash of `data`.
 #[inline]
 pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -30,7 +35,9 @@ pub fn fnv1a(data: &[u8]) -> u32 {
     h
 }
 
-// 8.3 cache dir name: '_' + 7 hex digits of lower 28 bits of hash
+/// Generate an 8.3-safe cache directory name from a hash.
+///
+/// Format: `_` followed by 7 uppercase hex digits of the lower 28 bits.
 pub fn dir_name_for_hash(name_hash: u32) -> [u8; 8] {
     let h = name_hash & 0x0FFF_FFFF;
     let mut buf = [0u8; 8];
@@ -46,12 +53,13 @@ pub fn dir_name_for_hash(name_hash: u32) -> [u8; 8] {
     buf
 }
 
+/// Interpret an 8-byte directory name buffer as a UTF-8 `&str`.
 #[inline]
 pub fn dir_name_str(buf: &[u8; 8]) -> &str {
     core::str::from_utf8(buf).unwrap_or("_0000000")
 }
 
-// 8.3 chapter filename: CH000.TXT to CH255.TXT
+/// Generate an 8.3-safe chapter filename: `CH000.TXT` through `CH255.TXT`.
 pub fn chapter_file_name(idx: u16) -> [u8; 9] {
     debug_assert!(idx < 1000, "chapter index out of 3-digit range");
     let mut n = *b"CH000.TXT";
@@ -61,14 +69,19 @@ pub fn chapter_file_name(idx: u16) -> [u8; 9] {
     n
 }
 
+/// Interpret a 9-byte chapter filename buffer as a UTF-8 `&str`.
 #[inline]
 pub fn chapter_file_str(buf: &[u8; 9]) -> &str {
     core::str::from_utf8(buf).unwrap_or("CH000.TXT")
 }
 
+/// Filename used for the cache metadata file.
 pub const META_FILE: &str = "META.BIN";
 
-// encode cache metadata into buf; return bytes written
+/// Encode cache metadata into `buf`; returns the number of bytes written.
+///
+/// The metadata header stores a magic value, version, the EPUB file size,
+/// a name hash, and a `u32` size for each cached chapter.
 pub fn encode_cache_meta(
     epub_size: u32,
     name_hash: u32,
@@ -100,7 +113,11 @@ pub fn encode_cache_meta(
     total
 }
 
-// parse and validate META.BIN; write chapter sizes into out slice
+/// Parse and validate a `META.BIN` blob.
+///
+/// On success, writes individual chapter sizes into `chapter_sizes_out`
+/// and returns the number of chapters. Returns an error if the magic,
+/// version, EPUB size, name hash, or chapter count do not match.
 pub fn parse_cache_meta(
     data: &[u8],
     epub_size: u32,
@@ -154,7 +171,14 @@ pub fn parse_cache_meta(
     Ok(count)
 }
 
-// stream-decompress ZIP entry, strip HTML, emit plain-text chunks; ~47KB temp
+/// Stream-decompress a ZIP entry, strip HTML, and emit plain-text chunks.
+///
+/// `read_fn(offset, buf)` reads raw bytes from the underlying store.
+/// `output_fn(chunk)` receives stripped plain-text output incrementally.
+///
+/// Returns the total number of bytes written through `output_fn`.
+/// Peak temporary memory ≈ 47 KB (decompressor + sliding window + strip
+/// buffers).
 pub fn stream_strip_entry<E>(
     entry: &ZipEntry,
     local_offset: u32,
@@ -289,7 +313,7 @@ fn stream_deflate<E>(
                 Ok(_) => {
                     comp_left = 0;
                 }
-                Err(_) => return Err("cache: SD read failed during deflate"),
+                Err(_) => return Err("cache: read failed during deflate"),
             }
         }
 
