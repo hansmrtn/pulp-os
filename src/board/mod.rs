@@ -16,7 +16,7 @@ pub const SCREEN_H: u16 = WIDTH; // 800
 use core::cell::RefCell;
 
 use critical_section::Mutex;
-use embedded_hal_bus::spi::RefCellDevice;
+use embedded_hal_bus::spi::CriticalSectionDevice;
 use esp_hal::{
     Blocking,
     analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation},
@@ -31,11 +31,11 @@ use log::info;
 use static_cell::StaticCell;
 
 pub type SpiBus = spi::master::SpiDmaBus<'static, Blocking>;
-pub type SharedSpiDevice = RefCellDevice<'static, SpiBus, Output<'static>, Delay>;
-pub type SdSpiDevice = RefCellDevice<'static, SpiBus, raw_gpio::RawOutputPin, Delay>;
+pub type SharedSpiDevice = CriticalSectionDevice<'static, SpiBus, Output<'static>, Delay>;
+pub type SdSpiDevice = CriticalSectionDevice<'static, SpiBus, raw_gpio::RawOutputPin, Delay>;
 pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, Input<'static>>;
 
-static SPI_BUS: StaticCell<RefCell<SpiBus>> = StaticCell::new();
+static SPI_BUS: StaticCell<Mutex<RefCell<SpiBus>>> = StaticCell::new();
 
 // ISR clears interrupt flag; any interrupt wakes the Embassy executor
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
@@ -171,17 +171,24 @@ impl Board {
             .with_dma(p.DMA_CH0)
             .with_buffers(dma_rx_buf, dma_tx_buf);
 
-        let spi_ref: &'static RefCell<SpiBus> = SPI_BUS.init(RefCell::new(spi_dma_bus));
+        let spi_ref: &'static Mutex<RefCell<SpiBus>> =
+            SPI_BUS.init(Mutex::new(RefCell::new(spi_dma_bus)));
         info!("SPI bus: DMA enabled (CH0, 4096B TX+RX)");
 
-        let sd_spi = RefCellDevice::new(spi_ref, sd_cs, Delay::new()).unwrap();
+        let sd_spi = CriticalSectionDevice::new(spi_ref, sd_cs, Delay::new()).unwrap();
         let sd = SdStorage::new(sd_spi);
 
         let fast_cfg = spi::master::Config::default().with_frequency(Rate::from_mhz(SPI_FREQ_MHZ));
-        spi_ref.borrow_mut().apply_config(&fast_cfg).unwrap();
+        critical_section::with(|cs| {
+            spi_ref
+                .borrow(cs)
+                .borrow_mut()
+                .apply_config(&fast_cfg)
+                .unwrap();
+        });
         info!("SPI bus: 400kHz -> {}MHz", SPI_FREQ_MHZ);
 
-        let epd_spi = RefCellDevice::new(spi_ref, epd_cs, Delay::new()).unwrap();
+        let epd_spi = CriticalSectionDevice::new(spi_ref, epd_cs, Delay::new()).unwrap();
         let epd = DisplayDriver::new(epd_spi, dc, rst, busy);
 
         (DisplayHw { epd }, StorageHw { sd })

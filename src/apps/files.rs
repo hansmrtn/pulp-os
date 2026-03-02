@@ -1,5 +1,9 @@
 // Paginated file browser for SD card root directory.
+// Background title scanner resolves EPUB titles from OPF metadata.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -14,6 +18,8 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
 use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
+use smol_epub::epub::{self, EpubMeta, EpubSpine};
+use smol_epub::zip::ZipIndex;
 
 const PAGE_SIZE: usize = 7;
 
@@ -44,6 +50,11 @@ pub struct FilesApp {
     body_font: &'static BitmapFont,
     heading_font: &'static BitmapFont,
     list_y: u16,
+
+    /// Index into the DirCache to resume the title scan from.
+    title_scan_idx: usize,
+    /// `true` while there are still untitled EPUBs to scan.
+    title_scanning: bool,
 }
 
 impl FilesApp {
@@ -61,6 +72,8 @@ impl FilesApp {
             body_font: fonts::body_font(0),
             heading_font: hf,
             list_y: CONTENT_TOP + 8 + hf.line_height + HEADER_LIST_GAP,
+            title_scan_idx: 0,
+            title_scanning: false,
         }
     }
 
@@ -175,6 +188,8 @@ impl App for FilesApp {
         self.needs_load = true;
         self.stale_cache = true;
         self.error = None;
+        self.title_scan_idx = 0;
+        self.title_scanning = true;
         ctx.mark_dirty(Region::new(
             0,
             CONTENT_TOP,
@@ -185,6 +200,7 @@ impl App for FilesApp {
 
     fn on_exit(&mut self) {
         self.count = 0;
+        self.title_scanning = false;
     }
 
     fn on_suspend(&mut self) {}
@@ -199,7 +215,7 @@ impl App for FilesApp {
     }
 
     fn needs_work(&self) -> bool {
-        self.needs_load
+        self.needs_load || self.title_scanning
     }
 
     fn on_work<SPI: embedded_hal::spi::SpiDevice>(
@@ -207,24 +223,43 @@ impl App for FilesApp {
         svc: &mut Services<'_, SPI>,
         ctx: &mut AppContext,
     ) {
-        if self.stale_cache {
-            svc.invalidate_dir_cache();
-            self.stale_cache = false;
+        // ── page load ───────────────────────────────────────────
+        if self.needs_load {
+            if self.stale_cache {
+                svc.invalidate_dir_cache();
+                self.stale_cache = false;
+            }
+
+            let mut buf = [DirEntry::EMPTY; PAGE_SIZE];
+            match svc.dir_page(self.scroll, &mut buf) {
+                Ok(page) => {
+                    self.load_page(&buf[..page.count], page.total);
+                }
+                Err(e) => {
+                    log::info!("SD load failed: {}", e);
+                    self.load_failed(e);
+                }
+            }
+
+            ctx.mark_dirty(self.list_region());
+            ctx.mark_dirty(STATUS_REGION);
+            return; // yield — title scan runs on the next tick
         }
 
-        let mut buf = [DirEntry::EMPTY; PAGE_SIZE];
-        match svc.dir_page(self.scroll, &mut buf) {
-            Ok(page) => {
-                self.load_page(&buf[..page.count], page.total);
-            }
-            Err(e) => {
-                log::info!("SD load failed: {}", e);
-                self.load_failed(e);
+        // ── background title scan (one EPUB per tick) ───────────
+        if self.title_scanning {
+            if let Some(dirty) = scan_one_epub_title(svc, self.title_scan_idx) {
+                self.title_scan_idx = dirty.next_idx;
+                if dirty.resolved {
+                    // Reload the visible page so the title shows up.
+                    self.needs_load = true;
+                }
+            } else {
+                // No more untitled EPUBs — scan complete.
+                self.title_scanning = false;
+                log::info!("titles: scan complete");
             }
         }
-
-        ctx.mark_dirty(self.list_region());
-        ctx.mark_dirty(STATUS_REGION);
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
@@ -337,4 +372,125 @@ impl App for FilesApp {
             }
         }
     }
+}
+
+// ── background EPUB title scanner ───────────────────────────────────
+
+struct TitleScanResult {
+    /// Resume scanning from this DirCache index next tick.
+    next_idx: usize,
+    /// `true` if a title was resolved and the visible page may need
+    /// refreshing.
+    resolved: bool,
+}
+
+/// Attempt to resolve the title of one untitled EPUB.
+///
+/// Parses the EPUB's ZIP central directory, extracts `container.xml`
+/// and the OPF, and reads `<dc:title>`.  The result is saved to
+/// `TITLES.BIN` and applied to the DirCache entry so subsequent
+/// page loads show it.
+///
+/// Returns `None` when no untitled EPUBs remain from `from` onward.
+fn scan_one_epub_title<SPI: embedded_hal::spi::SpiDevice>(
+    svc: &mut Services<'_, SPI>,
+    from: usize,
+) -> Option<TitleScanResult> {
+    let (idx, name_buf, name_len) = svc.next_untitled_epub(from)?;
+    let name = core::str::from_utf8(&name_buf[..name_len as usize]).unwrap_or("");
+    let next_idx = idx + 1;
+
+    log::info!("titles: scanning {} (idx {})", name, idx);
+
+    let result = (|| -> Result<(), &'static str> {
+        // 1. Read EOCD tail
+        let file_size = svc.file_size(name)?;
+        if file_size < 22 {
+            return Err("too small");
+        }
+
+        let tail_size = (file_size as usize).min(512);
+        let tail_offset = file_size - tail_size as u32;
+        let mut buf = [0u8; 512];
+        let n = svc.read_file_chunk(name, tail_offset, &mut buf[..tail_size])?;
+
+        let (cd_offset, cd_size) = ZipIndex::parse_eocd(&buf[..n], file_size)?;
+
+        // 2. Read central directory
+        let mut cd_buf = Vec::new();
+        cd_buf
+            .try_reserve_exact(cd_size as usize)
+            .map_err(|_| "CD too large")?;
+        cd_buf.resize(cd_size as usize, 0);
+
+        let mut total = 0usize;
+        while total < cd_buf.len() {
+            let rd = svc.read_file_chunk(name, cd_offset + total as u32, &mut cd_buf[total..])?;
+            if rd == 0 {
+                return Err("CD truncated");
+            }
+            total += rd;
+        }
+
+        let mut zip = ZipIndex::new();
+        zip.parse_central_directory(&cd_buf)?;
+        drop(cd_buf);
+
+        // 3. Find and parse container.xml → OPF path
+        let mut opf_path_buf = [0u8; epub::OPF_PATH_CAP];
+        let opf_path_len = if let Some(ci) = zip.find("META-INF/container.xml") {
+            let container = smol_epub::zip::extract_entry(
+                zip.entry(ci),
+                zip.entry(ci).local_offset,
+                |off, b| svc.read_file_chunk(name, off, b),
+            )?;
+            let len = epub::parse_container(&container, &mut opf_path_buf)?;
+            drop(container);
+            len
+        } else {
+            epub::find_opf_in_zip(&zip, &mut opf_path_buf)?
+        };
+
+        let opf_path =
+            core::str::from_utf8(&opf_path_buf[..opf_path_len]).map_err(|_| "bad OPF path")?;
+
+        // 4. Extract OPF and parse title
+        let opf_idx = zip
+            .find(opf_path)
+            .or_else(|| zip.find_icase(opf_path))
+            .ok_or("OPF not found")?;
+
+        let opf_data = smol_epub::zip::extract_entry(
+            zip.entry(opf_idx),
+            zip.entry(opf_idx).local_offset,
+            |off, b| svc.read_file_chunk(name, off, b),
+        )?;
+
+        let opf_dir = opf_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let mut meta = EpubMeta::new();
+        let mut spine = EpubSpine::new();
+        epub::parse_opf(&opf_data, opf_dir, &zip, &mut meta, &mut spine)?;
+        drop(opf_data);
+
+        let title = meta.title_str();
+        if title.is_empty() {
+            return Err("no title in OPF");
+        }
+
+        // 5. Save to TITLES.BIN and update DirCache
+        log::info!("titles: {} -> \"{}\"", name, title);
+        let _ = svc.save_title(name, title);
+        svc.set_dir_entry_title(idx, title.as_bytes());
+
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        log::warn!("titles: {} failed: {}", name, e);
+    }
+
+    Some(TitleScanResult {
+        next_idx,
+        resolved: result.is_ok(),
+    })
 }

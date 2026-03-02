@@ -1,4 +1,4 @@
-// Debug status bar; zero height in release builds.
+// Status bar: system stats (debug) and background work indicator (all builds).
 
 #[cfg(debug_assertions)]
 use core::fmt::Write;
@@ -11,7 +11,6 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 
 use crate::board::SCREEN_W;
-#[cfg(debug_assertions)]
 use embedded_graphics::primitives::PrimitiveStyle;
 #[cfg(debug_assertions)]
 use embedded_graphics::text::Text;
@@ -19,6 +18,7 @@ use embedded_graphics::text::Text;
 #[cfg(debug_assertions)]
 use super::stack_fmt::BorrowedFmt;
 use super::widget::Region;
+use crate::kernel::work_queue;
 
 #[cfg(debug_assertions)]
 pub const BAR_HEIGHT: u16 = 18;
@@ -39,6 +39,7 @@ pub struct SystemStatus {
     pub stack_free: usize,
     pub stack_hwm: usize,
     pub sd_ok: bool,
+    pub bg_active: bool,
 }
 
 pub struct StatusBar {
@@ -46,6 +47,7 @@ pub struct StatusBar {
     buf: [u8; 112],
     #[cfg(debug_assertions)]
     len: usize,
+    bg_active: bool,
 }
 
 impl Default for StatusBar {
@@ -61,10 +63,13 @@ impl StatusBar {
             buf: [0u8; 112],
             #[cfg(debug_assertions)]
             len: 0,
+            bg_active: false,
         }
     }
 
     pub fn update(&mut self, _s: &SystemStatus) {
+        self.bg_active = _s.bg_active;
+
         #[cfg(debug_assertions)]
         {
             let s = _s;
@@ -110,6 +115,10 @@ impl StatusBar {
 
             let _ = write!(w, "  SD:{}", if s.sd_ok { "OK" } else { "--" });
 
+            if s.bg_active {
+                let _ = write!(w, " [BG]");
+            }
+
             self.len = w.len();
         }
     }
@@ -119,20 +128,40 @@ impl StatusBar {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 
+    /// Refresh the `bg_active` flag from the work queue without a
+    /// full [`update`] call.  Cheap enough to call every render pass.
+    pub fn refresh_bg_status(&mut self) {
+        self.bg_active = work_queue::status().is_active();
+    }
+
     pub fn draw<D>(&self, _display: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = BinaryColor>,
     {
         #[cfg(debug_assertions)]
         {
-            let display = _display;
             BAR_REGION
                 .to_rect()
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                .draw(display)?;
+                .draw(&mut *_display)?;
 
             let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::Off);
-            Text::new(self.text(), Point::new(4, 14), style).draw(display)?;
+            Text::new(self.text(), Point::new(4, 14), style).draw(&mut *_display)?;
+        }
+
+        // Background work indicator — small dot near the top-right
+        // corner, visible in both debug (white on black bar) and
+        // release (black on white paper) builds.
+        if self.bg_active {
+            #[cfg(debug_assertions)]
+            let color = BinaryColor::Off;
+            #[cfg(not(debug_assertions))]
+            let color = BinaryColor::On;
+
+            Region::new(SCREEN_W - 6, 1, 3, 3)
+                .to_rect()
+                .into_styled(PrimitiveStyle::with_fill(color))
+                .draw(&mut *_display)?;
         }
 
         Ok(())

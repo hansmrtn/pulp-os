@@ -20,6 +20,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
+use crate::kernel::work_queue;
 use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt};
 use smol_epub::DecodedImage;
@@ -86,13 +87,28 @@ enum State {
     NeedOpf,
     NeedToc,
     NeedCache,
-    NeedCacheChapter,
-    NeedImageCache,
     NeedIndex,
     NeedPage,
     Ready,
     ShowToc,
     Error,
+}
+
+/// Background caching progress — runs independently of the reading
+/// [`State`] so the user can read while remaining chapters and images
+/// are processed by the async cache worker.
+#[derive(Clone, Copy, PartialEq)]
+enum BgCacheState {
+    /// Nothing to do (fully cached, cache hit, or not an EPUB).
+    Idle,
+    /// Dispatch the next uncached chapter to the worker.
+    CacheChapter,
+    /// A chapter strip is in-flight; poll for the result.
+    WaitChapter,
+    /// Scan for and dispatch the next uncached image.
+    CacheImage,
+    /// An image decode is in-flight; poll for the result.
+    WaitImage,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +207,11 @@ pub struct ReaderApp {
     cache_chapter: u16,
     img_cache_ch: u16,
     img_cache_offset: u32,
+    img_scan_wrapped: bool,
+
+    bg_cache: BgCacheState,
+    ch_cached: [bool; cache::MAX_CACHE_CHAPTERS],
+    work_gen: u16,
 
     ch_cache: Vec<u8>,
     page_img: Option<DecodedImage>,
@@ -256,6 +277,11 @@ impl ReaderApp {
             cache_chapter: 0,
             img_cache_ch: 0,
             img_cache_offset: 0,
+            img_scan_wrapped: false,
+
+            bg_cache: BgCacheState::Idle,
+            ch_cached: [false; cache::MAX_CACHE_CHAPTERS],
+            work_gen: 0,
 
             ch_cache: Vec::new(),
 
@@ -291,6 +317,25 @@ impl ReaderApp {
 
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
         self.chrome_font = Some(font);
+    }
+
+    /// Returns `true` when the reader has background caching work that
+    /// should be driven even while the reader is not the active app.
+    pub fn has_bg_work(&self) -> bool {
+        self.is_epub && self.bg_cache != BgCacheState::Idle
+    }
+
+    /// Run one step of background caching.
+    ///
+    /// Called by the main loop when the reader is **suspended** (another
+    /// app is active) so that chapter stripping and image decoding
+    /// continue transparently.  Safe to call from any app context —
+    /// only touches the background pipeline state, never the primary
+    /// reading state or display.
+    pub fn bg_work_tick<SPI: embedded_hal::spi::SpiDevice>(&mut self, svc: &mut Services<'_, SPI>) {
+        if self.bg_cache != BgCacheState::Idle {
+            self.bg_cache_step(svc);
+        }
     }
 
     fn rebuild_quick_actions(&mut self) {
@@ -738,57 +783,67 @@ impl ReaderApp {
             return;
         }
 
-        if !self.ch_cache.is_empty() {
-            log::info!(
-                "reader: releasing {} KB chapter cache for image decode",
-                self.ch_cache.len() / 1024
-            );
-            self.ch_cache = Vec::new();
-        }
-
         let img_max_h = if self.fullscreen_img {
             TEXT_AREA_H
         } else {
             IMAGE_DISPLAY_H
         };
 
-        let result = if is_jpeg && entry.method == zip::METHOD_STORED {
-            let svc_ref = &*svc;
-            smol_epub::jpeg::decode_jpeg_sd(
-                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                data_offset,
-                entry.uncomp_size,
-                TEXT_W as u16,
-                img_max_h,
-            )
-        } else if is_jpeg {
-            let svc_ref = &*svc;
-            smol_epub::jpeg::decode_jpeg_deflate_sd(
-                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                data_offset,
-                entry.comp_size,
-                entry.uncomp_size,
-                TEXT_W as u16,
-                img_max_h,
-            )
-        } else if entry.method == zip::METHOD_STORED {
-            let svc_ref = &*svc;
-            smol_epub::png::decode_png_sd(
-                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                data_offset,
-                entry.uncomp_size,
-                TEXT_W as u16,
-                img_max_h,
-            )
-        } else {
-            let svc_ref = &*svc;
-            smol_epub::png::decode_png_deflate_sd(
-                |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                data_offset,
-                entry.comp_size,
-                TEXT_W as u16,
-                img_max_h,
-            )
+        // Closure that performs the actual decode dispatch.
+        let do_decode = |svc_ref: &Services<'_, SPI>| -> Result<DecodedImage, &'static str> {
+            if is_jpeg && entry.method == zip::METHOD_STORED {
+                smol_epub::jpeg::decode_jpeg_sd(
+                    |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                    data_offset,
+                    entry.uncomp_size,
+                    TEXT_W as u16,
+                    img_max_h,
+                )
+            } else if is_jpeg {
+                smol_epub::jpeg::decode_jpeg_deflate_sd(
+                    |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                    data_offset,
+                    entry.comp_size,
+                    entry.uncomp_size,
+                    TEXT_W as u16,
+                    img_max_h,
+                )
+            } else if entry.method == zip::METHOD_STORED {
+                smol_epub::png::decode_png_sd(
+                    |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                    data_offset,
+                    entry.uncomp_size,
+                    TEXT_W as u16,
+                    img_max_h,
+                )
+            } else {
+                smol_epub::png::decode_png_deflate_sd(
+                    |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                    data_offset,
+                    entry.comp_size,
+                    TEXT_W as u16,
+                    img_max_h,
+                )
+            }
+        };
+
+        // First attempt: decode while keeping the chapter cache alive.
+        let result = do_decode(&*svc);
+
+        // OOM fallback: if the first attempt failed and a chapter cache
+        // is occupying heap, release it and retry with the freed memory.
+        let result = match result {
+            Ok(img) => Ok(img),
+            Err(e) if !self.ch_cache.is_empty() => {
+                log::info!(
+                    "reader: decode failed ({}), releasing {} KB chapter cache and retrying",
+                    e,
+                    self.ch_cache.len() / 1024,
+                );
+                self.ch_cache = Vec::new();
+                do_decode(&*svc)
+            }
+            Err(e) => Err(e),
         };
 
         match result {
@@ -939,6 +994,9 @@ impl ReaderApp {
             )
         {
             self.chapters_cached = true;
+            for i in 0..count {
+                self.ch_cached[i] = true;
+            }
             log::info!("epub: cache hit ({} chapters)", count);
             return Ok(true);
         }
@@ -947,50 +1005,6 @@ impl ReaderApp {
         svc.ensure_pulp_subdir(dir)?;
         self.cache_chapter = 0;
         Ok(false)
-    }
-
-    fn epub_cache_one_chapter<SPI: embedded_hal::spi::SpiDevice>(
-        &mut self,
-        svc: &mut Services<'_, SPI>,
-    ) -> Result<bool, &'static str> {
-        let ch = self.cache_chapter as usize;
-        let spine_len = self.spine.len();
-
-        if ch >= spine_len {
-            return self.epub_finish_cache(svc);
-        }
-
-        let dir_buf = self.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
-
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-
-        let entry_idx = self.spine.items[ch] as usize;
-        let entry = *self.zip.entry(entry_idx);
-
-        let ch_file = cache::chapter_file_name(ch as u16);
-        let ch_str = cache::chapter_file_str(&ch_file);
-
-        svc.write_pulp_sub(dir, ch_str, &[])?; // truncate stale data
-        let svc_ref = &*svc;
-        let text_size = cache::stream_strip_entry(
-            &entry,
-            entry.local_offset,
-            |offset, buf| svc_ref.read_file_chunk(epub_name, offset, buf),
-            |chunk| svc_ref.append_pulp_sub(dir, ch_str, chunk),
-        )?;
-
-        self.chapter_sizes[ch] = text_size;
-        log::info!("epub: cached ch{}/{} = {} bytes", ch, spine_len, text_size);
-
-        self.cache_chapter += 1;
-
-        if (self.cache_chapter as usize) < spine_len {
-            Ok(true)
-        } else {
-            self.epub_finish_cache(svc)
-        }
     }
 
     fn epub_finish_cache<SPI: embedded_hal::spi::SpiDevice>(
@@ -1015,14 +1029,259 @@ impl ReaderApp {
         Ok(false)
     }
 
-    /// Scan cached chapter text for image references and pre-decode them.
+    /// Synchronously cache a single chapter by index.
     ///
-    /// Processes one image per call, returning `Ok(true)` when more work
-    /// remains and `Ok(false)` when every chapter has been scanned.
-    fn epub_precache_one_image<SPI: embedded_hal::spi::SpiDevice>(
+    /// Used to ensure the chapter the user wants to read is available
+    /// before entering `Ready`, even while other chapters are still
+    /// being background-cached.  Skipped if the chapter is already
+    /// cached.  Does NOT write META.BIN or set `chapters_cached`.
+    fn epub_cache_single_chapter<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+        ch: usize,
+    ) -> Result<(), &'static str> {
+        if ch >= self.spine.len() || self.ch_cached[ch] {
+            return Ok(());
+        }
+
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let (nb, nl) = self.name_copy();
+        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        let entry_idx = self.spine.items[ch] as usize;
+        let entry = *self.zip.entry(entry_idx);
+
+        let ch_file = cache::chapter_file_name(ch as u16);
+        let ch_str = cache::chapter_file_str(&ch_file);
+
+        svc.write_pulp_sub(dir, ch_str, &[])?;
+        let svc_ref = &*svc;
+        let text_size = cache::stream_strip_entry(
+            &entry,
+            entry.local_offset,
+            |offset, buf| svc_ref.read_file_chunk(epub_name, offset, buf),
+            |chunk| svc_ref.append_pulp_sub(dir, ch_str, chunk),
+        )?;
+
+        self.chapter_sizes[ch] = text_size;
+        self.ch_cached[ch] = true;
+
+        log::info!(
+            "epub: sync-cached ch{}/{} = {} bytes",
+            ch,
+            self.spine.len(),
+            text_size
+        );
+        Ok(())
+    }
+
+    // ── async cache-worker dispatch / receive ───────────────────────
+
+    /// Extract a chapter's XHTML from the ZIP and dispatch it to the
+    /// background cache worker for HTML stripping.
+    ///
+    /// Returns `Ok(true)` when a command was dispatched (caller should
+    /// transition to [`State::WaitChapterStrip`]), or `Ok(false)` when
+    /// all chapters have been cached already.
+    fn epub_dispatch_chapter_strip<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> Result<bool, &'static str> {
+        let spine_len = self.spine.len();
+
+        // Advance past chapters that were already sync-cached.
+        while (self.cache_chapter as usize) < spine_len
+            && self.ch_cached[self.cache_chapter as usize]
+        {
+            self.cache_chapter += 1;
+        }
+
+        // Priority: sync-cache chapters adjacent to the reading
+        // position before continuing the sequential scan, so
+        // forward/backward chapter navigation is always instant.
+        let reading_ch = self.chapter as usize;
+        for &adj in &[reading_ch + 1, reading_ch.saturating_sub(1)] {
+            if adj < spine_len && adj != reading_ch && !self.ch_cached[adj] {
+                log::info!(
+                    "epub: priority cache ch{} (adjacent to ch{})",
+                    adj,
+                    reading_ch,
+                );
+                if let Err(e) = self.epub_cache_single_chapter(svc, adj) {
+                    log::warn!("epub: priority cache ch{} failed: {}", adj, e);
+                }
+            }
+        }
+
+        let ch = self.cache_chapter as usize;
+        if ch >= spine_len {
+            return self.epub_finish_cache(svc);
+        }
+
+        // Large chapters need ~2× their uncompressed size in heap
+        // (extract Vec + strip output Vec simultaneously).  On a
+        // 140 KB heap anything over ~32 KB risks OOM in the worker.
+        // Fall back to the streaming pipeline which uses fixed ~51 KB
+        // overhead regardless of chapter size.
+        const ASYNC_THRESHOLD: u32 = 32768;
+        let entry_idx = self.spine.items[ch] as usize;
+        let uncomp = self.zip.entry(entry_idx).uncomp_size;
+        if uncomp > ASYNC_THRESHOLD {
+            log::info!(
+                "epub: ch{}/{} large ({} bytes), sync-caching",
+                ch,
+                spine_len,
+                uncomp,
+            );
+            self.epub_cache_single_chapter(svc, ch)?;
+            self.cache_chapter += 1;
+            return Ok(true);
+        }
+
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let ch_file = cache::chapter_file_name(ch as u16);
+        let ch_str = cache::chapter_file_str(&ch_file);
+
+        // Truncate any stale data before the worker produces output.
+        svc.write_pulp_sub(dir, ch_str, &[])?;
+
+        let (nb, nl) = self.name_copy();
+        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        // Extract the full XHTML into memory.  If the heap can't
+        // accommodate it (OOM on borderline sizes), fall back to the
+        // streaming pipeline instead of failing.
+        let xhtml = match extract_zip_entry(svc, epub_name, &self.zip, entry_idx) {
+            Ok(data) => data,
+            Err(e) => {
+                log::info!(
+                    "epub: ch{}/{} extract failed ({}), sync-caching",
+                    ch,
+                    spine_len,
+                    e,
+                );
+                self.epub_cache_single_chapter(svc, ch)?;
+                self.cache_chapter += 1;
+                return Ok(true);
+            }
+        };
+
+        log::info!(
+            "epub: dispatch ch{}/{} ({} bytes XHTML) to worker",
+            ch,
+            spine_len,
+            xhtml.len()
+        );
+
+        let task = work_queue::WorkTask::StripChapter {
+            chapter_idx: ch as u16,
+            xhtml,
+        };
+        if !work_queue::submit(self.work_gen, task) {
+            return Err("cache: worker channel full");
+        }
+        Ok(true)
+    }
+
+    /// Poll the cache worker for a completed chapter-strip result.
+    ///
+    /// Returns `Ok(Some(true))` when the chapter was written and more
+    /// remain, `Ok(Some(false))` when all chapters are done,
+    /// `Ok(None)` when the worker hasn't finished yet, or `Err` on
+    /// write / strip failure.
+    fn epub_recv_chapter_strip<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<Option<bool>, &'static str> {
+        let result = match work_queue::try_recv() {
+            Some(r) if r.is_current() => r,
+            Some(_) => return Ok(None), // stale generation — discard
+            None => return Ok(None),    // worker still busy
+        };
+
+        match result.outcome {
+            work_queue::WorkOutcome::ChapterReady { chapter_idx, text } => {
+                let ch = chapter_idx as usize;
+                let text_size = text.len() as u32;
+
+                // If the user sync-cached this chapter while the
+                // worker was processing, skip the SD write.
+                if !self.ch_cached[ch] {
+                    let dir_buf = self.cache_dir;
+                    let dir = cache::dir_name_str(&dir_buf);
+                    let ch_file = cache::chapter_file_name(chapter_idx);
+                    let ch_str = cache::chapter_file_str(&ch_file);
+
+                    svc.write_pulp_sub(dir, ch_str, &text)?;
+                    self.chapter_sizes[ch] = text_size;
+                }
+                self.ch_cached[ch] = true;
+                drop(text);
+
+                log::info!(
+                    "epub: cached ch{}/{} = {} bytes",
+                    ch,
+                    self.spine.len(),
+                    text_size
+                );
+
+                self.cache_chapter += 1;
+
+                if (self.cache_chapter as usize) < self.spine.len() {
+                    Ok(Some(true))
+                } else {
+                    self.epub_finish_cache(svc)?;
+                    Ok(Some(false))
+                }
+            }
+            work_queue::WorkOutcome::ChapterFailed { chapter_idx, error } => {
+                let ch = chapter_idx as usize;
+                log::warn!(
+                    "epub: worker failed ch{} ({}), falling back to sync",
+                    ch,
+                    error,
+                );
+                // The streaming pipeline uses fixed ~51 KB overhead
+                // regardless of chapter size — it won't OOM.
+                if let Err(e) = self.epub_cache_single_chapter(svc, ch) {
+                    log::warn!("epub: sync fallback also failed ch{}: {}", ch, e);
+                }
+                self.cache_chapter += 1;
+
+                if (self.cache_chapter as usize) < self.spine.len() {
+                    Ok(Some(true))
+                } else {
+                    self.epub_finish_cache(svc)?;
+                    Ok(Some(false))
+                }
+            }
+            _ => {
+                // Unexpected result type — discard and keep waiting.
+                log::warn!("epub: unexpected result while waiting for chapter strip");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Scan cached chapter text for the next un-cached image reference,
+    /// extract its raw bytes from the ZIP, and dispatch it to the
+    /// background cache worker for decoding.
+    ///
+    /// Returns `Ok(true)` when a decode was dispatched (caller should
+    /// transition to [`State::WaitImageDecode`]), or `Ok(false)` when
+    /// every chapter has been fully scanned.
+    fn epub_find_and_dispatch_image<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<bool, &'static str> {
+        // Image scanning uses the prefetch buffer as scratch space so
+        // the current page data in self.buf is never clobbered.
+        // Invalidate the prefetch — it will be reloaded on the next
+        // page turn.
+        self.prefetch_page = NO_PREFETCH;
+
         let spine_len = self.spine.len();
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
@@ -1030,6 +1289,13 @@ impl ReaderApp {
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
         while (self.img_cache_ch as usize) < spine_len {
+            // After wrapping, stop when we reach the chapter we
+            // originally started from — everything beyond was already
+            // scanned in the first pass.
+            if self.img_scan_wrapped && self.img_cache_ch >= self.chapter {
+                break;
+            }
+
             let ch = self.img_cache_ch as usize;
             let ch_size = if ch < cache::MAX_CACHE_CHAPTERS {
                 self.chapter_sizes[ch] as usize
@@ -1043,31 +1309,34 @@ impl ReaderApp {
 
             while offset < ch_size {
                 let read_len = PAGE_BUF.min(ch_size - offset);
-                let n =
-                    svc.read_pulp_sub_chunk(dir, ch_str, offset as u32, &mut self.buf[..read_len])?;
+                let n = svc.read_pulp_sub_chunk(
+                    dir,
+                    ch_str,
+                    offset as u32,
+                    &mut self.prefetch[..read_len],
+                )?;
                 if n == 0 {
                     break;
                 }
 
                 let mut i = 0;
                 while i + 2 < n {
-                    if self.buf[i] != MARKER || self.buf[i + 1] != IMG_REF {
+                    if self.prefetch[i] != MARKER || self.prefetch[i + 1] != IMG_REF {
                         i += 1;
                         continue;
                     }
 
-                    let path_len = self.buf[i + 2] as usize;
+                    let path_len = self.prefetch[i + 2] as usize;
                     let path_start = i + 3;
                     if path_len == 0 || path_start + path_len > n {
-                        // straddles chunk boundary; will be caught on next read
                         i += 1;
                         continue;
                     }
 
-                    // copy src path to a local buffer before we touch self again
                     let mut src_buf = [0u8; 128];
                     let src_n = path_len.min(src_buf.len());
-                    src_buf[..src_n].copy_from_slice(&self.buf[path_start..path_start + src_n]);
+                    src_buf[..src_n]
+                        .copy_from_slice(&self.prefetch[path_start..path_start + src_n]);
                     let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
                         Ok(s) if !s.is_empty() => s,
                         _ => {
@@ -1076,7 +1345,6 @@ impl ReaderApp {
                         }
                     };
 
-                    // resolve image path relative to chapter XHTML
                     let mut path_buf = [0u8; 512];
                     let plen = {
                         let ch_zip_idx = self.spine.items[ch] as usize;
@@ -1092,19 +1360,20 @@ impl ReaderApp {
                         }
                     };
 
-                    let img_name = img_cache_name(cache::fnv1a(full_path.as_bytes()));
+                    let path_hash = cache::fnv1a(full_path.as_bytes());
+                    let img_name = img_cache_name(path_hash);
                     let img_file = img_cache_str(&img_name);
 
-                    // already cached — skip
+                    // Already cached — skip.
                     if svc.file_size_pulp_sub(dir, img_file).is_ok() {
                         i = path_start + path_len;
                         continue;
                     }
 
-                    // save resume position past this image ref
+                    // Save resume position past this image ref.
                     self.img_cache_offset = (offset + path_start + path_len) as u32;
 
-                    // locate image entry in ZIP
+                    // Locate image entry in ZIP.
                     let zip_idx = match self
                         .zip
                         .find(full_path)
@@ -1113,115 +1382,50 @@ impl ReaderApp {
                         Some(idx) => idx,
                         None => {
                             log::warn!("precache: image not in ZIP: {}", full_path);
+                            return Ok(true); // skip, scan next on re-entry
+                        }
+                    };
+
+                    // Extract full uncompressed image from ZIP.
+                    log::info!("precache: extracting {}", full_path);
+                    let data = match extract_zip_entry(svc, epub_name, &self.zip, zip_idx) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log::warn!("precache: extract failed: {}", e);
                             return Ok(true);
                         }
                     };
 
-                    let entry = *self.zip.entry(zip_idx);
-                    let data_offset = {
-                        let mut hdr = [0u8; 30];
-                        if svc
-                            .read_file_chunk(epub_name, entry.local_offset, &mut hdr)
-                            .is_err()
-                        {
-                            log::warn!("precache: read local header failed");
-                            return Ok(true);
-                        }
-                        match zip::ZipIndex::local_header_data_skip(&hdr) {
-                            Ok(skip) => entry.local_offset + skip,
-                            Err(e) => {
-                                log::warn!("precache: {}", e);
-                                return Ok(true);
-                            }
-                        }
-                    };
-
-                    // determine image format
-                    let ext_jpeg = full_path.ends_with(".jpg")
-                        || full_path.ends_with(".jpeg")
-                        || full_path.ends_with(".JPG")
-                        || full_path.ends_with(".JPEG");
-                    let ext_png = full_path.ends_with(".png") || full_path.ends_with(".PNG");
-
-                    let (is_jpeg, is_png) = if ext_jpeg || ext_png {
-                        (ext_jpeg, ext_png)
-                    } else if entry.method == zip::METHOD_STORED {
-                        let mut magic = [0u8; 8];
-                        let mn = svc
-                            .read_file_chunk(epub_name, data_offset, &mut magic)
-                            .unwrap_or(0);
-                        (
-                            mn >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
-                            mn >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
-                        )
-                    } else {
-                        (false, false)
-                    };
+                    // Detect format from magic bytes on the raw data.
+                    let is_jpeg = data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8;
+                    let is_png = data.len() >= 8 && data[..8] == [137, 80, 78, 71, 13, 10, 26, 10];
 
                     if !is_jpeg && !is_png {
                         log::warn!("precache: unsupported format: {}", full_path);
                         return Ok(true);
                     }
 
-                    log::info!("precache: decoding {}", full_path);
+                    log::info!(
+                        "precache: dispatch {} ({} bytes) to worker",
+                        full_path,
+                        data.len()
+                    );
 
-                    let svc_ref = &*svc;
-                    let result = if is_jpeg && entry.method == zip::METHOD_STORED {
-                        smol_epub::jpeg::decode_jpeg_sd(
-                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                            data_offset,
-                            entry.uncomp_size,
-                            TEXT_W as u16,
-                            TEXT_AREA_H,
-                        )
-                    } else if is_jpeg {
-                        smol_epub::jpeg::decode_jpeg_deflate_sd(
-                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                            data_offset,
-                            entry.comp_size,
-                            entry.uncomp_size,
-                            TEXT_W as u16,
-                            TEXT_AREA_H,
-                        )
-                    } else if entry.method == zip::METHOD_STORED {
-                        smol_epub::png::decode_png_sd(
-                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                            data_offset,
-                            entry.uncomp_size,
-                            TEXT_W as u16,
-                            TEXT_AREA_H,
-                        )
-                    } else {
-                        smol_epub::png::decode_png_deflate_sd(
-                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
-                            data_offset,
-                            entry.comp_size,
-                            TEXT_W as u16,
-                            TEXT_AREA_H,
-                        )
+                    let task = work_queue::WorkTask::DecodeImage {
+                        path_hash,
+                        data,
+                        is_jpeg,
+                        max_w: TEXT_W as u16,
+                        max_h: TEXT_AREA_H,
                     };
-
-                    match result {
-                        Ok(img) => {
-                            log::info!(
-                                "precache: decoded {}x{} ({}B 1-bit)",
-                                img.width,
-                                img.height,
-                                img.data.len()
-                            );
-                            if let Err(e) = save_cached_image(svc, dir, img_file, &img) {
-                                log::warn!("precache: save failed: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("precache: decode failed: {}", e);
-                        }
+                    if !work_queue::submit(self.work_gen, task) {
+                        return Err("cache: worker channel full");
                     }
-
-                    return Ok(true); // yield after each image
+                    return Ok(true); // dispatched
                 }
 
-                // advance with overlap so markers at chunk boundary are not missed
+                // Advance with overlap so markers at chunk boundary
+                // are not missed.
                 if offset + n >= ch_size {
                     break;
                 }
@@ -1232,8 +1436,144 @@ impl ReaderApp {
             self.img_cache_offset = 0;
         }
 
-        log::info!("precache: all images done");
+        // Wrap around: if we started mid-book, scan the chapters
+        // before the starting point so every chapter gets covered.
+        if !self.img_scan_wrapped && self.chapter > 0 {
+            log::info!(
+                "precache: wrapping image scan to ch0 (started at ch{})",
+                self.chapter,
+            );
+            self.img_cache_ch = 0;
+            self.img_cache_offset = 0;
+            self.img_scan_wrapped = true;
+            return Ok(true);
+        }
+
+        log::info!("precache: all images scanned");
         Ok(false)
+    }
+
+    /// Poll the cache worker for a completed image-decode result.
+    ///
+    /// Returns `Ok(Some(true))` when the image was saved (more may
+    /// remain), `Ok(None)` if the worker hasn't finished yet, or
+    /// `Err` on save failure.
+    fn epub_recv_image_result<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<Option<bool>, &'static str> {
+        let result = match work_queue::try_recv() {
+            Some(r) if r.is_current() => r,
+            Some(_) => return Ok(None), // stale generation — discard
+            None => return Ok(None),
+        };
+
+        match result.outcome {
+            work_queue::WorkOutcome::ImageReady { path_hash, image } => {
+                let dir_buf = self.cache_dir;
+                let dir = cache::dir_name_str(&dir_buf);
+                let img_name = img_cache_name(path_hash);
+                let img_file = img_cache_str(&img_name);
+
+                log::info!(
+                    "precache: decoded {}x{} ({}B 1-bit)",
+                    image.width,
+                    image.height,
+                    image.data.len()
+                );
+
+                if let Err(e) = save_cached_image(svc, dir, img_file, &image) {
+                    log::warn!("precache: save failed: {}", e);
+                }
+
+                Ok(Some(true))
+            }
+            work_queue::WorkOutcome::ImageFailed { path_hash, error } => {
+                log::warn!("precache: image {:#010X} failed: {}", path_hash, error);
+                // Skip failed image, continue scanning.
+                Ok(Some(true))
+            }
+            _ => {
+                log::warn!("precache: unexpected result while waiting for image decode");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Run one step of background caching.
+    ///
+    /// Returns `true` if `self.buf` was dirtied by image scanning and
+    /// needs to be reloaded via [`State::NeedPage`].
+    fn bg_cache_step<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> bool {
+        match self.bg_cache {
+            BgCacheState::CacheChapter => {
+                match self.epub_dispatch_chapter_strip(svc) {
+                    Ok(true) => self.bg_cache = BgCacheState::WaitChapter,
+                    Ok(false) => {
+                        // All chapters cached — start image scan
+                        // from the current reading chapter so images
+                        // the user is about to see get cached first.
+                        self.img_cache_ch = self.chapter;
+                        self.img_cache_offset = 0;
+                        self.img_scan_wrapped = false;
+                        self.bg_cache = BgCacheState::CacheImage;
+                    }
+                    Err(e) => {
+                        log::warn!("bg: ch dispatch failed: {}, skipping", e);
+                        self.cache_chapter += 1;
+                        // Stay in CacheChapter — next tick tries the next one.
+                    }
+                }
+                false // chapter dispatch does not touch self.buf
+            }
+            BgCacheState::WaitChapter => {
+                match self.epub_recv_chapter_strip(svc) {
+                    Ok(Some(true)) => self.bg_cache = BgCacheState::CacheChapter,
+                    Ok(Some(false)) => {
+                        self.img_cache_ch = self.chapter;
+                        self.img_cache_offset = 0;
+                        self.img_scan_wrapped = false;
+                        self.bg_cache = BgCacheState::CacheImage;
+                    }
+                    Ok(None) => {} // worker still busy
+                    Err(e) => {
+                        log::warn!("bg: ch recv failed: {}, continuing", e);
+                        self.bg_cache = BgCacheState::CacheChapter;
+                    }
+                }
+                false
+            }
+            BgCacheState::CacheImage => {
+                match self.epub_find_and_dispatch_image(svc) {
+                    Ok(true) => self.bg_cache = BgCacheState::WaitImage,
+                    Ok(false) => self.bg_cache = BgCacheState::Idle,
+                    Err(e) => {
+                        log::warn!("bg: image error: {}, continuing", e);
+                        // Stay in CacheImage — next tick scans for the next one.
+                    }
+                }
+                // Image scanning uses the prefetch buffer, leaving
+                // self.buf (current page data) untouched.  The
+                // prefetch is invalidated and will be reloaded on
+                // the next page turn.
+                false
+            }
+            BgCacheState::WaitImage => {
+                match self.epub_recv_image_result(svc) {
+                    Ok(Some(_)) => self.bg_cache = BgCacheState::CacheImage,
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::warn!("bg: image recv error: {}", e);
+                        self.bg_cache = BgCacheState::CacheImage;
+                    }
+                }
+                false
+            }
+            BgCacheState::Idle => false,
+        }
     }
 
     fn epub_index_chapter(&mut self) {
@@ -1887,6 +2227,14 @@ impl App for ReaderApp {
         self.title[..n].copy_from_slice(&self.filename[..n]);
         self.title_len = n;
 
+        // Bump to a new work-queue generation and drain stale work
+        // from any previous book (covers the case where on_enter is
+        // called without a preceding on_exit, e.g. Replace transition).
+        self.work_gen = work_queue::reset();
+        self.bg_cache = BgCacheState::Idle;
+        self.ch_cached = [false; cache::MAX_CACHE_CHAPTERS];
+        self.img_scan_wrapped = false;
+
         self.is_epub = epub::is_epub_filename(self.name());
         self.rebuild_quick_actions();
         self.reset_paging();
@@ -1908,6 +2256,13 @@ impl App for ReaderApp {
     }
 
     fn on_exit(&mut self) {
+        // Cancel any in-flight background cache work so the worker
+        // doesn't write stale results after we switch books.
+        if self.is_epub {
+            work_queue::reset();
+            self.bg_cache = BgCacheState::Idle;
+        }
+
         self.line_count = 0;
         self.buf_len = 0;
         self.prefetch_page = NO_PREFETCH;
@@ -1923,9 +2278,19 @@ impl App for ReaderApp {
         }
     }
 
-    fn on_suspend(&mut self) {}
+    fn on_suspend(&mut self) {
+        // Background caching continues while suspended — the worker
+        // task runs independently and our work_gen stays valid.
+    }
 
     fn on_resume(&mut self, ctx: &mut AppContext) {
+        // Restore our generation so the worker considers in-flight
+        // results current again (another app may have submitted work
+        // under a different generation while we were suspended).
+        if self.work_gen != 0 {
+            work_queue::set_active_generation(self.work_gen);
+        }
+
         let font_changed = self.book_font_size_idx != self.applied_font_idx;
         self.apply_font_metrics();
         if font_changed {
@@ -1947,11 +2312,9 @@ impl App for ReaderApp {
                 | State::NeedOpf
                 | State::NeedToc
                 | State::NeedCache
-                | State::NeedCacheChapter
-                | State::NeedImageCache
                 | State::NeedIndex
                 | State::NeedPage
-        )
+        ) || self.bg_cache != BgCacheState::Idle
     }
 
     fn on_work<SPI: embedded_hal::spi::SpiDevice>(
@@ -2048,8 +2411,24 @@ impl App for ReaderApp {
                         continue;
                     }
                     Ok(false) => {
-                        self.state = State::NeedCacheChapter; // yield; more chapters remain
-                        ctx.mark_dirty(LOADING_REGION);
+                        // Cache only the current chapter synchronously
+                        // so the user can start reading immediately.
+                        let ch = self.chapter as usize;
+                        match self.epub_cache_single_chapter(svc, ch) {
+                            Ok(()) => {
+                                self.chapters_cached = true;
+                                self.cache_chapter = 0;
+                                self.bg_cache = BgCacheState::CacheChapter;
+                                self.state = State::NeedIndex;
+                                continue;
+                            }
+                            Err(e) => {
+                                log::info!("reader: sync cache ch{} failed: {}", ch, e);
+                                self.error = Some(e);
+                                self.state = State::Error;
+                                ctx.mark_dirty(PAGE_REGION);
+                            }
+                        }
                     }
                     Err(e) => {
                         log::info!("reader: cache check failed: {}", e);
@@ -2059,40 +2438,22 @@ impl App for ReaderApp {
                     }
                 },
 
-                State::NeedCacheChapter => match self.epub_cache_one_chapter(svc) {
-                    Ok(true) => {
-                        ctx.mark_dirty(LOADING_REGION);
-                    }
-                    Ok(false) => {
-                        self.img_cache_ch = 0;
-                        self.img_cache_offset = 0;
-                        self.state = State::NeedImageCache;
-                        continue;
-                    }
-                    Err(e) => {
-                        log::info!("reader: cache ch{} failed: {}", self.cache_chapter, e);
-                        self.error = Some(e);
-                        self.state = State::Error;
-                        ctx.mark_dirty(PAGE_REGION);
-                    }
-                },
-
-                State::NeedImageCache => match self.epub_precache_one_image(svc) {
-                    Ok(true) => {
-                        ctx.mark_dirty(LOADING_REGION);
-                    }
-                    Ok(false) => {
-                        self.state = State::NeedIndex;
-                        continue;
-                    }
-                    Err(e) => {
-                        log::warn!("precache: error: {}, skipping", e);
-                        self.state = State::NeedIndex;
-                        continue;
-                    }
-                },
-
                 State::NeedIndex => {
+                    // Ensure the target chapter is cached before
+                    // indexing (it may not be if background caching
+                    // hasn't reached it yet).
+                    if self.is_epub
+                        && self.chapters_cached
+                        && !self.ch_cached[self.chapter as usize]
+                    {
+                        if let Err(e) = self.epub_cache_single_chapter(svc, self.chapter as usize) {
+                            self.error = Some(e);
+                            self.state = State::Error;
+                            ctx.mark_dirty(PAGE_REGION);
+                            break;
+                        }
+                    }
+
                     let want_last = self.goto_last_page;
                     self.goto_last_page = false;
 
@@ -2164,6 +2525,15 @@ impl App for ReaderApp {
                 _ => {}
             }
             break;
+        }
+
+        // ── background caching (runs while the user reads) ──────
+        // Runs in any stable state — page turns momentarily leave
+        // Ready, but background work resumes on the next tick.
+        if matches!(self.state, State::Ready | State::ShowToc)
+            && self.bg_cache != BgCacheState::Idle
+        {
+            self.bg_cache_step(svc);
         }
     }
 
@@ -2385,6 +2755,9 @@ impl App for ReaderApp {
             } else {
                 let _ = write!(sbuf, "p{}", self.page + 1);
             }
+            if self.bg_cache != BgCacheState::Idle {
+                let _ = write!(sbuf, " *");
+            }
             draw_chrome_text(
                 strip,
                 STATUS_REGION,
@@ -2417,21 +2790,8 @@ impl App for ReaderApp {
         {
             let mut lbuf = StackFmt::<48>::new();
             match self.state {
-                State::NeedCache | State::NeedCacheChapter => {
-                    let _ = write!(
-                        lbuf,
-                        "Caching ch {}/{}...",
-                        self.cache_chapter + 1,
-                        self.spine.len()
-                    );
-                }
-                State::NeedImageCache => {
-                    let _ = write!(
-                        lbuf,
-                        "Caching images (ch {}/{})...",
-                        self.img_cache_ch + 1,
-                        self.spine.len()
-                    );
+                State::NeedCache => {
+                    let _ = write!(lbuf, "Preparing...");
                 }
                 State::NeedIndex => {
                     let _ = write!(lbuf, "Indexing...");

@@ -32,6 +32,7 @@ use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::fonts;
 use pulp_os::kernel::tasks;
 use pulp_os::kernel::uptime_secs;
+use pulp_os::kernel::work_queue;
 use pulp_os::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use pulp_os::ui::{
     BAR_HEIGHT, ButtonFeedback, QuickMenu, StatusBar, SystemStatus, free_stack_bytes, paint_stack,
@@ -259,7 +260,20 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     paint_stack();
 
-    // 140KB: WiFi radio ~65KB static + stack + esp-radio leaves no room for more
+    // Heap budget — ESP32-C3 has ~320-328 KB DRAM after IRAM split.
+    // Static consumers (app statics ~60-70 KB, WiFi blob .bss ~37-65 KB,
+    // DMA 9 KB) are already laid out before heap_allocator! runs, so
+    // the size below is what's actually *left*.
+    //
+    // WiFi (esp-radio with `esp-alloc` feature) allocates its dynamic
+    // buffers from this heap at runtime — but only during Upload mode.
+    // Normal reading never touches the radio, so the full heap is
+    // available for chapter caches and image decoding.
+    //
+    // The ~28 KB gap between .bss end and the stack origin at
+    // 0x3FCCE400 is NOT free — it is consumed by runtime call depth
+    // (display driver rendering, ZIP decompression, etc.).  Increasing
+    // this value causes stack overflow in write_region_strips_dual.
     esp_alloc::heap_allocator!(size: 143360);
 
     info!("booting...");
@@ -337,7 +351,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     spawner.spawn(tasks::input_task(input)).unwrap();
     spawner.spawn(tasks::housekeeping_task()).unwrap();
     spawner.spawn(tasks::idle_timeout_task()).unwrap();
-    info!("tasks spawned (input_task, housekeeping_task, idle_timeout_task).");
+    spawner.spawn(work_queue::worker_task()).unwrap();
+    info!("tasks spawned (input_task, housekeeping_task, idle_timeout_task, worker_task).");
     info!("kernel ready.");
 
     let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
@@ -481,6 +496,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             }
         }
 
+        // 3b. reader background caching — continues even while
+        //     another app is active (e.g. browsing files or settings).
+        if launcher.active() != AppId::Reader && apps.reader.has_bg_work() {
+            let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
+            apps.reader.bg_work_tick(&mut svc);
+        }
+
         // 4. housekeeping
 
         // battery mv (~30s, from input_task)
@@ -519,6 +541,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         }
 
         // 5. render
+        statusbar.refresh_bg_status();
+
         if !launcher.ctx.has_redraw() {
             continue;
         }
@@ -663,7 +687,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 // helpers
 
 fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
-    const HEAP_TOTAL: usize = 143360; // matches heap_allocator!(size: ...) above
+    const HEAP_TOTAL: usize = 143360;
     let stats = esp_alloc::HEAP.stats();
 
     let bat_pct = battery::battery_percentage(battery_mv);
@@ -678,6 +702,7 @@ fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
         stack_free: free_stack_bytes(),
         stack_hwm: stack_high_water_mark(),
         sd_ok,
+        bg_active: work_queue::status().is_active(),
     });
 }
 

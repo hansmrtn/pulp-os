@@ -347,6 +347,35 @@ impl DirCache {
     pub fn invalidate(&mut self) {
         self.valid = false;
     }
+
+    /// Find the next EPUB file without a title, starting from `from`.
+    ///
+    /// Returns `Some((index, name))` where `name` is a short-lived
+    /// copy suitable for passing to SD read functions, or `None` when
+    /// every EPUB from `from..count` already has a title.
+    pub fn next_untitled_epub(&self, from: usize) -> Option<(usize, [u8; 13], u8)> {
+        for i in from..self.count {
+            let e = &self.entries[i];
+            if e.is_dir || e.title_len > 0 {
+                continue;
+            }
+            let name = e.name_str();
+            if smol_epub::epub::is_epub_filename(name) {
+                return Some((i, e.name, e.name_len));
+            }
+        }
+        None
+    }
+
+    /// Set the title of the entry at `index`.
+    ///
+    /// Called by the title scanner after resolving a title from the
+    /// EPUB's OPF metadata.
+    pub fn set_entry_title(&mut self, index: usize, title: &[u8]) {
+        if index < self.count {
+            self.entries[index].set_title(title);
+        }
+    }
 }
 
 // insertion sort: dirs first, then filenames case-insensitive

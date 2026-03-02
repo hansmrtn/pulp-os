@@ -152,6 +152,14 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         self.dir_cache.invalidate();
     }
 
+    pub fn next_untitled_epub(&self, from: usize) -> Option<(usize, [u8; 13], u8)> {
+        self.dir_cache.next_untitled_epub(from)
+    }
+
+    pub fn set_dir_entry_title(&mut self, index: usize, title: &[u8]) {
+        self.dir_cache.set_entry_title(index, title);
+    }
+
     pub fn read_file_chunk(
         &self,
         name: &str,
