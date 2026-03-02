@@ -1,6 +1,4 @@
-// Launcher screen, entry point after boot.
-// Menu: Continue (if recent) / Files / Bookmarks / Settings / Upload.
-// Bookmarks shows a scrollable list of saved positions, most-recent-first.
+// Launcher screen: menu, bookmarks browser.
 
 use core::fmt::Write as _;
 
@@ -19,7 +17,6 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::bitmap::byte_to_char;
 use crate::ui::{Alignment, BUTTON_BAR_H, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
-// menu layout constants
 const ITEM_W: u16 = 280;
 const ITEM_H: u16 = 52;
 const ITEM_GAP: u16 = 14;
@@ -28,7 +25,6 @@ const ITEM_X: u16 = (SCREEN_W - ITEM_W) / 2;
 const TITLE_ITEM_GAP: u16 = 24;
 const MAX_ITEMS: usize = 5;
 
-// bookmark list layout
 const BM_MARGIN: u16 = 8;
 const BM_HEADER_GAP: u16 = 4;
 const BM_BOTTOM: u16 = SCREEN_H - BUTTON_BAR_H;
@@ -64,12 +60,10 @@ pub struct HomeApp {
     item_regions: [Region; MAX_ITEMS],
     item_count: usize,
 
-    // recent book for "Continue" button
     recent_book: [u8; 32],
     recent_book_len: usize,
     needs_load_recent: bool,
 
-    // bookmark browser state
     bm_entries: [BmListEntry; bookmarks::SLOTS],
     bm_count: usize,
     bm_selected: usize,
@@ -110,7 +104,6 @@ impl HomeApp {
         self.item_regions = compute_item_regions(self.heading_font.line_height);
     }
 
-    // called once at boot before first render
     pub fn load_recent<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         services: &mut Services<'_, SPI>,

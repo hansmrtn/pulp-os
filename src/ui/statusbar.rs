@@ -1,7 +1,4 @@
-// Debug status bar at top of screen (debug builds only).
-// Shows battery, uptime, heap (current/peak/total), stack, SD state.
-// In release builds BAR_HEIGHT is 0 and draw/update are no-ops,
-// so apps reclaim the full screen without any code changes.
+// Debug status bar; zero height in release builds.
 
 #[cfg(debug_assertions)]
 use core::fmt::Write;
@@ -146,7 +143,6 @@ impl StatusBar {
     }
 }
 
-// distance from current SP down to _stack_end_cpu0 (bottom of stack)
 pub fn free_stack_bytes() -> usize {
     let sp: usize;
     #[cfg(target_arch = "riscv32")]
@@ -158,7 +154,6 @@ pub fn free_stack_bytes() -> usize {
         sp = 0;
     }
 
-    // lowest address the stack may reach
     #[cfg(target_arch = "riscv32")]
     {
         unsafe extern "C" {
@@ -174,11 +169,8 @@ pub fn free_stack_bytes() -> usize {
     }
 }
 
-// stack painting: paint_stack() fills unused stack with 0xDEAD_BEEF at boot;
-// stack_high_water_mark() scans upward to find peak usage.
 const STACK_PAINT_WORD: u32 = 0xDEAD_BEEF;
 
-// fill unused stack with sentinel; call once early in main before task spawn
 pub fn paint_stack() {
     #[cfg(target_arch = "riscv32")]
     {
@@ -213,7 +205,6 @@ pub fn paint_stack() {
     }
 }
 
-// scan for first non-sentinel word from stack bottom; return peak usage in bytes
 pub fn stack_high_water_mark() -> usize {
     #[cfg(target_arch = "riscv32")]
     {

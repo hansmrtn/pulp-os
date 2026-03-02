@@ -1,5 +1,4 @@
-// System settings with persistent storage.
-// Text-based key=value format in _PULP/SETTINGS.TXT.
+// System settings; key=value text in _PULP/SETTINGS.TXT.
 use core::fmt::Write as _;
 
 use crate::apps::{App, AppContext, Services, Transition};
@@ -22,8 +21,6 @@ const VALUE_W: u16 = 296; // reaches x = 472
 
 const NUM_ITEMS: usize = 4;
 const HEADING_ITEMS_GAP: u16 = 8; // gap between heading bottom and first row
-
-// persistent settings
 
 const SETTINGS_FILE: &str = "SETTINGS.TXT";
 #[derive(Clone, Copy)]
@@ -58,7 +55,6 @@ impl SystemSettings {
     }
 }
 
-// wifi config (in settings.txt)
 pub const WIFI_SSID_CAP: usize = 32;
 pub const WIFI_PASS_CAP: usize = 63;
 
@@ -104,7 +100,6 @@ impl WifiConfig {
     }
 }
 
-// Text format parser / writer
 fn trim(s: &[u8]) -> &[u8] {
     let mut start = 0;
     let mut end = s.len();
@@ -173,7 +168,6 @@ fn parse_settings_txt(data: &[u8], settings: &mut SystemSettings, wifi: &mut Wif
     }
 }
 
-// tiny cursor writer for building the text representation
 struct TxtWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
@@ -239,7 +233,6 @@ fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) -> usi
     wr.len()
 }
 
-// SettingsApp
 impl Default for SettingsApp {
     fn default() -> Self {
         Self::new()
@@ -298,8 +291,6 @@ impl SettingsApp {
         self.loaded
     }
 
-    // load settings from SD and apply font indices immediately;
-    // called once at boot so saved preferences are in effect from the first frame
     pub fn load_eager<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         services: &mut Services<'_, SPI>,

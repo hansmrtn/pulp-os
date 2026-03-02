@@ -1,7 +1,4 @@
-// Application framework and launcher.
-// App trait + nav stack (max 4). No dyn, no heap.
-// needs_work()/on_work() decouple SD I/O from rendering.
-// Services is the syscall boundary into storage.
+// App trait, nav stack, and Services syscall boundary.
 
 pub mod bookmarks;
 pub mod files;
@@ -28,8 +25,6 @@ pub enum AppId {
     Upload,
 }
 
-// nav transitions: Push suspends current + pushes new; Pop exits + resumes parent;
-// Replace swaps in place; Home unwinds to root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
@@ -46,7 +41,6 @@ pub enum Redraw {
     Full,
 }
 
-// 8.3 filename or short path context message
 const MSG_BUF_SIZE: usize = 64;
 
 pub struct AppContext {
@@ -118,7 +112,6 @@ impl AppContext {
     }
 }
 
-// each call re-opens volume/dir/file; reader uses prefetch to amortize cost
 pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
     dir_cache: &'a mut DirCache,
     bookmarks: &'a mut BookmarkCache,
@@ -194,8 +187,6 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::read_file_chunk_in_dir(self.sd, dir, name, offset, buf)
     }
 
-    // _PULP app-data directory
-
     pub fn ensure_pulp_dir(&self) -> Result<(), &'static str> {
         storage::ensure_pulp_dir(self.sd)
     }
@@ -221,7 +212,6 @@ impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
         storage::write_pulp_file(self.sd, name, data)
     }
 
-    // nested ops inside _PULP/<dir>/
     pub fn ensure_pulp_subdir(&self, name: &str) -> Result<(), &'static str> {
         storage::ensure_pulp_subdir(self.sd, name)
     }
@@ -272,7 +262,6 @@ pub trait App {
 
     fn on_quick_cycle_update(&mut self, _id: u8, _value: u8, _ctx: &mut AppContext) {}
 
-    // called once per strip during refresh
     fn draw(&self, strip: &mut StripBuffer);
 
     fn needs_work(&self) -> bool {

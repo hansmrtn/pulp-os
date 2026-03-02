@@ -1,5 +1,4 @@
 // SD card file operations and directory cache.
-// DirCache reads root entries once into RAM, serves pages from there.
 
 use embedded_sdmmc::{Mode, VolumeIdx};
 
@@ -18,7 +17,6 @@ pub struct DirEntry {
     pub name_len: u8,
     pub is_dir: bool,
     pub size: u32,
-    // parsed display title from EPUB OPF metadata; empty = unavailable
     pub title: [u8; TITLE_CAP],
     pub title_len: u8,
 }

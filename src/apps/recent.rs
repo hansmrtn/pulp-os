@@ -1,6 +1,4 @@
-// RAM-resident bookmark cache: 16 slots x 48 bytes held permanently in RAM (~780B).
-// Loaded from SD once; reads served from RAM with zero SD I/O.
-// Writes mark dirty; flush() persists to SD only when dirty.
+// Bookmark cache: 16 slots, RAM-resident, flushed to SD on dirty.
 //
 // Record layout (little-endian, 48 bytes per slot):
 //   [0..4)   name_hash    u32
@@ -16,7 +14,6 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
 pub use smol_epub::cache::fnv1a;
 
-// case-insensitive FNV-1a; FAT filenames are case-insensitive
 fn fnv1a_icase(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in data {
@@ -105,7 +102,6 @@ impl BookmarkSlot {
     }
 }
 
-// lightweight bookmark list entry (35B vs 48B for BookmarkSlot)
 #[derive(Clone, Copy)]
 pub struct BmListEntry {
     pub filename: [u8; FILENAME_CAP],
@@ -125,7 +121,6 @@ impl BmListEntry {
     }
 }
 
-// in-memory bookmark table; loaded once, reads from RAM, writes mark dirty (~780B)
 pub struct BookmarkCache {
     slots: [BookmarkSlot; SLOTS],
     count: usize, // slots present in file; new saves past this extend count
@@ -149,7 +144,6 @@ impl BookmarkCache {
         }
     }
 
-    // true if in-memory state has changed since the last flush
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -158,7 +152,6 @@ impl BookmarkCache {
         self.loaded
     }
 
-    // read bookmark file from SD; idempotent; no-op if already loaded
     pub fn ensure_loaded<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         if self.loaded {
             return;
@@ -166,7 +159,6 @@ impl BookmarkCache {
         self.force_load(sd);
     }
 
-    // reload from SD, discarding in-memory changes
     pub fn force_load<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         let mut buf = [0u8; FILE_LEN];
         let slot_count = match storage::read_pulp_file_start(sd, BOOKMARK_FILE, &mut buf) {
@@ -189,7 +181,6 @@ impl BookmarkCache {
         log::info!("bookmarks: loaded {} slots from SD", slot_count);
     }
 
-    // find bookmark by filename; None if not found or not loaded
     pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
         if !self.loaded {
             return None;
@@ -205,13 +196,11 @@ impl BookmarkCache {
         None
     }
 
-    // copy valid bookmarks into out, sorted by generation descending; return count written
     pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
         if !self.loaded {
             return 0;
         }
 
-        // collect valid entries with their generation for sorting
         let mut gens = [0u16; SLOTS];
         let mut count = 0usize;
 
@@ -231,7 +220,6 @@ impl BookmarkCache {
             }
         }
 
-        // insertion sort by generation descending (most recent first)
         for i in 1..count {
             let key_gen = gens[i];
             let key_entry = out[i];
@@ -248,8 +236,6 @@ impl BookmarkCache {
         count
     }
 
-    // save bookmark; update cache + mark dirty; call flush() to persist.
-    // handles LRU eviction, generation increment, hash+name matching.
     pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         if !self.loaded {
             log::warn!("bookmarks: save called before load, ignoring");
@@ -258,7 +244,6 @@ impl BookmarkCache {
 
         let key = fnv1a_icase(filename);
 
-        // scan for: target slot, max generation, first free, LRU
         let mut max_gen: u16 = 0;
         let mut target: Option<usize> = None;
         let mut first_free: Option<usize> = None;
@@ -311,7 +296,6 @@ impl BookmarkCache {
 
         self.slots[write_slot] = new_slot;
 
-        // extend count if we wrote past the current end
         if write_slot >= self.count {
             self.count = write_slot + 1;
         }
@@ -327,7 +311,6 @@ impl BookmarkCache {
         );
     }
 
-    // write cache to SD if dirty; no-op if clean; 768B stack buffer
     pub fn flush<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
         if !self.dirty || !self.loaded {
             return;
@@ -349,7 +332,6 @@ impl BookmarkCache {
             }
             Err(e) => {
                 log::warn!("bookmarks: flush failed: {}", e);
-                // leave dirty=true so we retry next time
             }
         }
     }

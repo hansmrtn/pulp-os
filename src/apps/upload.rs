@@ -1,9 +1,4 @@
-// WiFi upload mode: HTTP file upload server run from Home menu.
-// WiFi credentials are read from _PULP/SETTINGS.TXT (wifi_ssid / wifi_pass).
-// GET / -> HTML file-picker form.
-// POST /upload -> multipart/form-data streamed to SD root.
-// No embassy tasks; runner, server, mDNS and back-button multiplexed with select.
-// mDNS advertises as pulp.local so users don't need the DHCP IP.
+// WiFi upload server: GET / serves HTML, POST /upload streams to SD, mDNS as pulp.local.
 
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
@@ -29,8 +24,6 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::tasks;
 use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region, stack_fmt};
 
-// layout
-
 const HEADING_X: u16 = 16;
 const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;
 
@@ -39,8 +32,6 @@ const BODY_W: u16 = SCREEN_W - BODY_X * 2;
 const BODY_LINE_GAP: u16 = 10;
 
 const FOOTER_Y: u16 = SCREEN_H - 60;
-
-// HTTP response fragments
 
 const HTTP_200_HTML: &[u8] =
     b"HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
@@ -52,11 +43,7 @@ const HTTP_500_TEXT: &[u8] =
     b"HTTP/1.0 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
 const HTTP_404: &[u8] = b"HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
 
-// Embedded HTML page with drag-and-drop, file listing, and delete support.
-// JS is minimal: XHR upload with progress, fetch /files for listing, POST /delete.
 const UPLOAD_PAGE: &[u8] = include_bytes!("../../assets/upload.html");
-
-// mDNS constants
 
 const MDNS_PORT: u16 = 5353;
 
@@ -69,10 +56,7 @@ const HOSTNAME_WIRE: [u8; 12] = [
 
 const MDNS_RESPONSE_LEN: usize = 38;
 
-// max boundary string length
 const MAX_BOUNDARY_LEN: usize = 120;
-
-// work buffer for upload data; larger = fewer SD writes
 const WORK_BUF_SIZE: usize = 2048;
 
 enum ServerEvent {
@@ -121,8 +105,6 @@ pub async fn run_upload_mode<SPI>(
 
     let ssid = wifi_cfg.ssid();
     let password = wifi_cfg.password();
-
-    // screen 1: connecting
 
     {
         let mut msg_buf = [0u8; 64];
@@ -296,8 +278,6 @@ pub async fn run_upload_mode<SPI>(
     )
     .await;
 
-    // phase 4: HTTP server + mDNS responder loop
-
     let mut rx_buf = [0u8; 2048];
     let mut tx_buf = [0u8; 1536];
 
@@ -346,9 +326,6 @@ pub async fn run_upload_mode<SPI>(
     info!("upload: exiting, tearing down WiFi");
 }
 
-// HTTP request handling
-
-// accept one TCP connection, route the request, send a response
 async fn serve_one_request<SPI>(
     stack: embassy_net::Stack<'_>,
     rx_buf: &mut [u8],
@@ -373,7 +350,6 @@ where
         return ServerEvent::Nothing;
     }
 
-    // read HTTP request headers (accumulate until \r\n\r\n)
     let mut hdr = [0u8; 1024];
     let mut hdr_len = 0usize;
 
@@ -403,7 +379,6 @@ where
         }
     }
 
-    // locate end of headers; body data may follow in the same read
     let headers_end = match find_subsequence(&hdr[..hdr_len], b"\r\n\r\n") {
         Some(p) => p,
         None => {
@@ -415,7 +390,6 @@ where
     let initial_body = &hdr[body_offset..hdr_len];
     let headers = &hdr[..headers_end];
 
-    // parse request line: "METHOD /path HTTP/x.x"
     let first_line_end = headers
         .iter()
         .position(|&b| b == b'\r')
@@ -427,7 +401,6 @@ where
 
     let path = extract_path(request_line);
 
-    // ── GET / ── serve the upload page HTML ──────────────────────────
     if is_get && path == b"/" {
         let _ = socket.write_all(HTTP_200_HTML).await;
         let _ = socket.write_all(UPLOAD_PAGE).await;
@@ -436,7 +409,6 @@ where
         return ServerEvent::Nothing;
     }
 
-    // ── GET /files ── JSON array of {name, size} ────────────────────
     if is_get && path == b"/files" {
         let _ = socket.write_all(HTTP_200_JSON).await;
 
@@ -466,7 +438,7 @@ where
             let mid = b"\",\"size\":";
             json_buf[pos..pos + mid.len()].copy_from_slice(mid);
             pos += mid.len();
-            // format u32 without alloc
+
             pos += fmt_u32(e.size, &mut json_buf[pos..]);
             json_buf[pos] = b'}';
             pos += 1;
@@ -482,7 +454,6 @@ where
         return ServerEvent::Nothing;
     }
 
-    // ── POST /upload ── multipart file upload ───────────────────────
     if is_post && path == b"/upload" {
         let boundary = match find_boundary(headers) {
             Some(b) => b,
@@ -513,9 +484,7 @@ where
         }
     }
 
-    // ── POST /delete ── body = filename to delete ───────────────────
     if is_post && path == b"/delete" {
-        // read body (filename); may need to read more beyond initial_body
         let content_len = extract_content_length(headers).unwrap_or(0);
         let max_body = content_len.min(13); // 8.3 filename max
         let mut body = [0u8; 16];
@@ -546,7 +515,6 @@ where
             return ServerEvent::DeleteFailed;
         }
 
-        // copy name into fixed buffer before passing to storage
         let mut name_buf = [0u8; 13];
         let name_bytes = name.as_bytes();
         name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
@@ -572,15 +540,12 @@ where
         }
     }
 
-    // fallback: 404
     let _ = socket.write_all(HTTP_404).await;
     let _ = socket.flush().await;
     close_socket(&mut socket).await;
     ServerEvent::Nothing
 }
 
-// stream a multipart upload body to SD; initial_body = body bytes read with headers.
-// returns sanitised 8.3 filename on success.
 async fn handle_upload<SPI>(
     socket: &mut TcpSocket<'_>,
     sd: &SdStorage<SPI>,
@@ -594,7 +559,6 @@ where
         return Err("boundary too long");
     }
 
-    // build end-of-file-data marker: \r\n--<boundary>
     let em_len = 4 + boundary.len();
     let mut end_marker_buf = [0u8; MAX_BOUNDARY_LEN + 4];
     end_marker_buf[0] = b'\r';
@@ -603,10 +567,6 @@ where
     end_marker_buf[3] = b'-';
     end_marker_buf[4..em_len].copy_from_slice(boundary);
     let end_marker = &end_marker_buf[..em_len];
-
-    // phase A: skip multipart preamble, find file data start.
-    // accumulate until \r\n\r\n (blank line ending part headers);
-    // everything after is file data.
 
     let mut work = [0u8; WORK_BUF_SIZE];
     let init_len = initial_body.len().min(work.len());
@@ -617,14 +577,12 @@ where
         if let Some(pos) = find_subsequence(&work[..filled], b"\r\n\r\n") {
             let part_headers = &work[..pos];
 
-            // extract raw filename from Content-Disposition
             let raw_name = extract_filename(part_headers).ok_or("no filename in upload")?;
             let (name_buf, name_len) = sanitize_83(raw_name);
             if name_len == 0 {
                 return Err("invalid filename");
             }
 
-            // shift remaining file data to front of work buffer
             let file_start = pos + 4;
             work.copy_within(file_start..filled, 0);
             filled -= file_start;
@@ -651,19 +609,14 @@ where
 
     info!("upload: receiving file '{}'", name_str);
 
-    // create (or truncate) file on SD
     storage::write_file(sd, name_str, &[])?;
 
-    // phase B: stream file data to SD.
-    // keep last end_marker.len() bytes unwritten (holdback) to detect
-    // boundary spanning two TCP reads; everything before is safe to flush.
+    // holdback last end_marker.len() bytes to detect boundary spanning two reads
 
     let mut total_written: u32 = 0;
 
     loop {
-        // check for end marker in current buffer
         if let Some(pos) = find_subsequence(&work[..filled], end_marker) {
-            // write remaining file data before the marker
             if pos > 0 {
                 storage::append_root_file(sd, name_str, &work[..pos])?;
                 total_written += pos as u32;
@@ -672,25 +625,20 @@ where
             return Ok((file_name_buf, file_name_len));
         }
 
-        // flush safe prefix (everything except holdback zone)
         if filled > end_marker.len() {
             let safe = filled - end_marker.len();
             storage::append_root_file(sd, name_str, &work[..safe])?;
             total_written += safe as u32;
 
-            // compact: move holdback to front
             work.copy_within(safe..filled, 0);
             filled = end_marker.len();
         }
 
-        // read more data from network
         let n = socket
             .read(&mut work[filled..])
             .await
             .map_err(|_| "read error during upload")?;
         if n == 0 {
-            // connection closed before end marker found;
-            // write what we have (may include partial boundary junk)
             if filled > 0 {
                 let _ = storage::append_root_file(sd, name_str, &work[..filled]);
             }
@@ -700,27 +648,21 @@ where
     }
 }
 
-// HTTP helpers
-
-// extract request path from a request line like "GET /path HTTP/1.1"
 fn extract_path(line: &[u8]) -> &[u8] {
-    // skip method
     let start = match line.iter().position(|&b| b == b' ') {
         Some(p) => p + 1,
         None => return b"/",
     };
-    // find end of path
+
     let rest = &line[start..];
     let end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
-    // strip query string
+
     let path = &rest[..end];
     let qmark = path.iter().position(|&b| b == b'?').unwrap_or(path.len());
     &path[..qmark]
 }
 
-// extract multipart boundary from headers block
 fn find_boundary(headers: &[u8]) -> Option<&[u8]> {
-    // search for "boundary=" case-insensitively
     let marker = b"boundary=";
     let pos = headers
         .windows(marker.len())
@@ -732,7 +674,6 @@ fn find_boundary(headers: &[u8]) -> Option<&[u8]> {
         return None;
     }
 
-    // handle quoted or unquoted value
     if rest[0] == b'"' {
         let inner = &rest[1..];
         let end = inner.iter().position(|&b| b == b'"')?;
@@ -752,7 +693,6 @@ fn find_boundary(headers: &[u8]) -> Option<&[u8]> {
     }
 }
 
-// extract raw filename bytes from multipart part headers
 fn extract_filename(headers: &[u8]) -> Option<&[u8]> {
     let marker = b"filename=\"";
     let pos = headers
@@ -767,15 +707,12 @@ fn extract_filename(headers: &[u8]) -> Option<&[u8]> {
     Some(&rest[..end])
 }
 
-// sanitise raw filename to valid FAT 8.3; returns (buf, len)
 fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
-    // strip path components
     let name = match raw.iter().rposition(|&b| b == b'/' || b == b'\\') {
         Some(p) => &raw[p + 1..],
         None => raw,
     };
 
-    // split into base and extension at last dot
     let (base_src, ext_src) = match name.iter().rposition(|&b| b == b'.') {
         Some(dot) => (&name[..dot], &name[dot + 1..]),
         None => (name, &[] as &[u8]),
@@ -784,7 +721,6 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
     let mut out = [0u8; 13];
     let mut pos: usize = 0;
 
-    // base name: up to 8 chars, uppercased
     for &b in base_src.iter() {
         if pos >= 8 {
             break;
@@ -795,13 +731,11 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
         }
     }
 
-    // fallback if base is empty after filtering
     if pos == 0 {
         out[..6].copy_from_slice(b"UPLOAD");
         pos = 6;
     }
 
-    // extension: up to 3 chars, uppercased
     if !ext_src.is_empty() {
         out[pos] = b'.';
         pos += 1;
@@ -815,7 +749,7 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
                 pos += 1;
             }
         }
-        // remove dot if no valid extension chars
+
         if pos == ext_start {
             pos -= 1;
         }
@@ -828,14 +762,12 @@ fn is_valid_83_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~' | b'!' | b'#' | b'$' | b'&')
 }
 
-// send a plain-text error response
 async fn send_error_response(socket: &mut TcpSocket<'_>, msg: &str) {
     let _ = socket.write_all(HTTP_500_TEXT).await;
     let _ = socket.write_all(msg.as_bytes()).await;
     let _ = socket.flush().await;
 }
 
-// format a u32 into decimal ASCII; returns number of bytes written
 fn fmt_u32(mut n: u32, buf: &mut [u8]) -> usize {
     if n == 0 {
         buf[0] = b'0';
@@ -854,7 +786,6 @@ fn fmt_u32(mut n: u32, buf: &mut [u8]) -> usize {
     pos
 }
 
-// extract Content-Length value from headers
 fn extract_content_length(headers: &[u8]) -> Option<usize> {
     let marker = b"content-length:";
     let pos = headers
@@ -862,7 +793,7 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
         .position(|w| w.eq_ignore_ascii_case(marker))?;
     let start = pos + marker.len();
     let rest = &headers[start..];
-    // skip whitespace
+
     let trimmed = rest.iter().position(|&b| b != b' ' && b != b'\t')?;
     let rest = &rest[trimmed..];
     let end = rest
@@ -881,7 +812,6 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
     Some(val)
 }
 
-// gracefully close a TCP socket
 async fn close_socket(socket: &mut TcpSocket<'_>) {
     Timer::after(Duration::from_millis(50)).await;
     socket.close();
@@ -889,7 +819,6 @@ async fn close_socket(socket: &mut TcpSocket<'_>) {
     socket.abort();
 }
 
-// find first occurrence of needle in haystack
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
@@ -898,8 +827,6 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
 }
-
-// mDNS responder
 
 async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
@@ -988,8 +915,6 @@ fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
     MDNS_RESPONSE_LEN
 }
 
-// input helpers
-
 async fn drain_until_back() {
     let mapper = ButtonMapper::new();
     loop {
@@ -1003,8 +928,6 @@ async fn drain_until_back() {
         }
     }
 }
-
-// display helpers
 
 async fn render_screen(
     epd: &mut Epd,

@@ -1,5 +1,3 @@
-// Proportional-font label widgets for the bitmap rendering pipeline.
-
 use core::convert::Infallible;
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
@@ -49,7 +47,6 @@ impl<'a> BitmapLabel<'a> {
     }
 }
 
-// owned fixed-size buffer variant; implements fmt::Write for formatted output
 pub struct BitmapDynLabel<const N: usize> {
     region: Region,
     buffer: [u8; N],

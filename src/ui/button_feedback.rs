@@ -1,7 +1,3 @@
-// Button feedback: plain text edge labels (no inversion).
-// Bottom tabs show the mapped action text; side labels hidden.
-// No visual change on press/release; purely informational.
-
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
 use super::widget::{Alignment, Region};
@@ -15,13 +11,11 @@ use crate::fonts::font_data;
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;
 
-// total height reserved at bottom of screen for button labels
 pub const BUTTON_BAR_H: u16 = TAB_H + BOTTOM_INSET;
 
 const RIDGE_W: u16 = 22;
 const RIDGE_H: u16 = 36;
 
-// center positions of each button on the screen edge (px)
 const CX_BACK: u16 = 84;
 const CX_CONFIRM: u16 = 194;
 const CX_LEFT: u16 = 286;
@@ -128,17 +122,14 @@ impl ButtonFeedback {
         }
     }
 
-    // set chrome font for button label text; call on UI font size change
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
         self.font = Some(font);
     }
 
-    // draw bottom-edge labels only; no side indicators or inversion
     pub fn draw(&self, strip: &mut StripBuffer) {
         let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);
 
         for def in BUMPS.iter() {
-            // skip side-edge indicators (VolUp/VolDown)
             if def.edge != Edge::Bottom {
                 continue;
             }
@@ -149,7 +140,6 @@ impl ButtonFeedback {
                 continue;
             }
 
-            // plain: white background, black text
             r.to_rect()
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
                 .draw(strip)

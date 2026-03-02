@@ -1,9 +1,4 @@
-// pulp-os entry point: Embassy multi-task architecture.
-// main:              UI event loop, app dispatch, rendering.
-// input_task:        10ms button poll, publishes events + battery mv.
-// housekeeping_task: periodic signals (status 5s, SD/bookmarks 30s).
-// idle_timeout_task: fires IDLE_SLEEP_DUE after idle timeout.
-// CPU sleeps (WFI) whenever all tasks are waiting.
+// pulp-os: Embassy event loop, app dispatch, rendering.
 
 #![no_std]
 #![no_main]
@@ -46,7 +41,6 @@ use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// on_work cadence: lets multi-step ops (EPUB init, caching) progress between events
 const TICK_MS: u64 = 10;
 
 const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
@@ -73,7 +67,6 @@ impl Apps {
     }
 }
 
-// Static dispatch to the active app by AppId.
 macro_rules! with_app {
     ($id:expr, $apps:expr, |$app:ident| $body:expr) => {
         match $id {
@@ -100,7 +93,6 @@ macro_rules! with_app {
     };
 }
 
-// Execute a nav-stack transition: lifecycle callbacks, font propagation.
 macro_rules! apply_transition {
     ($nav:expr, $launcher:expr, $apps:expr, $bm_cache:expr,
      $quick_menu:expr, $bumps:expr) => {{
@@ -123,7 +115,6 @@ macro_rules! apply_transition {
             }
         }
 
-        // propagate persisted prefs before lifecycle callbacks
         $apps.propagate_fonts($quick_menu, $bumps);
 
         if nav.to != AppId::Upload {
@@ -140,11 +131,8 @@ macro_rules! apply_transition {
     }};
 }
 
-// busy-wait loop with input processing.
-// macro because it borrows multiple locals and .awaits inside the main async fn.
-// runs during full and partial waveforms; selects on BUSY pin, input channel,
-// and work ticker so page pre-loads happen concurrently.
-// non-trivial transitions (Back, Home) deferred until waveform ends.
+// busy-wait with input: selects on BUSY pin, input channel, work ticker.
+// macro because it .awaits inside the main async fn.
 macro_rules! busy_wait_with_input {
     ($epd:expr, $mapper:expr,
      $quick_menu:expr, $launcher:expr, $apps:expr,
@@ -152,12 +140,10 @@ macro_rules! busy_wait_with_input {
         let mut _deferred: Option<Transition> = None;
         let mut _work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
         loop {
-            // level-check first; avoids creating futures if already done
             if !$epd.is_busy() {
                 break;
             }
 
-            // wait for BUSY low, input event, or work tick
             match select(
                 $epd.busy_pin().wait_for_low(),
                 select(tasks::INPUT_EVENTS.receive(), _work_ticker.next()),
@@ -166,11 +152,9 @@ macro_rules! busy_wait_with_input {
             {
                 Either::First(_) => break,
 
-                // input event from the channel
                 Either::Second(Either::First(hw_event)) => {
                     let event = $mapper.map_event(hw_event);
 
-                    // skip quick-menu during refresh; cosmetic, can wait
                     if $quick_menu.open {
                         continue;
                     }
@@ -182,11 +166,9 @@ macro_rules! busy_wait_with_input {
                     }
                 }
 
-                // work tick
                 Either::Second(Either::Second(_)) => {}
             }
 
-            // pre-load next page while waveform runs
             let active = $launcher.active();
             let needs = with_app!(active, $apps, |app| app.needs_work());
             if needs {
@@ -199,8 +181,6 @@ macro_rules! busy_wait_with_input {
     }};
 }
 
-// flush bookmarks, render sleep screen, deep-sleep display + MCU.
-// macro because it borrows locals and .awaits inside the main async fn.
 macro_rules! enter_sleep {
     ($reason:expr, $bm_cache:expr, $board:expr, $strip:expr, $delay:expr) => {{
         info!("{}: entering sleep...", $reason);
@@ -256,9 +236,7 @@ macro_rules! draw_scene {
     };
 }
 
-// Heavy statics kept out of the async future so Embassy's state machine stays ~200 B.
-// const-fn types  → ConstStaticCell  (value in .bss at link time; .take() panics on double-use).
-// runtime-init types → StaticCell     (.init(val) panics on double-use).
+// heavy statics out of the async future; ConstStaticCell for const-fn types, StaticCell otherwise
 
 static STRIP: ConstStaticCell<StripBuffer> = ConstStaticCell::new(StripBuffer::new());
 static STATUSBAR: ConstStaticCell<StatusBar> = ConstStaticCell::new(StatusBar::new());
@@ -279,16 +257,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // paint sentinel before any deep calls; measure peak via stack_high_water_mark()
     paint_stack();
 
-    // 140KB heap (reduced from 200KB to fit WiFi firmware blobs in DRAM).
-    // WiFi radio static data ~65KB; this leaves enough for stack + esp-radio.
+    // 140KB: WiFi radio ~65KB static + stack + esp-radio leaves no room for more
     esp_alloc::heap_allocator!(size: 143360);
 
     info!("booting...");
 
-    // must run before first .await; sets up RTOS scheduler + Embassy timer driver
     let timg0 = TimerGroup::new(unsafe { peripherals.TIMG0.clone_unchecked() });
     let sw_ints =
         SoftwareInterruptControl::new(unsafe { peripherals.SW_INTERRUPT.clone_unchecked() });
@@ -310,12 +285,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .is_ok();
 
-    // ensure _PULP/ exists
     if sd_ok && let Err(e) = storage::ensure_pulp_dir(&board.storage.sd) {
         info!("warning: failed to create _PULP dir: {}", e);
     }
 
-    // created here for initial battery read, then moved into input_task
     let mut input = InputDriver::new(board.input);
     let mapper = ButtonMapper::new();
 
@@ -335,7 +308,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     bm_cache.ensure_loaded(&board.storage.sd);
 
-    // load settings + recent book before first render
     {
         let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
         apps.settings.load_eager(&mut svc);
@@ -343,7 +315,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         apps.home.load_recent(&mut svc);
     }
 
-    // signal idle timeout after settings load so persisted value is used
     tasks::set_idle_timeout(apps.settings.system_settings().sleep_timeout);
 
     let cached_battery_mv_init = battery::adc_to_battery_mv(input.read_battery_mv());
@@ -351,7 +322,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     apps.home.on_enter(&mut launcher.ctx);
 
-    // write both RAM planes, kick GC waveform, yield ~1.6s
     board
         .display
         .epd
@@ -361,18 +331,15 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         })
         .await;
 
-    // drain stale redraw left by on_enter
     let _ = launcher.ctx.take_redraw();
     info!("ui ready.");
 
-    // InputDriver moved into input_task; events arrive via INPUT_EVENTS from here on
     spawner.spawn(tasks::input_task(input)).unwrap();
     spawner.spawn(tasks::housekeeping_task()).unwrap();
     spawner.spawn(tasks::idle_timeout_task()).unwrap();
     info!("tasks spawned (input_task, housekeeping_task, idle_timeout_task).");
     info!("kernel ready.");
 
-    // main event loop: wakes on input event or work ticker (10ms)
     let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
     let mut partial_refreshes: u32 = 0;

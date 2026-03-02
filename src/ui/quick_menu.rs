@@ -1,8 +1,3 @@
-// Quick-action overlay: summoned by Power (Menu) from any app.
-// Core actions (Refresh, Go Home) always present; apps inject up to MAX_APP_ACTIONS items.
-// Two kinds: Cycle (rotate options) and Trigger (fire on Select). Menu/Back dismisses.
-// Rendering: plain inverted-text rows, no borders or separators.
-
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
 use super::stack_fmt::StackFmt;
@@ -13,11 +8,9 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
 
-// layout constants
-
 const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (SCREEN_W - OVERLAY_W) / 2;
-const OVERLAY_BOTTOM: u16 = 760; // above button widgets (~14px clearance)
+const OVERLAY_BOTTOM: u16 = 760;
 const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
@@ -36,18 +29,15 @@ const MAX_ITEMS: usize = MAX_APP_ACTIONS + NUM_CORE;
 
 #[derive(Debug, Clone, Copy)]
 pub enum QuickActionKind {
-    // rotates through named options; value is the current index
     Cycle {
         value: u8,
         options: &'static [&'static str],
     },
-    // fires immediately on Select; display is the right-column label
     Trigger {
         display: &'static str,
     },
 }
 
-// app-provided quick action descriptor; id echoed in AppTrigger
 #[derive(Debug, Clone, Copy)]
 pub struct QuickAction {
     pub id: u8,
@@ -146,12 +136,10 @@ impl QuickMenu {
         }
     }
 
-    // set chrome font for menu item text; call on UI font size change
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
         self.font = Some(font);
     }
 
-    // open overlay with app-provided items; core items appended automatically
     pub fn show(&mut self, app_actions: &[QuickAction]) {
         let n_app = app_actions.len().min(MAX_APP_ACTIONS);
         self.app_count = n_app;
@@ -268,7 +256,6 @@ impl QuickMenu {
         }
     }
 
-    // cycle: advance value; trigger/core: fire and close
     fn activate_selected(&mut self) -> QuickMenuResult {
         match &mut self.items[self.selected].kind {
             MenuItemKind::AppCycle { value, options, .. } => {
@@ -350,7 +337,6 @@ impl QuickMenu {
 
         let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);
 
-        // clear the overlay background
         let outer = self.overlay_region;
         if outer.intersects(strip.logical_window()) {
             outer
@@ -368,7 +354,6 @@ impl QuickMenu {
             let label_region = self.item_label_region(i);
             let value_region = self.item_value_region(i);
 
-            // selected row: inverted (white text on black)
             if selected {
                 let row_region = Region::new(OVERLAY_X, self.item_y(i), OVERLAY_W, ITEM_H);
                 if row_region.intersects(strip.logical_window()) {
@@ -386,7 +371,6 @@ impl QuickMenu {
                 BinaryColor::On
             };
 
-            // draw label text
             if label_region.intersects(strip.logical_window()) {
                 font.draw_aligned(
                     strip,
@@ -397,14 +381,12 @@ impl QuickMenu {
                 );
             }
 
-            // draw value text
             if value_region.intersects(strip.logical_window()) {
                 self.format_value(i, &mut val_buf);
                 font.draw_aligned(strip, value_region, val_buf.as_str(), Alignment::Center, fg);
             }
         }
 
-        // help text at the bottom
         let help = match &self.items[self.selected].kind {
             MenuItemKind::AppCycle { .. } => "Up/Down: move  Jump: adjust  Sel: cycle  Menu: close",
             _ => "Up/Down: move  Sel: activate  Menu: close",

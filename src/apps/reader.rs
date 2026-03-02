@@ -1,7 +1,4 @@
-// Plain text and EPUB reader.
-// TXT: lazy page-indexed with prefetch. EPUB: ZIP/OPF parsed once,
-// chapters stream-decompressed + HTML-stripped to SD cache; then both
-// formats read identically. Cache keyed on file size + name hash.
+// Reader: TXT (lazy page-indexed) or EPUB (ZIP/OPF → SD cache).
 
 extern crate alloc;
 
@@ -54,20 +51,14 @@ const NO_PREFETCH: usize = usize::MAX;
 const TEXT_W: u32 = (SCREEN_W - 2 * MARGIN) as u32;
 const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - BUTTON_BAR_H;
 const EOCD_TAIL: usize = 512;
-const INDENT_PX: u32 = 24; // px per blockquote indent level
-
-// fixed display height for inline images; scaled to fit TEXT_W x IMAGE_DISPLAY_H
+const INDENT_PX: u32 = 24;
 const IMAGE_DISPLAY_H: u16 = 200;
-
-// when chapter stripped text fits in this limit, load into RAM once;
-// page turns become zero-SD-I/O memcpy + word-wrap (~96KB covers most chapters)
 const CHAPTER_CACHE_MAX: usize = 98304;
 
 const PROGRESS_H: u16 = 2;
 const PROGRESS_Y: u16 = SCREEN_H - PROGRESS_H - 1;
 const PROGRESS_W: u16 = SCREEN_W - 2 * MARGIN;
 
-// position overlay: centered banner shown while Next/Prev is held
 const POSITION_OVERLAY_W: u16 = 280;
 const POSITION_OVERLAY_H: u16 = 40;
 const POSITION_OVERLAY: Region = Region::new(
@@ -107,8 +98,8 @@ enum State {
 struct LineSpan {
     start: u16,
     len: u16,
-    flags: u8,  // bit 0 = bold, bit 1 = italic, bit 2 = heading
-    indent: u8, // blockquote indent depth (0 = none)
+    flags: u8,
+    indent: u8,
 }
 
 impl LineSpan {
@@ -122,8 +113,7 @@ impl LineSpan {
     const FLAG_BOLD: u8 = 1 << 0;
     const FLAG_ITALIC: u8 = 1 << 1;
     const FLAG_HEADING: u8 = 1 << 2;
-    // first line of an inline image block; start/len point to src path in buf.
-    // continuation lines have FLAG_IMAGE set with len == 0.
+    // image origin: len > 0, start/len = src path; continuation lines: len == 0
     const FLAG_IMAGE: u8 = 1 << 3;
 
     #[inline]
@@ -131,7 +121,6 @@ impl LineSpan {
         self.flags & Self::FLAG_IMAGE != 0
     }
 
-    // true for the first line of an image block (carries the path)
     #[inline]
     fn is_image_origin(&self) -> bool {
         self.is_image() && self.len > 0
@@ -185,7 +174,6 @@ pub struct ReaderApp {
     error: Option<&'static str>,
     show_position: bool,
 
-    // EPUB state
     is_epub: bool,
     zip: ZipIndex,
     meta: EpubMeta,
@@ -194,7 +182,6 @@ pub struct ReaderApp {
     goto_last_page: bool,
     restore_offset: Option<u32>,
 
-    // EPUB chapter cache (SD-backed)
     cache_dir: [u8; 8],
     epub_name_hash: u32,
     epub_file_size: u32,
@@ -202,33 +189,22 @@ pub struct ReaderApp {
     chapters_cached: bool,
     cache_chapter: u16,
 
-    // RAM chapter cache: entire chapter held in heap; page turns are
-    // zero-SD-I/O memcpy + word-wrap. cleared on chapter change/exit.
     ch_cache: Vec<u8>,
-
-    // decoded image for current page; cleared on page turn/chapter change
     page_img: Option<DecodedImage>,
-
-    // table of contents
     toc: EpubToc,
     toc_source: Option<TocSource>,
     toc_selected: usize,
     toc_scroll: usize,
 
-    // fonts (None = FONT_6X13 fallback)
     fonts: Option<fonts::FontSet>,
     font_line_h: u16,
     font_ascent: u16,
     max_lines: usize,
 
-    // persisted font preference; set by main before on_enter
     book_font_size_idx: u8,
     applied_font_idx: u8,
 
-    // chrome font for header/status/loading text
     chrome_font: Option<&'static BitmapFont>,
-
-    // quick-action buffer (rebuilt on state changes)
     qa_buf: [QuickAction; QA_MAX],
     qa_count: usize,
 }
@@ -306,7 +282,6 @@ impl ReaderApp {
         self.rebuild_quick_actions();
     }
 
-    // set chrome font; called from main on UI font size change
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
         self.chrome_font = Some(font);
     }
@@ -322,7 +297,6 @@ impl ReaderApp {
         );
         n += 1;
 
-        // chapter nav only for multi-chapter EPUBs
         if self.is_epub && self.spine.len() > 1 {
             self.qa_buf[n] = QuickAction::trigger(QA_PREV_CHAPTER, "Prev Ch", "<<<");
             n += 1;
@@ -338,7 +312,6 @@ impl ReaderApp {
         self.qa_count = n;
     }
 
-    // reinit font metrics from book_font_size_idx
     fn apply_font_metrics(&mut self) {
         self.fonts = None;
         self.font_line_h = LINE_H;
@@ -415,12 +388,10 @@ impl ReaderApp {
             let spine_len = self.spine.len() as u64;
             let ch = self.chapter as u64;
 
-            // last page of last chapter = 100%
             if ch + 1 >= spine_len && self.fully_indexed && self.page + 1 >= self.total_pages {
                 return 100;
             }
 
-            // within-chapter progress (0-100)
             let in_ch = if self.file_size == 0 {
                 0u64
             } else {
@@ -429,12 +400,10 @@ impl ReaderApp {
                 ((pos * 100) / size).min(100)
             };
 
-            // overall: (chapter * 100 + in_chapter_pct) / spine_len
             let overall = (ch * 100 + in_ch) / spine_len;
             return overall.min(100) as u8;
         }
 
-        // TXT fallback
         if self.file_size == 0 {
             return 100;
         }
@@ -528,7 +497,6 @@ impl ReaderApp {
         &mut self,
         svc: &mut Services<'_, SPI>,
     ) -> Result<(), &'static str> {
-        // fast path: chapter in RAM; memcpy + wrap, zero SD I/O
         if !self.ch_cache.is_empty() {
             let start = (self.offsets[self.page] as usize).min(self.ch_cache.len());
             let end = (start + PAGE_BUF).min(self.ch_cache.len());
@@ -539,7 +507,6 @@ impl ReaderApp {
             self.buf_len = n;
             self.prefetch_page = NO_PREFETCH;
             self.prefetch_len = 0;
-            // offsets already known from preindex_all_pages
             self.wrap_lines_counted(n);
             self.decode_page_images(svc);
             return Ok(());
@@ -549,7 +516,6 @@ impl ReaderApp {
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
         if self.prefetch_page == self.page {
-            // prefetch hit
             core::mem::swap(&mut self.buf, &mut self.prefetch);
             self.buf_len = self.prefetch_len;
             self.prefetch_page = NO_PREFETCH;
@@ -623,7 +589,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // scan current page for image-origin lines, decode first image into page_img
     fn decode_page_images<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -634,8 +599,7 @@ impl ReaderApp {
             return;
         }
 
-        // find first image-origin line; copy src path to local buf to
-        // avoid borrowing self.buf across &mut self calls below
+        // copy src path to local buf to avoid borrowing self.buf below
         let mut src_buf = [0u8; 128];
         let mut src_len = 0usize;
         for i in 0..self.line_count {
@@ -662,7 +626,6 @@ impl ReaderApp {
 
         log::info!("reader: decoding image: {}", src_str);
 
-        // resolve src path against chapter's directory
         let ch_zip_idx = self.spine.items[self.chapter as usize] as usize;
         let ch_path = self.zip.entry_name(ch_zip_idx);
         let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -674,7 +637,6 @@ impl ReaderApp {
             Err(_) => return,
         };
 
-        // try SD image cache first
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
         let img_name = img_cache_name(cache::fnv1a(full_path.as_bytes()));
@@ -691,7 +653,6 @@ impl ReaderApp {
             return;
         }
 
-        // cache miss; decode from ZIP
         let zip_idx = match self
             .zip
             .find(full_path)
@@ -708,7 +669,6 @@ impl ReaderApp {
         let (nb, nl) = self.name_copy();
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
-        // absolute byte offset of the entry's raw data
         let data_offset = {
             let mut hdr = [0u8; 30];
             if svc
@@ -727,7 +687,6 @@ impl ReaderApp {
             }
         };
 
-        // detect format from extension; fall back to magic bytes for STORED entries
         let ext_jpeg = full_path.ends_with(".jpg")
             || full_path.ends_with(".jpeg")
             || full_path.ends_with(".JPG")
@@ -754,7 +713,6 @@ impl ReaderApp {
             return;
         }
 
-        // free chapter RAM cache to maximise heap for image decode
         if !self.ch_cache.is_empty() {
             log::info!(
                 "reader: releasing {} KB chapter cache for image decode",
@@ -764,7 +722,6 @@ impl ReaderApp {
         }
 
         let result = if is_jpeg && entry.method == zip::METHOD_STORED {
-            // stored JPEG: stream directly from SD
             let svc_ref = &*svc;
             smol_epub::jpeg::decode_jpeg_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
@@ -774,7 +731,6 @@ impl ReaderApp {
                 IMAGE_DISPLAY_H,
             )
         } else if is_jpeg {
-            // deflate JPEG: stream-decompress + decode
             let svc_ref = &*svc;
             smol_epub::jpeg::decode_jpeg_deflate_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
@@ -785,7 +741,6 @@ impl ReaderApp {
                 IMAGE_DISPLAY_H,
             )
         } else if entry.method == zip::METHOD_STORED {
-            // stored PNG: stream directly from SD
             let svc_ref = &*svc;
             smol_epub::png::decode_png_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
@@ -795,7 +750,6 @@ impl ReaderApp {
                 IMAGE_DISPLAY_H,
             )
         } else {
-            // deflate PNG: stream-decompress + decode
             let svc_ref = &*svc;
             smol_epub::png::decode_png_deflate_sd(
                 |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
@@ -827,7 +781,6 @@ impl ReaderApp {
         }
     }
 
-    // parse ZIP EOCD + central directory; heap freed on return
     fn epub_init_zip<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -870,7 +823,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // container.xml -> OPF -> spine + metadata; heap freed between steps
     fn epub_init_opf<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -927,7 +879,6 @@ impl ReaderApp {
             self.title[..n].copy_from_slice(&self.meta.title[..n]);
             self.title_len = n;
 
-            // persist title mapping for Files view
             if let Err(e) = svc.save_title(name, self.meta.title_str()) {
                 log::warn!("epub: failed to save title mapping: {}", e);
             }
@@ -938,7 +889,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // Ok(true) = cache hit; Ok(false) = miss (subdir created, cache_chapter=0)
     fn epub_check_cache<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -946,8 +896,7 @@ impl ReaderApp {
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
 
-        // read META.BIN into self.buf (already owned) to avoid
-        // ~2KB of stack temporaries that overflowed under esp-rtos
+        // read into self.buf to avoid ~2KB stack temporaries (esp-rtos overflow)
         let meta_cap = cache::META_MAX_SIZE.min(self.buf.len());
         if let Ok(n) = svc.read_pulp_sub_chunk(dir, cache::META_FILE, 0, &mut self.buf[..meta_cap])
             && let Ok(count) = cache::parse_cache_meta(
@@ -969,8 +918,6 @@ impl ReaderApp {
         Ok(false)
     }
 
-    // decompress + strip one chapter to SD; ~47KB heap freed on return.
-    // Ok(true) = more remain; Ok(false) = all done (META.BIN written).
     fn epub_cache_one_chapter<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -1053,7 +1000,6 @@ impl ReaderApp {
         );
     }
 
-    // load current chapter into ch_cache; returns true on success, false = fall back to paged SD
     fn try_cache_chapter<SPI: embedded_hal::spi::SpiDevice>(
         &mut self,
         svc: &mut Services<'_, SPI>,
@@ -1074,14 +1020,11 @@ impl ReaderApp {
             return false;
         }
 
-        // reuse existing buffer if it already holds this chapter's data
-        // (e.g. font-size change -> NeedIndex for the same chapter)
         if self.ch_cache.len() == ch_size {
             log::info!("chapter cache: reusing {} bytes in RAM", ch_size);
             return true;
         }
 
-        // reserve exact capacity; bail on OOM
         self.ch_cache = Vec::new();
         if self.ch_cache.try_reserve_exact(ch_size).is_err() {
             log::info!("chapter cache: OOM for {} bytes", ch_size);
@@ -1121,7 +1064,6 @@ impl ReaderApp {
         true
     }
 
-    // compute all page offsets from cached chapter text; CPU-only, no SD I/O
     fn preindex_all_pages(&mut self) {
         if self.ch_cache.is_empty() {
             return;
@@ -1268,8 +1210,6 @@ impl ReaderApp {
     }
 }
 
-// helpers
-
 /// Decode one UTF-8 character starting at `buf[pos]` (a lead byte >= 0xC0)
 /// and map the codepoint to a printable ASCII replacement.
 /// Returns `(ascii_byte, byte_length_consumed)`.
@@ -1338,7 +1278,6 @@ fn wrap_proportional(
     let mut sp: usize = 0;
     let mut sp_px: u32 = 0;
 
-    // style state; carried across lines, updated by markers
     let mut bold = false;
     let mut italic = false;
     let mut heading = false;
@@ -1377,14 +1316,11 @@ fn wrap_proportional(
     while i < n {
         let b = buf[i];
 
-        // 2-byte style markers: [MARKER, tag]; zero width, update state
         if b == MARKER && i + 1 < n {
-            // image reference: [MARKER, IMG_REF, len, path...]
             if buf[i + 1] == IMG_REF && i + 2 < n {
                 let path_len = buf[i + 2] as usize;
                 let path_start = i + 3;
                 if path_start + path_len <= n && path_len > 0 {
-                    // flush text accumulated on current line
                     if ls < i {
                         emit!(ls, i);
                         if lc >= max_l {
@@ -1392,11 +1328,9 @@ fn wrap_proportional(
                         }
                     }
 
-                    // how many text-line slots does the image occupy?
                     let line_h = fonts.line_height(fonts::Style::Regular);
                     let img_lines = (IMAGE_DISPLAY_H / line_h).max(1) as usize;
 
-                    // origin line; carries the src-path location
                     if lc < max_l {
                         lines[lc] = LineSpan {
                             start: path_start as u16,
@@ -1407,7 +1341,6 @@ fn wrap_proportional(
                         lc += 1;
                     }
 
-                    // continuation lines (empty; reserve vertical space)
                     for _ in 1..img_lines {
                         if lc >= max_l {
                             break;
@@ -1472,7 +1405,7 @@ fn wrap_proportional(
             continue;
         }
 
-        // UTF-8 multi-byte: decode entire sequence, use replacement char advance
+        // UTF-8 multi-byte
         if b >= 0xC0 {
             let (repl, seq_len) = decode_utf8_to_ascii(buf, i);
             let sty = current_style(bold, italic, heading);
@@ -1580,7 +1513,6 @@ fn read_full<SPI: embedded_hal::spi::SpiDevice>(
     Ok(())
 }
 
-// draw text with bitmap font (FONT_6X13 fallback), clearing region background
 fn draw_chrome_text(
     strip: &mut StripBuffer,
     region: Region,
@@ -1608,9 +1540,6 @@ fn draw_chrome_text(
     }
 }
 
-// image cache helpers
-
-// 8.3 filename for a cached 1-bit image: IMXXXXXX.BIN (lower 24 bits of hash)
 fn img_cache_name(hash: u32) -> [u8; 12] {
     let h = hash & 0x00FF_FFFF;
     let mut n = *b"IM000000.BIN";
@@ -1630,7 +1559,6 @@ fn img_cache_str(buf: &[u8; 12]) -> &str {
     core::str::from_utf8(buf).unwrap_or("IM000000.BIN")
 }
 
-// load a cached 1-bit image from SD; format: [u16 LE width][u16 LE height][1-bit data]
 fn load_cached_image<SPI: embedded_hal::spi::SpiDevice>(
     svc: &Services<'_, SPI>,
     dir: &str,
@@ -1669,7 +1597,6 @@ fn load_cached_image<SPI: embedded_hal::spi::SpiDevice>(
     })
 }
 
-// write a decoded 1-bit image to SD cache
 fn save_cached_image<SPI: embedded_hal::spi::SpiDevice>(
     svc: &Services<'_, SPI>,
     dir: &str,
@@ -1751,7 +1678,6 @@ impl App for ReaderApp {
         self.apply_font_metrics();
         if font_changed {
             self.reset_paging();
-            // page offsets depend on line height; SD cache is font-independent
             if self.is_epub && self.chapters_cached {
                 self.state = State::NeedIndex;
             } else {
@@ -1882,7 +1808,6 @@ impl App for ReaderApp {
 
                 State::NeedCacheChapter => match self.epub_cache_one_chapter(svc) {
                     Ok(true) => {
-                        // all cached; update loading indicator
                         ctx.mark_dirty(LOADING_REGION);
                     }
                     Ok(false) => {
@@ -1903,8 +1828,6 @@ impl App for ReaderApp {
 
                     self.epub_index_chapter();
 
-                    // try to load entire chapter into RAM; if it fits,
-                    // preindex all pages (~5ms for 50KB) for zero-SD-I/O turns
                     if self.try_cache_chapter(svc) {
                         self.preindex_all_pages();
                     }
@@ -1929,7 +1852,6 @@ impl App for ReaderApp {
 
                 State::NeedPage => {
                     if let Some(target_off) = self.restore_offset.take() {
-                        // restore: scan to saved byte offset
                         self.page = 0;
                         loop {
                             match self.load_and_prefetch(svc) {
@@ -1976,7 +1898,6 @@ impl App for ReaderApp {
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
-        // TOC navigation
         if self.state == State::ShowToc {
             match event {
                 ActionEvent::Press(Action::Back) => {
@@ -2046,12 +1967,10 @@ impl App for ReaderApp {
             }
         }
 
-        // normal reader navigation
         match event {
             ActionEvent::Press(Action::Back) => Transition::Pop,
             ActionEvent::LongPress(Action::Back) => Transition::Home,
 
-            // long press Next/Prev: rapid paging + position overlay
             ActionEvent::LongPress(Action::Next) => {
                 if self.state == State::Ready {
                     self.show_position = true;
@@ -2067,7 +1986,6 @@ impl App for ReaderApp {
                 Transition::None
             }
 
-            // release clears position overlay
             ActionEvent::Release(Action::Next) | ActionEvent::Release(Action::Prev) => {
                 if self.show_position {
                     self.show_position = false;
@@ -2125,7 +2043,6 @@ impl App for ReaderApp {
                     log::info!("toc: opening ({} entries)", self.toc.len());
                     self.toc_selected = 0;
                     self.toc_scroll = 0;
-                    // pre-select current chapter
                     for i in 0..self.toc.len() {
                         if self.toc.entries[i].spine_idx == self.chapter {
                             self.toc_selected = i;
@@ -2228,7 +2145,6 @@ impl App for ReaderApp {
 
         if self.state != State::Ready && self.state != State::Error && self.state != State::ShowToc
         {
-            // loading indicator during work states
             let mut lbuf = StackFmt::<48>::new();
             match self.state {
                 State::NeedCache | State::NeedCacheChapter => {
@@ -2259,7 +2175,6 @@ impl App for ReaderApp {
             return;
         }
 
-        // table of contents screen
         if self.state == State::ShowToc {
             let toc_len = self.toc.len();
             if self.fonts.is_some() {
@@ -2323,12 +2238,10 @@ impl App for ReaderApp {
             for i in 0..self.line_count {
                 let span = self.lines[i];
 
-                // inline image
                 if span.is_image() {
                     if span.is_image_origin() {
                         let y_top = TEXT_Y as i32 + i as i32 * line_h;
                         if let Some(ref img) = self.page_img {
-                            // centre horizontally
                             let img_x =
                                 MARGIN as i32 + ((TEXT_W as i32 - img.width as i32) / 2).max(0);
                             strip.blit_1bpp(
@@ -2342,7 +2255,6 @@ impl App for ReaderApp {
                                 true,
                             );
                         } else {
-                            // placeholder when image could not be decoded
                             let baseline = y_top + ascent;
                             fs.draw_str(
                                 strip,
@@ -2353,7 +2265,6 @@ impl App for ReaderApp {
                             );
                         }
                     }
-                    // continuation lines (and origin after blit) are blank
                     continue;
                 }
 
@@ -2379,7 +2290,6 @@ impl App for ReaderApp {
                         j += 2;
                         continue;
                     }
-                    // UTF-8 lead byte: decode full sequence, render ASCII replacement
                     if b >= 0xC0 {
                         let (repl, seq_len) = decode_utf8_to_ascii(line, j);
                         if (bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&repl) {
@@ -2410,7 +2320,6 @@ impl App for ReaderApp {
             }
         }
 
-        // progress bar
         if self.state == State::Ready && (self.file_size > 0 || self.is_epub) {
             let pct = self.progress_pct() as u32;
             let filled_w = (PROGRESS_W as u32 * pct / 100).min(PROGRESS_W as u32);
@@ -2425,7 +2334,6 @@ impl App for ReaderApp {
             }
         }
 
-        // position overlay (long-press feedback)
         if self.show_position
             && self.state == State::Ready
             && POSITION_OVERLAY.intersects(strip.logical_window())
@@ -2456,7 +2364,6 @@ impl App for ReaderApp {
                 let _ = write!(pbuf, "Page {}  ({}%)", self.page + 1, self.progress_pct());
             }
 
-            // inverted banner: black bg, white text
             POSITION_OVERLAY
                 .to_rect()
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))

@@ -57,7 +57,6 @@ mod cmd {
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
 }
 
-// region params threaded between split-phase partial refresh steps
 #[derive(Clone, Copy, Debug)]
 pub struct RenderState {
     pub px: u16,
@@ -78,8 +77,6 @@ pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     init_done: bool,
     initial_refresh: bool,
 }
-
-// blocking API
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
 where
@@ -114,8 +111,6 @@ where
         self.reset(delay);
         self.init_display(delay);
     }
-
-    // strip helpers
 
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips<F>(
@@ -156,7 +151,6 @@ where
         }
     }
 
-    // write BW normal + RED inverted; DU drives all pixels to BW target; corrects stale RED
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips_bw_inv_red<F>(
         &mut self,
@@ -188,16 +182,13 @@ where
                 }
             }
 
-            // BW: normal
             self.set_partial_ram_area(px, y, pw, rows);
             self.send_command(cmd::WRITE_RAM_BW);
             self.send_data(strip.data());
 
-            // RED: inverted; forces all pixels into DU diff
             for byte in strip.data_mut().iter_mut() {
                 *byte = !*byte;
             }
-            // re-apply edge masks
             if needs_mask && row_bytes > 0 {
                 for row in strip.data_mut().chunks_mut(row_bytes) {
                     row[0] |= left_mask;
@@ -212,7 +203,6 @@ where
         }
     }
 
-    // sync RED+BW with one draw per chunk (2N vs 3N SPI writes); DMA-backed
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips_dual<F>(
         &mut self,
@@ -258,8 +248,6 @@ where
         }
     }
 
-    // display init (matches GxEPD2 _InitDisplay)
-
     fn init_display(&mut self, delay: &mut Delay) {
         self.send_command(cmd::SW_RESET);
         delay.delay_millis(10);
@@ -281,8 +269,6 @@ where
         self.init_done = true;
     }
 
-    // coordinate helpers
-
     fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
         match self.rotation {
             Rotation::Deg0 => (x, y, w, h),
@@ -292,7 +278,6 @@ where
         }
     }
 
-    // transform logical region to byte-aligned physical coords + edge masks
     fn align_partial_region(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
         let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
 
@@ -320,11 +305,10 @@ where
         })
     }
 
-    // gates wired in reverse; Y flipped per GxEPD2
+    // gates wired in reverse; Y flipped, X inc / Y dec per GxEPD2
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
         let y_flipped = HEIGHT - y - h;
 
-        // X increment, Y decrement; compensates gate reversal
         self.send_command(cmd::DATA_ENTRY_MODE);
         self.send_data(&[0x01]);
 
@@ -353,8 +337,6 @@ where
             ((y_flipped + h - 1) >> 8) as u8,
         ]);
     }
-
-    // low-level SPI / busy
 
     // WFI between polls; BUSY falling-edge IRQ wakes; timer backstop
     fn wait_busy(&mut self, timeout_ms: u32) {
@@ -386,11 +368,6 @@ where
         let _ = self.spi.write(data);
     }
 
-    // split-phase partial refresh:
-    // phase1_bw -> start_du -> (busy wait / input) -> phase3_sync -> power_off_async
-    // use phase1_bw_inv_red when red_stale (phase 3 was skipped last cycle)
-
-    // write new content to BW RAM; returns None on degenerate region or initial_refresh set
     #[allow(clippy::too_many_arguments)]
     pub fn partial_phase1_bw<F>(
         &mut self,
@@ -427,7 +404,6 @@ where
         Some(rs)
     }
 
-    // write BW + inverted RED; use after skipped phase 3 to fix stale RED
     #[allow(clippy::too_many_arguments)]
     pub fn partial_phase1_bw_inv_red<F>(
         &mut self,
@@ -463,7 +439,6 @@ where
         Some(rs)
     }
 
-    // kick DU waveform (non-blocking); caller polls is_busy
     pub fn partial_start_du(&mut self, rs: &RenderState) {
         self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
 
@@ -477,13 +452,11 @@ where
         self.power_is_on = true;
     }
 
-    // true while controller is busy
     #[inline]
     pub fn is_busy(&mut self) -> bool {
         self.busy.is_high().unwrap_or(false)
     }
 
-    // sync both RAM planes after DU completes; call when is_busy is false
     pub fn partial_phase3_sync<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
     where
         F: Fn(&mut StripBuffer),
@@ -500,15 +473,10 @@ where
         );
     }
 
-    // true until first full refresh has been performed
     pub fn needs_initial_refresh(&self) -> bool {
         self.initial_refresh
     }
 
-    // split-phase full refresh:
-    // write_full_frame -> start_full_update -> (busy wait) -> finish_full_update
-
-    // write full frame to RED and BW RAM; does not kick GC waveform
     pub fn write_full_frame<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: &F)
     where
         F: Fn(&mut StripBuffer),
@@ -532,28 +500,23 @@ where
         }
     }
 
-    // kick GC waveform (non-blocking); BUSY high ~1.6s; poll is_busy then call finish_full_update
     pub fn start_full_update(&mut self) {
-        // bypass RED=0, BW normal
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        // mode 1: GC full waveform
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
         self.send_data(&[0xF7]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
     }
 
-    // finalise state after GC waveform completes
     pub fn finish_full_update(&mut self) {
         self.power_is_on = false;
         self.initial_refresh = false;
     }
 
-    // deep-sleep mode 1: image retained, ~3uA; requires hw reset to wake
+    // mode 1: image retained, ~3uA; requires hw reset to wake
     pub fn enter_deep_sleep(&mut self) {
-        // power off before sleeping
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
             self.send_data(&[0x83]);
@@ -562,14 +525,11 @@ where
             self.power_is_on = false;
         }
 
-        // mode 1: RAM retained, <3uA
         self.send_command(cmd::DEEP_SLEEP);
         self.send_data(&[0x01]);
         self.init_done = false;
     }
 }
-
-// async API: BUSY-wait replaced with .await; SPI writes remain synchronous
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
 where
@@ -578,7 +538,6 @@ where
     RST: OutputPin,
     BUSY: InputPin + embedded_hal_async::digital::Wait,
 {
-    // expose busy pin for external async wait
     pub fn busy_pin(&mut self) -> &mut BUSY {
         &mut self.busy
     }
@@ -587,7 +546,6 @@ where
         let _ = self.busy.wait_for_low().await;
     }
 
-    // async write_full_frame; SPI writes are blocking (DMA), no .await needed
     pub async fn write_full_frame_async<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -599,8 +557,6 @@ where
         self.write_full_frame(strip, delay, draw);
     }
 
-    // partial DU refresh in one await (~500ms); falls back to full GC on initial_refresh.
-    // runs phase1 (SPI writes), kicks DU, awaits BUSY low, then syncs both RAM planes.
     pub async fn partial_refresh_async<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -626,7 +582,6 @@ where
             None => return,
         };
 
-        // phase 1: write BW RAM
         self.write_region_strips(
             strip,
             rs.px,
@@ -639,11 +594,9 @@ where
             rs.right_mask,
         );
 
-        // phase 2: kick DU waveform and await completion
         self.partial_start_du(&rs);
         self.wait_busy_async().await;
 
-        // phase 3: sync both RAM planes
         self.write_region_strips_dual(
             strip,
             rs.px,
@@ -658,7 +611,6 @@ where
         self.power_off_async().await;
     }
 
-    // full GC refresh in one await (~1.6s); prefer split-phase in event loops
     pub async fn full_refresh_async<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -672,7 +624,6 @@ where
         self.initial_refresh = false;
     }
 
-    // async power-off (~200ms); awaits BUSY low
     pub async fn power_off_async(&mut self) {
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
@@ -684,11 +635,9 @@ where
     }
 
     async fn update_full_async(&mut self) {
-        // bypass RED=0, BW normal
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        // GC full waveform
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
         self.send_data(&[0xF7]);
 

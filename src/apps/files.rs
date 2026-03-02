@@ -1,6 +1,4 @@
 // Paginated file browser for SD card root directory.
-// In-page scroll marks two rows dirty; cross-page sets needs_load
-// and defers to AppWork for SD read + render decision.
 
 use core::fmt::Write as _;
 
@@ -19,7 +17,6 @@ use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 const PAGE_SIZE: usize = 7;
 
-// centered list column: 448px wide, 16px margins
 const LIST_X: u16 = 16;
 const LIST_W: u16 = 448;
 
@@ -127,7 +124,6 @@ impl FilesApp {
             self.scroll = self.scroll.saturating_sub(1);
             self.needs_load = true;
         } else if self.total > 0 {
-            // wrap to bottom
             self.scroll = self.total.saturating_sub(PAGE_SIZE);
             self.selected = self.total.saturating_sub(self.scroll) - 1;
             self.needs_load = true;
@@ -144,7 +140,6 @@ impl FilesApp {
             self.scroll += 1;
             self.needs_load = true;
         } else if self.total > 0 {
-            // wrap to top
             self.scroll = 0;
             self.selected = 0;
             self.needs_load = true;
@@ -334,7 +329,6 @@ impl App for FilesApp {
                     .draw(strip)
                     .unwrap();
             } else {
-                // clear phantom rows below list end
                 region
                     .to_rect()
                     .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))

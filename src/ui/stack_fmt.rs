@@ -1,6 +1,4 @@
-// No-alloc fmt::Write buffers.
-// StackFmt<N> owns a [u8; N]; BorrowedFmt wraps &mut [u8].
-// Both silently truncate on overflow.
+// No-alloc fmt::Write buffers; silently truncate on overflow.
 
 pub struct StackFmt<const N: usize> {
     buf: [u8; N],
@@ -85,7 +83,6 @@ impl core::fmt::Write for BorrowedFmt<'_> {
     }
 }
 
-// format into a borrowed slice via closure; returns bytes written
 #[inline]
 pub fn stack_fmt(buf: &mut [u8], f: impl FnOnce(&mut BorrowedFmt<'_>)) -> usize {
     let mut w = BorrowedFmt::new(buf);
