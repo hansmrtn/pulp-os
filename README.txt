@@ -1,9 +1,9 @@
 ABOUT
-    pulp-os - bare-metal e-reader firmware for the XTEink X4
+    pulp-os is a bare-metal e-reader firmware for the XTEink X4
 
     Embedded e-reader operating system targeting the XTEink X4 board
-    (ESP32-C3 + SSD1677 e-paper).  Written in Rust.  No OS, no std,
-    no framebuffer.  Async runtime provided by Embassy via esp-rtos.
+    (ESP32-C3 + SSD1677 e-paper). Written in Rust. No std no framebuffer.
+    Async runtime provided by Embassy via esp-rtos.
 
 HARDWARE
     MCU         ESP32-C3, single-core RISC-V RV32IMC, 160 MHz
@@ -23,10 +23,14 @@ HARDWARE
 
 BUILDING
     Requires stable Rust >= 1.88 and the riscv32imc-unknown-none-elf
-    target.  rust-toolchain.toml handles both automatically.
+    target. rust-toolchain.toml handles both automatically.
 
         cargo build --release
-        cargo espflash flash --release --monitor
+        espflash flash --monitor --chip esp32c3 /path/to/target/image
+
+        or
+
+        cargo run --release
 
 FEATURES
     txt reader      lazy page-indexed, read-ahead prefetch
@@ -53,84 +57,6 @@ CONTROLS
     Power (short)       open quick-action menu
     Power (long)        deep sleep
 
-SD CARD LAYOUT
-    /                       root; place .txt and .epub files here
-    /_PULP/                 app data (created at boot)
-    /_PULP/SETTINGS.TXT     settings (key=value text, editable)
-    /_PULP/BKMK.BIN         bookmarks (16 slots x 48 bytes)
-    /_PULP/TITLES.BIN       title index (append-only, tab-separated)
-    /_PULP/RECENT.BIN       last opened filename
-    /_PULP/<hash>/          epub chapter cache directories
-
-    SETTINGS.TXT format (lines starting with # are ignored):
-      sleep_timeout=10      minutes idle before sleep; 0 = never
-      ghost_clear=10        partial refreshes before full GC
-      book_font=1           0=Small  1=Medium  2=Large
-      ui_font=1             0=Small  1=Medium  2=Large
-      wifi_ssid=MyNetwork   SSID for upload mode
-      wifi_pass=secret      password for upload mode
-
-    Bookmark slot layout (48 bytes each):
-      0:4   name_hash       FNV-1a of filename
-      4:4   byte_offset     file/chapter position
-      8:2   chapter         epub chapter; 0 for txt
-     10:2   flags           bit 0 = valid
-     12:2   generation      LRU counter
-     14:1   name_len
-     15:1   pad
-     16:32  filename
-
-SOURCE LAYOUT
-    src/
-      bin/main.rs           async entry point, event loop, rendering
-      lib.rs                crate root
-      kernel/
-        tasks.rs            spawned tasks (input, housekeeping, idle)
-        wake.rs             uptime helper
-      board/
-        mod.rs              SPI/DMA init, peripheral wiring
-        action.rs           semantic actions, button-to-action mapper
-        button.rs           button enum, ADC ladder decode
-        raw_gpio.rs         register-level GPIO for unmapped pins
-      drivers/
-        ssd1677.rs          e-paper controller driver
-        strip.rs            4 KB strip render buffer (no framebuffer)
-        input.rs            debounced ADC + GPIO input, long press, repeat
-        sdcard.rs           SD card over SPI, FAT volume manager
-        storage.rs          file ops, directory cache, _PULP helpers
-        battery.rs          ADC-to-mV, discharge curve LUT
-      fonts/
-        mod.rs              font selection, FontSet (regular/bold/italic)
-        bitmap.rs           1-bit glyph blit, string measurement
-      ui/
-        widget.rs           Region, Alignment, wrap helpers
-        bitmap_label.rs     proportional-font label widgets
-        statusbar.rs        top bar, stack painting, heap stats
-        quick_menu.rs       overlay menu (cycle + trigger actions)
-        button_feedback.rs  edge button labels
-      apps/
-        mod.rs              App trait, Launcher nav stack, Services
-        home.rs             launcher menu + bookmark browser
-        files.rs            paginated SD file browser
-        reader.rs           txt + epub reader
-        settings.rs         persistent settings editor
-        upload.rs           wifi HTTP upload server
-        bookmarks.rs        RAM-resident bookmark cache
-
-    smol-epub/              no_std epub parser crate
-      src/
-        zip.rs              ZIP central directory, streaming DEFLATE
-        xml.rs              minimal XML tag/attribute scanner
-        css.rs              CSS property parser
-        epub.rs             container.xml, OPF spine, NCX/NAV TOC
-        html_strip.rs       streaming HTML-to-styled-text converter
-        cache.rs            chapter decompress + strip pipeline
-        png.rs              PNG decoder, Floyd-Steinberg dither
-        jpeg.rs             JPEG decoder, Floyd-Steinberg dither
-
-    build.rs                TTF rasterisation, linker config
-    assets/fonts/           source TTFs (Regular, Bold, Italic)
-
 RUNTIME ARCHITECTURE
     Embassy async executor on esp-rtos.  Four concurrent tasks:
 
@@ -141,29 +67,41 @@ RUNTIME ARCHITECTURE
 
     CPU sleeps (WFI) whenever all tasks are waiting.
 
-DESIGN NOTES
-    No dyn dispatch.  The with_app!() macro statically dispatches to
-    each concrete app struct.  No vtable, no heap indirection.
+NOTES
+    No dyn dispatch.  with_app!() macro matches AppId, expands to
+    concrete calls per app struct.  All monomorphised; no vtable.
 
-    Apps never touch hardware.  All I/O goes through the Services
-    handle passed to on_work().  Clean syscall boundary.
+    Apps never touch hardware.  Services mediates all I/O (SD, dir
+    cache, bookmarks) and is only passed in via on_work().
 
-    Strip-buffered rendering.  The display is driven in 4 KB horizontal
-    strips (40 rows each, 12 strips total) instead of a 48 KB
-    framebuffer.  Widgets draw to logical coordinates; the strip
-    buffer handles rotation and clipping.
+    Dirty-region tracking.  Apps call ctx.mark_dirty(region); regions
+    are unioned per frame.  Partial DU or full GC issued accordingly.
 
-    Heavy statics in .bss.  Large structs (ReaderApp, StripBuffer,
-    BookmarkCache) are placed in static storage via ConstStaticCell
-    so the async future stays small (~200 B).
+    Strip rendering.  12 x 40-row strips (4 KB each) instead of a
+    48 KB framebuffer.  Draw callback fires per strip during DMA.
+    Windowed mode for partial refresh; widgets use logical coords.
 
-    Partial refresh owns the render path.  Apps call mark_dirty(region)
-    for targeted updates.  Full GC refresh is forced periodically and
-    on screen transitions.  DU waveform runs concurrently with input
-    processing and page prefetch.
+    Heavy statics.  Large structs live in ConstStaticCell / StaticCell
+    so the async future stays ~200 B.  Taken once, passed as &'static mut.
 
-    Heap is used only for EPUB chapter text and image decode buffers
-    (alloc::vec).  Everything else is stack or static.
+    Nav stack.  Launcher holds a 4-deep AppId stack.  Transitions
+    (Push/Pop/Replace/Home) drive on_suspend / on_enter lifecycle.
+
+    Quick menu.  Power button opens a per-app overlay; drawn inline
+    during the strip pass.  Refresh and go-home always available.
+
+    Heap budget.  140 KB heap; used only for epub chapter text and
+    image decode (alloc::vec).  Peak ~79 KB.  Rest is stack/static.
+
+    smol-epub.  Companion no_std crate: ZIP/DEFLATE, OPF spine,
+    streaming HTML strip, 1-bit Floyd-Steinberg PNG/JPEG decoders.
+    All I/O via generic read closure; storage-agnostic.
+
+    Input.  ADC ladders sampled at 100 Hz, debounced, long-press and
+    repeat detected in driver.  ButtonMapper maps to semantic actions.
+
+    Fonts.  build.rs rasterises TTFs via fontdue into 1-bit bitmaps
+    at three sizes.  Book and UI sizes independently hot-swappable.
 
 LICENSE
     MIT
