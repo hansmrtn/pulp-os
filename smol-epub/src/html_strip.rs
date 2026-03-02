@@ -53,6 +53,7 @@ const IMG_SRC_CAP: usize = 128; // 3-byte marker header + up to 125 path bytes
 #[repr(u8)]
 enum Phase {
     Text,
+    Utf8Cont,
     AfterLt,
     TagName,
     TagBody,
@@ -114,6 +115,10 @@ pub struct HtmlStripStream {
     trailing_nl: u8, // deferred newlines; flushed before next visible byte; capped at 2
     has_output: bool, // true once any visible char emitted; suppresses leading whitespace
 
+    // UTF-8 multi-byte accumulator (used in Utf8Cont phase)
+    utf8_acc: u32,
+    utf8_remaining: u8,
+
     // deferred open-style markers; open-tag markers (bold on, heading on, etc.)
     // appear AFTER paragraph-break newlines and BEFORE text.
     // close-tag markers go to `pending` immediately (before paragraph newlines).
@@ -154,6 +159,8 @@ impl HtmlStripStream {
             last_was_space: true,
             trailing_nl: 0,
             has_output: false,
+            utf8_acc: 0,
+            utf8_remaining: 0,
             deferred: [0u8; DEFERRED_CAP],
             deferred_len: 0,
             pending: [0u8; PENDING_CAP],
@@ -226,8 +233,46 @@ impl HtmlStripStream {
                         self.phase = Phase::Entity;
                     } else if is_html_ws(b) {
                         self.queue_ws();
+                    } else if b >= 0xC0 {
+                        // UTF-8 lead byte: start multi-byte accumulation
+                        if b < 0xE0 {
+                            self.utf8_acc = (b as u32) & 0x1F;
+                            self.utf8_remaining = 1;
+                        } else if b < 0xF0 {
+                            self.utf8_acc = (b as u32) & 0x0F;
+                            self.utf8_remaining = 2;
+                        } else {
+                            self.utf8_acc = (b as u32) & 0x07;
+                            self.utf8_remaining = 3;
+                        }
+                        self.phase = Phase::Utf8Cont;
+                    } else if b >= 0x80 {
+                        // stray continuation byte; skip silently
                     } else {
                         self.queue_text(b);
+                    }
+                }
+
+                // UTF-8 continuation bytes; accumulate then map to ASCII
+                Phase::Utf8Cont => {
+                    if b & 0xC0 == 0x80 {
+                        self.utf8_acc = (self.utf8_acc << 6) | (b as u32 & 0x3F);
+                        self.utf8_remaining -= 1;
+                        if self.utf8_remaining == 0 {
+                            if let Some(ascii) = codepoint_to_byte(self.utf8_acc) {
+                                if is_html_ws(ascii) {
+                                    self.queue_ws();
+                                } else {
+                                    self.queue_text(ascii);
+                                }
+                            }
+                            self.phase = Phase::Text;
+                        }
+                    } else {
+                        // broken sequence; emit replacement and reprocess byte
+                        self.queue_text(b'?');
+                        self.phase = Phase::Text;
+                        advance = false;
                     }
                 }
 
@@ -914,6 +959,30 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
                 last_was_space = true;
                 trailing_nl = 0;
             }
+        } else if b >= 0xC0 {
+            // UTF-8 multi-byte sequence; decode and replace with ASCII approx
+            let (cp, seq_len) = decode_utf8_char(buf, r, len);
+            if let Some(ascii) = codepoint_to_byte(cp) {
+                if is_html_ws(ascii) {
+                    if !last_was_space {
+                        buf[w] = b' ';
+                        w += 1;
+                        last_was_space = true;
+                        trailing_nl = 0;
+                    }
+                } else {
+                    buf[w] = ascii;
+                    w += 1;
+                    last_was_space = false;
+                    trailing_nl = 0;
+                }
+            }
+            r += seq_len;
+            continue;
+        } else if b >= 0x80 {
+            // stray continuation byte; skip
+            r += 1;
+            continue;
         } else {
             buf[w] = b;
             w += 1;
@@ -1079,15 +1148,47 @@ fn codepoint_to_byte(cp: u32) -> Option<u8> {
     match cp {
         0 => None,
         0x0001..=0x007F => Some(cp as u8),
-        0x00A0 => Some(b' '), // nbsp
-        0x00AD => Some(b'-'), // soft hyphen
-        0x2013 | 0x2014 => Some(b'-'),
-        0x2018..=0x201A => Some(b'\''),
-        0x201C..=0x201E => Some(b'"'),
-        0x2022 => Some(b'*'),
-        0x2026 => Some(b'.'),
-        _ => Some(b'?'), // unicode placeholder
+        0x00A0 => Some(b' '),           // nbsp
+        0x00AB | 0x00BB => Some(b'"'),  // « »
+        0x00AD => Some(b'-'),           // soft hyphen
+        0x00B7 => Some(b'.'),           // middle dot
+        0x00D7 => Some(b'x'),           // multiplication sign
+        0x00F7 => Some(b'/'),           // division sign
+        0x2010..=0x2015 => Some(b'-'),  // hyphens, dashes (figure dash, horiz bar)
+        0x2018..=0x201B => Some(b'\''), // single quotes (left, right, low-9, reversed-9)
+        0x201C..=0x201F => Some(b'"'),  // double quotes (left, right, low-9, reversed-9)
+        0x2022 => Some(b'*'),           // bullet
+        0x2026 => Some(b'.'),           // horizontal ellipsis
+        0x2032 => Some(b'\''),          // prime
+        0x2033 => Some(b'"'),           // double prime
+        0x2039 | 0x203A => Some(b'\''), // single guillemets
+        0x2212 => Some(b'-'),           // minus sign
+        _ => Some(b'?'),                // unmapped codepoint
     }
+}
+
+/// Decode one UTF-8 character starting at `buf[pos]` (which must be a lead byte >= 0xC0).
+/// Returns `(codepoint, byte_length)`. On malformed input returns `(0xFFFD, 1)`.
+fn decode_utf8_char(buf: &[u8], pos: usize, len: usize) -> (u32, usize) {
+    let b0 = buf[pos];
+    let (mut cp, expected) = if b0 < 0xE0 {
+        ((b0 as u32) & 0x1F, 2)
+    } else if b0 < 0xF0 {
+        ((b0 as u32) & 0x0F, 3)
+    } else {
+        ((b0 as u32) & 0x07, 4)
+    };
+    if pos + expected > len {
+        return (0xFFFD, len - pos); // truncated sequence; consume remaining
+    }
+    for i in 1..expected {
+        let cont = buf[pos + i];
+        if cont & 0xC0 != 0x80 {
+            return (0xFFFD, i); // broken: stop before bad byte
+        }
+        cp = (cp << 6) | (cont as u32 & 0x3F);
+    }
+    (cp, expected)
 }
 
 // in-place entity decoding; separate from resolve_entity
@@ -1145,17 +1246,9 @@ fn decode_entity_inplace(input: &[u8], pos: usize) -> (DecodedInplace, usize) {
 }
 
 fn codepoint_to_decoded_inplace(cp: u32) -> DecodedInplace {
-    match cp {
-        0 => DecodedInplace::None,
-        0x0001..=0x007F => DecodedInplace::Byte(cp as u8),
-        0x00A0 => DecodedInplace::Byte(b' '),
-        0x00AD => DecodedInplace::Byte(b'-'),
-        0x2013 | 0x2014 => DecodedInplace::Byte(b'-'),
-        0x2018..=0x201A => DecodedInplace::Byte(b'\''),
-        0x201C..=0x201E => DecodedInplace::Byte(b'"'),
-        0x2022 => DecodedInplace::Byte(b'*'),
-        0x2026 => DecodedInplace::Byte(b'.'),
-        _ => DecodedInplace::Byte(b'?'),
+    match codepoint_to_byte(cp) {
+        Some(b) => DecodedInplace::Byte(b),
+        None => DecodedInplace::None,
     }
 }
 

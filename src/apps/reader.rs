@@ -1266,6 +1266,50 @@ impl ReaderApp {
 
 // helpers
 
+/// Decode one UTF-8 character starting at `buf[pos]` (a lead byte >= 0xC0)
+/// and map the codepoint to a printable ASCII replacement.
+/// Returns `(ascii_byte, byte_length_consumed)`.
+fn decode_utf8_to_ascii(buf: &[u8], pos: usize) -> (u8, usize) {
+    let b0 = buf[pos];
+    let (mut cp, expected) = if b0 < 0xE0 {
+        ((b0 as u32) & 0x1F, 2)
+    } else if b0 < 0xF0 {
+        ((b0 as u32) & 0x0F, 3)
+    } else {
+        ((b0 as u32) & 0x07, 4)
+    };
+    let len = buf.len();
+    if pos + expected > len {
+        return (b'?', len - pos);
+    }
+    for i in 1..expected {
+        let cont = buf[pos + i];
+        if cont & 0xC0 != 0x80 {
+            return (b'?', i);
+        }
+        cp = (cp << 6) | (cont as u32 & 0x3F);
+    }
+    let ascii = match cp {
+        0x00A0 => b' ',           // non-breaking space
+        0x00AB | 0x00BB => b'"',  // « »
+        0x00AD => b'-',           // soft hyphen
+        0x00B7 => b'.',           // middle dot
+        0x00D7 => b'x',           // multiplication sign
+        0x00F7 => b'/',           // division sign
+        0x2010..=0x2015 => b'-',  // hyphens, en-dash, em-dash, etc.
+        0x2018..=0x201B => b'\'', // single curly quotes
+        0x201C..=0x201F => b'"',  // double curly quotes
+        0x2022 => b'*',           // bullet
+        0x2026 => b'.',           // horizontal ellipsis
+        0x2032 => b'\'',          // prime
+        0x2033 => b'"',           // double prime
+        0x2039 | 0x203A => b'\'', // single guillemets
+        0x2212 => b'-',           // minus sign
+        _ => b'?',
+    };
+    (ascii, expected)
+}
+
 fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {
     if end > start && buf[end - 1] == b'\r' {
         end - 1
@@ -1420,6 +1464,37 @@ fn wrap_proportional(
             if lc >= max_l {
                 return (ls, lc);
             }
+            i += 1;
+            continue;
+        }
+
+        // UTF-8 multi-byte: decode entire sequence, use replacement char advance
+        if b >= 0xC0 {
+            let (repl, seq_len) = decode_utf8_to_ascii(buf, i);
+            let sty = current_style(bold, italic, heading);
+            let adv = fonts.advance(repl as char, sty) as u32;
+            px += adv;
+            if px > max_w {
+                if sp > ls {
+                    emit!(ls, sp);
+                    px -= sp_px;
+                    ls = sp;
+                } else {
+                    emit!(ls, i);
+                    ls = i;
+                    px = adv;
+                }
+                sp = ls;
+                sp_px = 0;
+                if lc >= max_l {
+                    return (ls, lc);
+                }
+            }
+            i += seq_len;
+            continue;
+        }
+        if b >= 0x80 {
+            // stray continuation byte; skip without affecting layout
             i += 1;
             continue;
         }
@@ -2300,9 +2375,18 @@ impl App for ReaderApp {
                         j += 2;
                         continue;
                     }
+                    // UTF-8 lead byte: decode full sequence, render ASCII replacement
+                    if b >= 0xC0 {
+                        let (repl, seq_len) = decode_utf8_to_ascii(line, j);
+                        if (bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&repl) {
+                            cx += fs.draw_char(strip, repl as char, sty, cx, baseline) as i32;
+                        }
+                        j += seq_len;
+                        continue;
+                    }
                     if !(bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&b) {
                         j += 1;
-                        continue; // non-printable
+                        continue; // stray continuation byte or control char
                     }
                     cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
                     j += 1;
