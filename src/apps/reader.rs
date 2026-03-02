@@ -7,7 +7,6 @@ extern crate alloc;
 
 use crate::fonts::bitmap::{self, BitmapFont};
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -856,7 +855,11 @@ impl ReaderApp {
             epub_size
         );
 
-        let mut cd_buf = vec![0u8; cd_size as usize];
+        let mut cd_buf = Vec::new();
+        cd_buf
+            .try_reserve_exact(cd_size as usize)
+            .map_err(|_| "epub: CD too large for memory")?;
+        cd_buf.resize(cd_size as usize, 0);
         read_full(svc, name, cd_offset, &mut cd_buf)?;
         self.zip.clear();
         self.zip.parse_central_directory(&cd_buf)?;
@@ -875,15 +878,16 @@ impl ReaderApp {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
-        let container_idx = self
-            .zip
-            .find("META-INF/container.xml")
-            .ok_or("epub: no container.xml")?;
-        let container_data = extract_zip_entry(svc, name, &self.zip, container_idx)?;
-
         let mut opf_path_buf = [0u8; epub::OPF_PATH_CAP];
-        let opf_path_len = epub::parse_container(&container_data, &mut opf_path_buf)?;
-        drop(container_data);
+        let opf_path_len = if let Some(container_idx) = self.zip.find("META-INF/container.xml") {
+            let container_data = extract_zip_entry(svc, name, &self.zip, container_idx)?;
+            let len = epub::parse_container(&container_data, &mut opf_path_buf)?;
+            drop(container_data);
+            len
+        } else {
+            log::warn!("epub: no container.xml, scanning for .opf");
+            epub::find_opf_in_zip(&self.zip, &mut opf_path_buf)?
+        };
 
         let opf_path = core::str::from_utf8(&opf_path_buf[..opf_path_len])
             .map_err(|_| "epub: bad opf path")?;
@@ -1066,7 +1070,7 @@ impl ReaderApp {
         };
 
         if ch_size == 0 || ch_size > CHAPTER_CACHE_MAX {
-            self.ch_cache.clear();
+            self.ch_cache = Vec::new();
             return false;
         }
 
@@ -1078,7 +1082,7 @@ impl ReaderApp {
         }
 
         // reserve exact capacity; bail on OOM
-        self.ch_cache.clear();
+        self.ch_cache = Vec::new();
         if self.ch_cache.try_reserve_exact(ch_size).is_err() {
             log::info!("chapter cache: OOM for {} bytes", ch_size);
             return false;
@@ -1103,7 +1107,7 @@ impl ReaderApp {
                 Ok(_) => break,
                 Err(e) => {
                     log::info!("chapter cache: SD read failed at {}: {}", pos, e);
-                    self.ch_cache.clear();
+                    self.ch_cache = Vec::new();
                     return false;
                 }
             }
@@ -1707,7 +1711,7 @@ impl App for ReaderApp {
         self.is_epub = epub::is_epub_filename(self.name());
         self.rebuild_quick_actions();
         self.reset_paging();
-        self.ch_cache.clear();
+        self.ch_cache = Vec::new();
         self.file_size = 0;
         self.chapter = 0;
         self.error = None;
@@ -1731,7 +1735,7 @@ impl App for ReaderApp {
         self.prefetch_len = 0;
         self.restore_offset = None;
         self.show_position = false;
-        self.ch_cache.clear();
+        self.ch_cache = Vec::new();
         self.page_img = None;
 
         if self.is_epub {

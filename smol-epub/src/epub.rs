@@ -231,6 +231,26 @@ pub fn parse_container(data: &[u8], out: &mut [u8; OPF_PATH_CAP]) -> Result<usiz
     found_len.ok_or("epub: no rootfile full-path in container.xml")
 }
 
+/// Scan ZIP entries for a `.opf` file and return its path.
+///
+/// This is a fallback for EPUBs that lack `META-INF/container.xml`.
+/// Writes the first `.opf` entry name into `out` and returns its byte length.
+pub fn find_opf_in_zip(
+    zip: &ZipIndex,
+    out: &mut [u8; OPF_PATH_CAP],
+) -> Result<usize, &'static str> {
+    for i in 0..zip.count() {
+        let name = zip.entry_name(i);
+        let bytes = name.as_bytes();
+        if bytes.len() >= 5 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".opf") {
+            let n = bytes.len().min(OPF_PATH_CAP);
+            out[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
+    }
+    Err("epub: no .opf file found in archive")
+}
+
 /// Parse an OPF document: extract metadata and build the reading-order spine.
 ///
 /// Two-pass, zero heap: phase 1 collects `idref` byte offsets

@@ -217,6 +217,10 @@ impl DirCache {
                 if matches!(entry.name.base_name()[0], b'.' | b'_') {
                     return;
                 }
+                // hide files the device cannot open
+                if !entry.attributes.is_directory() && !is_supported_ext(entry.name.extension()) {
+                    return;
+                }
                 if count < MAX_DIR_ENTRIES {
                     let mut name_buf = [0u8; 13];
                     let name_len = format_83_name(&entry.name, &mut name_buf);
@@ -348,6 +352,32 @@ impl DirCache {
 }
 
 // insertion sort: dirs first, then filenames case-insensitive
+/// Check whether a FAT 8.3 extension (3 bytes, space-padded) belongs to a
+/// file type the device can open.
+/// Supported: TXT, MD, EPU(B), JPG, JPE(G), PNG.
+fn is_supported_ext(ext: &[u8]) -> bool {
+    if ext.len() < 3 {
+        // 2-char extension: only "MD" (padded with space)
+        return ext.len() == 2
+            && ext[0].to_ascii_uppercase() == b'M'
+            && ext[1].to_ascii_uppercase() == b'D';
+    }
+    let e = [
+        ext[0].to_ascii_uppercase(),
+        ext[1].to_ascii_uppercase(),
+        ext[2].to_ascii_uppercase(),
+    ];
+    matches!(
+        e,
+        [b'T', b'X', b'T']
+            | [b'M', b'D', b' ']
+            | [b'E', b'P', b'U']
+            | [b'J', b'P', b'G']
+            | [b'J', b'P', b'E']
+            | [b'P', b'N', b'G']
+    )
+}
+
 fn sort_entries(entries: &mut [DirEntry]) {
     for i in 1..entries.len() {
         let key = entries[i];
