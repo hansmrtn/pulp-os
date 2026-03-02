@@ -194,6 +194,7 @@ pub struct ReaderApp {
 
     ch_cache: Vec<u8>,
     page_img: Option<DecodedImage>,
+    fullscreen_img: bool,
     toc: EpubToc,
     toc_source: Option<TocSource>,
     toc_selected: usize,
@@ -259,6 +260,7 @@ impl ReaderApp {
             ch_cache: Vec::new(),
 
             page_img: None,
+            fullscreen_img: false,
 
             toc: EpubToc::new(),
             toc_source: None,
@@ -496,6 +498,7 @@ impl ReaderApp {
         self.prefetch_page = NO_PREFETCH;
         self.prefetch_len = 0;
         self.page_img = None;
+        self.fullscreen_img = false;
     }
 
     fn load_and_prefetch<SPI: embedded_hal::spi::SpiDevice>(
@@ -599,9 +602,26 @@ impl ReaderApp {
         svc: &mut Services<'_, SPI>,
     ) {
         self.page_img = None;
+        self.fullscreen_img = false;
 
         if !self.is_epub || self.spine.is_empty() {
             return;
+        }
+
+        // detect image-only page (fullscreen cover / plate rendering)
+        {
+            let mut has_img = false;
+            let mut has_text = false;
+            for i in 0..self.line_count {
+                if self.lines[i].is_image() {
+                    if self.lines[i].is_image_origin() {
+                        has_img = true;
+                    }
+                } else if self.lines[i].len > 0 {
+                    has_text = true;
+                }
+            }
+            self.fullscreen_img = has_img && !has_text;
         }
 
         // copy src path to local buf to avoid borrowing self.buf below
@@ -726,6 +746,12 @@ impl ReaderApp {
             self.ch_cache = Vec::new();
         }
 
+        let img_max_h = if self.fullscreen_img {
+            TEXT_AREA_H
+        } else {
+            IMAGE_DISPLAY_H
+        };
+
         let result = if is_jpeg && entry.method == zip::METHOD_STORED {
             let svc_ref = &*svc;
             smol_epub::jpeg::decode_jpeg_sd(
@@ -733,7 +759,7 @@ impl ReaderApp {
                 data_offset,
                 entry.uncomp_size,
                 TEXT_W as u16,
-                IMAGE_DISPLAY_H,
+                img_max_h,
             )
         } else if is_jpeg {
             let svc_ref = &*svc;
@@ -743,7 +769,7 @@ impl ReaderApp {
                 entry.comp_size,
                 entry.uncomp_size,
                 TEXT_W as u16,
-                IMAGE_DISPLAY_H,
+                img_max_h,
             )
         } else if entry.method == zip::METHOD_STORED {
             let svc_ref = &*svc;
@@ -752,7 +778,7 @@ impl ReaderApp {
                 data_offset,
                 entry.uncomp_size,
                 TEXT_W as u16,
-                IMAGE_DISPLAY_H,
+                img_max_h,
             )
         } else {
             let svc_ref = &*svc;
@@ -761,7 +787,7 @@ impl ReaderApp {
                 data_offset,
                 entry.comp_size,
                 TEXT_W as u16,
-                IMAGE_DISPLAY_H,
+                img_max_h,
             )
         };
 
@@ -1146,7 +1172,7 @@ impl ReaderApp {
                             data_offset,
                             entry.uncomp_size,
                             TEXT_W as u16,
-                            IMAGE_DISPLAY_H,
+                            TEXT_AREA_H,
                         )
                     } else if is_jpeg {
                         smol_epub::jpeg::decode_jpeg_deflate_sd(
@@ -1155,7 +1181,7 @@ impl ReaderApp {
                             entry.comp_size,
                             entry.uncomp_size,
                             TEXT_W as u16,
-                            IMAGE_DISPLAY_H,
+                            TEXT_AREA_H,
                         )
                     } else if entry.method == zip::METHOD_STORED {
                         smol_epub::png::decode_png_sd(
@@ -1163,7 +1189,7 @@ impl ReaderApp {
                             data_offset,
                             entry.uncomp_size,
                             TEXT_W as u16,
-                            IMAGE_DISPLAY_H,
+                            TEXT_AREA_H,
                         )
                     } else {
                         smol_epub::png::decode_png_deflate_sd(
@@ -1171,7 +1197,7 @@ impl ReaderApp {
                             data_offset,
                             entry.comp_size,
                             TEXT_W as u16,
-                            IMAGE_DISPLAY_H,
+                            TEXT_AREA_H,
                         )
                     };
 
@@ -2487,75 +2513,98 @@ impl App for ReaderApp {
         if let Some(ref fs) = self.fonts {
             let line_h = self.font_line_h as i32;
             let ascent = self.font_ascent as i32;
-            for i in 0..self.line_count {
-                let span = self.lines[i];
 
-                if span.is_image() {
-                    if span.is_image_origin() {
-                        let y_top = TEXT_Y as i32 + i as i32 * line_h;
-                        if let Some(ref img) = self.page_img {
-                            let img_x =
-                                MARGIN as i32 + ((TEXT_W as i32 - img.width as i32) / 2).max(0);
-                            strip.blit_1bpp(
-                                &img.data,
-                                0,
-                                img.width as usize,
-                                img.height as usize,
-                                img.stride,
-                                img_x,
-                                y_top,
-                                true,
-                            );
-                        } else {
-                            let baseline = y_top + ascent;
-                            fs.draw_str(
-                                strip,
-                                "[image]",
-                                fonts::Style::Italic,
-                                MARGIN as i32,
-                                baseline,
-                            );
-                        }
-                    }
-                    continue;
+            // fullscreen image: centre in text area, skip normal line layout
+            if self.fullscreen_img {
+                if let Some(ref img) = self.page_img {
+                    let img_x = MARGIN as i32 + ((TEXT_W as i32 - img.width as i32) / 2).max(0);
+                    let img_y =
+                        TEXT_Y as i32 + ((TEXT_AREA_H as i32 - img.height as i32) / 2).max(0);
+                    strip.blit_1bpp(
+                        &img.data,
+                        0,
+                        img.width as usize,
+                        img.height as usize,
+                        img.stride,
+                        img_x,
+                        img_y,
+                        true,
+                    );
                 }
+            } else {
+                let mut img_rendered = false;
+                for i in 0..self.line_count {
+                    let span = self.lines[i];
 
-                let start = span.start as usize;
-                let end = start + span.len as usize;
-                let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
-                let x_indent = INDENT_PX as i32 * span.indent as i32;
-
-                let line = &self.buf[start..end];
-                let mut cx = MARGIN as i32 + x_indent;
-                let mut sty = span.style();
-                let mut j = 0usize;
-                while j < line.len() {
-                    let b = line[j];
-                    if b == MARKER && j + 1 < line.len() {
-                        sty = match line[j + 1] {
-                            BOLD_ON => fonts::Style::Bold,
-                            ITALIC_ON => fonts::Style::Italic,
-                            HEADING_ON => fonts::Style::Heading,
-                            BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
-                            _ => sty,
-                        };
-                        j += 2;
-                        continue;
-                    }
-                    if b >= 0xC0 {
-                        let (repl, seq_len) = decode_utf8_to_ascii(line, j);
-                        if (bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&repl) {
-                            cx += fs.draw_char(strip, repl as char, sty, cx, baseline) as i32;
+                    if span.is_image() {
+                        if span.is_image_origin() && !img_rendered {
+                            let y_top = TEXT_Y as i32 + i as i32 * line_h;
+                            if let Some(ref img) = self.page_img {
+                                let img_x =
+                                    MARGIN as i32 + ((TEXT_W as i32 - img.width as i32) / 2).max(0);
+                                let blit_h = (img.height as usize).min(IMAGE_DISPLAY_H as usize);
+                                strip.blit_1bpp(
+                                    &img.data,
+                                    0,
+                                    img.width as usize,
+                                    blit_h,
+                                    img.stride,
+                                    img_x,
+                                    y_top,
+                                    true,
+                                );
+                                img_rendered = true;
+                            } else {
+                                let baseline = y_top + ascent;
+                                fs.draw_str(
+                                    strip,
+                                    "[image]",
+                                    fonts::Style::Italic,
+                                    MARGIN as i32,
+                                    baseline,
+                                );
+                            }
                         }
-                        j += seq_len;
                         continue;
                     }
-                    if !(bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&b) {
+
+                    let start = span.start as usize;
+                    let end = start + span.len as usize;
+                    let baseline = TEXT_Y as i32 + i as i32 * line_h + ascent;
+                    let x_indent = INDENT_PX as i32 * span.indent as i32;
+
+                    let line = &self.buf[start..end];
+                    let mut cx = MARGIN as i32 + x_indent;
+                    let mut sty = span.style();
+                    let mut j = 0usize;
+                    while j < line.len() {
+                        let b = line[j];
+                        if b == MARKER && j + 1 < line.len() {
+                            sty = match line[j + 1] {
+                                BOLD_ON => fonts::Style::Bold,
+                                ITALIC_ON => fonts::Style::Italic,
+                                HEADING_ON => fonts::Style::Heading,
+                                BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
+                                _ => sty,
+                            };
+                            j += 2;
+                            continue;
+                        }
+                        if b >= 0xC0 {
+                            let (repl, seq_len) = decode_utf8_to_ascii(line, j);
+                            if (bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&repl) {
+                                cx += fs.draw_char(strip, repl as char, sty, cx, baseline) as i32;
+                            }
+                            j += seq_len;
+                            continue;
+                        }
+                        if !(bitmap::FIRST_CHAR..=bitmap::LAST_CHAR).contains(&b) {
+                            j += 1;
+                            continue; // stray continuation byte or control char
+                        }
+                        cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
                         j += 1;
-                        continue; // stray continuation byte or control char
                     }
-                    cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
-                    j += 1;
                 }
             }
         } else {

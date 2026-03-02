@@ -1446,6 +1446,7 @@ dependencies = [
 [[package]]
 name = "smol-epub"
 version = "0.1.0"
+source = "git+https://github.com/hansmrtn/smol-epub#b2243c914b3719dcd7b1b40d92fa8e9785f8a6c5"
 dependencies = [
  "log",
  "miniz_oxide",
