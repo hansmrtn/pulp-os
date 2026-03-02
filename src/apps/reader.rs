@@ -87,6 +87,7 @@ enum State {
     NeedToc,
     NeedCache,
     NeedCacheChapter,
+    NeedImageCache,
     NeedIndex,
     NeedPage,
     Ready,
@@ -188,6 +189,8 @@ pub struct ReaderApp {
     chapter_sizes: [u32; cache::MAX_CACHE_CHAPTERS],
     chapters_cached: bool,
     cache_chapter: u16,
+    img_cache_ch: u16,
+    img_cache_offset: u32,
 
     ch_cache: Vec<u8>,
     page_img: Option<DecodedImage>,
@@ -250,6 +253,8 @@ impl ReaderApp {
             chapter_sizes: [0u32; cache::MAX_CACHE_CHAPTERS],
             chapters_cached: false,
             cache_chapter: 0,
+            img_cache_ch: 0,
+            img_cache_offset: 0,
 
             ch_cache: Vec::new(),
 
@@ -984,6 +989,227 @@ impl ReaderApp {
         Ok(false)
     }
 
+    /// Scan cached chapter text for image references and pre-decode them.
+    ///
+    /// Processes one image per call, returning `Ok(true)` when more work
+    /// remains and `Ok(false)` when every chapter has been scanned.
+    fn epub_precache_one_image<SPI: embedded_hal::spi::SpiDevice>(
+        &mut self,
+        svc: &mut Services<'_, SPI>,
+    ) -> Result<bool, &'static str> {
+        let spine_len = self.spine.len();
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let (nb, nl) = self.name_copy();
+        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        while (self.img_cache_ch as usize) < spine_len {
+            let ch = self.img_cache_ch as usize;
+            let ch_size = if ch < cache::MAX_CACHE_CHAPTERS {
+                self.chapter_sizes[ch] as usize
+            } else {
+                0
+            };
+
+            let ch_file = cache::chapter_file_name(self.img_cache_ch);
+            let ch_str = cache::chapter_file_str(&ch_file);
+            let mut offset = self.img_cache_offset as usize;
+
+            while offset < ch_size {
+                let read_len = PAGE_BUF.min(ch_size - offset);
+                let n =
+                    svc.read_pulp_sub_chunk(dir, ch_str, offset as u32, &mut self.buf[..read_len])?;
+                if n == 0 {
+                    break;
+                }
+
+                let mut i = 0;
+                while i + 2 < n {
+                    if self.buf[i] != MARKER || self.buf[i + 1] != IMG_REF {
+                        i += 1;
+                        continue;
+                    }
+
+                    let path_len = self.buf[i + 2] as usize;
+                    let path_start = i + 3;
+                    if path_len == 0 || path_start + path_len > n {
+                        // straddles chunk boundary; will be caught on next read
+                        i += 1;
+                        continue;
+                    }
+
+                    // copy src path to a local buffer before we touch self again
+                    let mut src_buf = [0u8; 128];
+                    let src_n = path_len.min(src_buf.len());
+                    src_buf[..src_n].copy_from_slice(&self.buf[path_start..path_start + src_n]);
+                    let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
+                        Ok(s) if !s.is_empty() => s,
+                        _ => {
+                            i = path_start + path_len;
+                            continue;
+                        }
+                    };
+
+                    // resolve image path relative to chapter XHTML
+                    let mut path_buf = [0u8; 512];
+                    let plen = {
+                        let ch_zip_idx = self.spine.items[ch] as usize;
+                        let ch_path = self.zip.entry_name(ch_zip_idx);
+                        let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                        epub::resolve_path(ch_dir, src_str, &mut path_buf)
+                    };
+                    let full_path = match core::str::from_utf8(&path_buf[..plen]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            i = path_start + path_len;
+                            continue;
+                        }
+                    };
+
+                    let img_name = img_cache_name(cache::fnv1a(full_path.as_bytes()));
+                    let img_file = img_cache_str(&img_name);
+
+                    // already cached — skip
+                    if svc.file_size_pulp_sub(dir, img_file).is_ok() {
+                        i = path_start + path_len;
+                        continue;
+                    }
+
+                    // save resume position past this image ref
+                    self.img_cache_offset = (offset + path_start + path_len) as u32;
+
+                    // locate image entry in ZIP
+                    let zip_idx = match self
+                        .zip
+                        .find(full_path)
+                        .or_else(|| self.zip.find_icase(full_path))
+                    {
+                        Some(idx) => idx,
+                        None => {
+                            log::warn!("precache: image not in ZIP: {}", full_path);
+                            return Ok(true);
+                        }
+                    };
+
+                    let entry = *self.zip.entry(zip_idx);
+                    let data_offset = {
+                        let mut hdr = [0u8; 30];
+                        if svc
+                            .read_file_chunk(epub_name, entry.local_offset, &mut hdr)
+                            .is_err()
+                        {
+                            log::warn!("precache: read local header failed");
+                            return Ok(true);
+                        }
+                        match zip::ZipIndex::local_header_data_skip(&hdr) {
+                            Ok(skip) => entry.local_offset + skip,
+                            Err(e) => {
+                                log::warn!("precache: {}", e);
+                                return Ok(true);
+                            }
+                        }
+                    };
+
+                    // determine image format
+                    let ext_jpeg = full_path.ends_with(".jpg")
+                        || full_path.ends_with(".jpeg")
+                        || full_path.ends_with(".JPG")
+                        || full_path.ends_with(".JPEG");
+                    let ext_png = full_path.ends_with(".png") || full_path.ends_with(".PNG");
+
+                    let (is_jpeg, is_png) = if ext_jpeg || ext_png {
+                        (ext_jpeg, ext_png)
+                    } else if entry.method == zip::METHOD_STORED {
+                        let mut magic = [0u8; 8];
+                        let mn = svc
+                            .read_file_chunk(epub_name, data_offset, &mut magic)
+                            .unwrap_or(0);
+                        (
+                            mn >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
+                            mn >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
+                        )
+                    } else {
+                        (false, false)
+                    };
+
+                    if !is_jpeg && !is_png {
+                        log::warn!("precache: unsupported format: {}", full_path);
+                        return Ok(true);
+                    }
+
+                    log::info!("precache: decoding {}", full_path);
+
+                    let svc_ref = &*svc;
+                    let result = if is_jpeg && entry.method == zip::METHOD_STORED {
+                        smol_epub::jpeg::decode_jpeg_sd(
+                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                            data_offset,
+                            entry.uncomp_size,
+                            TEXT_W as u16,
+                            IMAGE_DISPLAY_H,
+                        )
+                    } else if is_jpeg {
+                        smol_epub::jpeg::decode_jpeg_deflate_sd(
+                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                            data_offset,
+                            entry.comp_size,
+                            entry.uncomp_size,
+                            TEXT_W as u16,
+                            IMAGE_DISPLAY_H,
+                        )
+                    } else if entry.method == zip::METHOD_STORED {
+                        smol_epub::png::decode_png_sd(
+                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                            data_offset,
+                            entry.uncomp_size,
+                            TEXT_W as u16,
+                            IMAGE_DISPLAY_H,
+                        )
+                    } else {
+                        smol_epub::png::decode_png_deflate_sd(
+                            |off, buf| svc_ref.read_file_chunk(epub_name, off, buf),
+                            data_offset,
+                            entry.comp_size,
+                            TEXT_W as u16,
+                            IMAGE_DISPLAY_H,
+                        )
+                    };
+
+                    match result {
+                        Ok(img) => {
+                            log::info!(
+                                "precache: decoded {}x{} ({}B 1-bit)",
+                                img.width,
+                                img.height,
+                                img.data.len()
+                            );
+                            if let Err(e) = save_cached_image(svc, dir, img_file, &img) {
+                                log::warn!("precache: save failed: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("precache: decode failed: {}", e);
+                        }
+                    }
+
+                    return Ok(true); // yield after each image
+                }
+
+                // advance with overlap so markers at chunk boundary are not missed
+                if offset + n >= ch_size {
+                    break;
+                }
+                offset += n.saturating_sub(128).max(1);
+            }
+
+            self.img_cache_ch += 1;
+            self.img_cache_offset = 0;
+        }
+
+        log::info!("precache: all images done");
+        Ok(false)
+    }
+
     fn epub_index_chapter(&mut self) {
         self.reset_paging();
         let ch = self.chapter as usize;
@@ -1696,6 +1922,7 @@ impl App for ReaderApp {
                 | State::NeedToc
                 | State::NeedCache
                 | State::NeedCacheChapter
+                | State::NeedImageCache
                 | State::NeedIndex
                 | State::NeedPage
         )
@@ -1811,7 +2038,9 @@ impl App for ReaderApp {
                         ctx.mark_dirty(LOADING_REGION);
                     }
                     Ok(false) => {
-                        self.state = State::NeedIndex;
+                        self.img_cache_ch = 0;
+                        self.img_cache_offset = 0;
+                        self.state = State::NeedImageCache;
                         continue;
                     }
                     Err(e) => {
@@ -1819,6 +2048,21 @@ impl App for ReaderApp {
                         self.error = Some(e);
                         self.state = State::Error;
                         ctx.mark_dirty(PAGE_REGION);
+                    }
+                },
+
+                State::NeedImageCache => match self.epub_precache_one_image(svc) {
+                    Ok(true) => {
+                        ctx.mark_dirty(LOADING_REGION);
+                    }
+                    Ok(false) => {
+                        self.state = State::NeedIndex;
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("precache: error: {}, skipping", e);
+                        self.state = State::NeedIndex;
+                        continue;
                     }
                 },
 
@@ -2152,6 +2396,14 @@ impl App for ReaderApp {
                         lbuf,
                         "Caching ch {}/{}...",
                         self.cache_chapter + 1,
+                        self.spine.len()
+                    );
+                }
+                State::NeedImageCache => {
+                    let _ = write!(
+                        lbuf,
+                        "Caching images (ch {}/{})...",
+                        self.img_cache_ch + 1,
                         self.spine.len()
                     );
                 }
