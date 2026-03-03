@@ -1,20 +1,28 @@
-// App trait, nav stack, and Services syscall boundary.
+// app trait, nav stack, and app lifecycle
 
-pub mod bookmarks;
 pub mod files;
 pub mod home;
+pub mod manager;
 pub mod reader;
+
 pub mod settings;
 pub mod upload;
 
 use crate::board::action::ActionEvent;
-use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::{self, DirCache, DirEntry, DirPage};
+#[allow(unused_imports)]
 use crate::drivers::strip::StripBuffer;
+use crate::kernel::KernelHandle;
+use crate::kernel::bookmarks::BookmarkCache;
 use crate::ui::Region;
 use crate::ui::quick_menu::QuickAction;
 
-pub use bookmarks::BookmarkCache;
+// cross-app constants
+pub const RECENT_FILE: &str = "RECENT";
+
+#[derive(Clone, Copy, Debug)]
+pub enum PendingSetting {
+    BookFontSize(u8),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
@@ -22,6 +30,8 @@ pub enum AppId {
     Files,
     Reader,
     Settings,
+    // upload bypasses the App trait; scheduler intercepts this
+    // variant and calls run_upload_mode directly
     Upload,
 }
 
@@ -112,154 +122,20 @@ impl AppContext {
     }
 }
 
-pub struct Services<'a, SPI: embedded_hal::spi::SpiDevice> {
-    dir_cache: &'a mut DirCache,
-    bookmarks: &'a mut BookmarkCache,
-    sd: &'a SdStorage<SPI>,
-}
-
-impl<'a, SPI: embedded_hal::spi::SpiDevice> Services<'a, SPI> {
-    pub fn new(
-        dir_cache: &'a mut DirCache,
-        bookmarks: &'a mut BookmarkCache,
-        sd: &'a SdStorage<SPI>,
-    ) -> Self {
-        Self {
-            dir_cache,
-            bookmarks,
-            sd,
-        }
-    }
-
-    pub fn bookmarks(&self) -> &BookmarkCache {
-        self.bookmarks
-    }
-
-    pub fn bookmarks_mut(&mut self) -> &mut BookmarkCache {
-        self.bookmarks
-    }
-
-    pub fn dir_page(
-        &mut self,
-        offset: usize,
-        buf: &mut [DirEntry],
-    ) -> Result<DirPage, &'static str> {
-        self.dir_cache.ensure_loaded(self.sd)?;
-        Ok(self.dir_cache.page(offset, buf))
-    }
-
-    pub fn invalidate_dir_cache(&mut self) {
-        self.dir_cache.invalidate();
-    }
-
-    pub fn next_untitled_epub(&self, from: usize) -> Option<(usize, [u8; 13], u8)> {
-        self.dir_cache.next_untitled_epub(from)
-    }
-
-    pub fn set_dir_entry_title(&mut self, index: usize, title: &[u8]) {
-        self.dir_cache.set_entry_title(index, title);
-    }
-
-    pub fn read_file_chunk(
-        &self,
-        name: &str,
-        offset: u32,
-        buf: &mut [u8],
-    ) -> Result<usize, &'static str> {
-        storage::read_file_chunk(self.sd, name, offset, buf)
-    }
-
-    pub fn read_file_start(
-        &self,
-        name: &str,
-        buf: &mut [u8],
-    ) -> Result<(u32, usize), &'static str> {
-        storage::read_file_start(self.sd, name, buf)
-    }
-
-    pub fn file_size(&self, name: &str) -> Result<u32, &'static str> {
-        storage::file_size(self.sd, name)
-    }
-
-    pub fn save_title(&self, filename: &str, title: &str) -> Result<(), &'static str> {
-        storage::save_title(self.sd, filename, title)
-    }
-
-    pub fn read_chunk_in_dir(
-        &self,
-        dir: &str,
-        name: &str,
-        offset: u32,
-        buf: &mut [u8],
-    ) -> Result<usize, &'static str> {
-        storage::read_file_chunk_in_dir(self.sd, dir, name, offset, buf)
-    }
-
-    pub fn ensure_pulp_dir(&self) -> Result<(), &'static str> {
-        storage::ensure_pulp_dir(self.sd)
-    }
-
-    pub fn read_pulp_start(
-        &self,
-        name: &str,
-        buf: &mut [u8],
-    ) -> Result<(u32, usize), &'static str> {
-        storage::read_pulp_file_start(self.sd, name, buf)
-    }
-
-    pub fn read_pulp_chunk(
-        &self,
-        name: &str,
-        offset: u32,
-        buf: &mut [u8],
-    ) -> Result<usize, &'static str> {
-        storage::read_pulp_file_chunk(self.sd, name, offset, buf)
-    }
-
-    pub fn write_pulp(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        storage::write_pulp_file(self.sd, name, data)
-    }
-
-    pub fn ensure_pulp_subdir(&self, name: &str) -> Result<(), &'static str> {
-        storage::ensure_pulp_subdir(self.sd, name)
-    }
-
-    pub fn write_pulp_sub(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        storage::write_in_pulp_subdir(self.sd, dir, name, data)
-    }
-
-    pub fn append_pulp_sub(&self, dir: &str, name: &str, data: &[u8]) -> Result<(), &'static str> {
-        storage::append_in_pulp_subdir(self.sd, dir, name, data)
-    }
-
-    pub fn read_pulp_sub_chunk(
-        &self,
-        dir: &str,
-        name: &str,
-        offset: u32,
-        buf: &mut [u8],
-    ) -> Result<usize, &'static str> {
-        storage::read_chunk_in_pulp_subdir(self.sd, dir, name, offset, buf)
-    }
-
-    pub fn file_size_pulp_sub(&self, dir: &str, name: &str) -> Result<u32, &'static str> {
-        storage::file_size_in_pulp_subdir(self.sd, dir, name)
-    }
-
-    pub fn delete_pulp_sub(&self, dir: &str, name: &str) -> Result<(), &'static str> {
-        storage::delete_in_pulp_subdir(self.sd, dir, name)
-    }
-}
-
+#[allow(async_fn_in_trait)]
 pub trait App {
-    fn on_enter(&mut self, ctx: &mut AppContext);
+    async fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>);
+
     fn on_exit(&mut self) {}
+
     fn on_suspend(&mut self) {
         self.on_exit();
     }
-    fn on_resume(&mut self, ctx: &mut AppContext) {
-        self.on_enter(ctx);
+
+    async fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+        self.on_enter(ctx, k).await;
     }
+
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition;
 
     fn quick_actions(&self) -> &[QuickAction] {
@@ -272,15 +148,19 @@ pub trait App {
 
     fn draw(&self, strip: &mut StripBuffer);
 
-    fn needs_work(&self) -> bool {
+    async fn background(&mut self, _ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {}
+
+    fn pending_setting(&self) -> Option<PendingSetting> {
+        None
+    }
+
+    fn save_state(&self, _bm: &mut BookmarkCache) {}
+
+    fn has_background_when_suspended(&self) -> bool {
         false
     }
-    fn on_work<SPI: embedded_hal::spi::SpiDevice>(
-        &mut self,
-        _services: &mut Services<'_, SPI>,
-        _ctx: &mut AppContext,
-    ) {
-    }
+
+    fn background_suspended(&mut self, _k: &mut KernelHandle<'_>) {}
 }
 
 const MAX_STACK_DEPTH: usize = 4;
@@ -293,6 +173,7 @@ pub struct NavEvent {
     pub resume: bool,
 }
 
+// 4-deep navigation stack with shared AppContext
 pub struct Launcher {
     stack: [AppId; MAX_STACK_DEPTH],
     depth: usize,

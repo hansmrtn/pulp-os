@@ -1,4 +1,4 @@
-// No-alloc fmt::Write buffers; silently truncate on overflow.
+// no-alloc fmt::Write buffers; silently truncate on overflow
 
 pub struct StackFmt<const N: usize> {
     buf: [u8; N],

@@ -1,7 +1,6 @@
-// Strip-based rendering buffer for e-paper.
-// 4KB strip instead of 48KB framebuffer; display split into horizontal bands.
-// Widgets draw to logical coords, clipped here.
-// begin_strip() for full refresh, begin_window() for partial.
+// strip-based rendering buffer for e-paper
+// 4 KB strip instead of 48 KB framebuffer; display split into horizontal bands
+// widgets draw to logical coords, clipped here
 
 use embedded_graphics_core::{
     Pixel,
@@ -14,11 +13,11 @@ use embedded_graphics_core::{
 use super::ssd1677::{HEIGHT, Rotation, WIDTH};
 use crate::ui::Region;
 
-pub const STRIP_ROWS: u16 = 40; // 4000B per strip (800/8 * 40)
+pub const STRIP_ROWS: u16 = 40;
 pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8;
 
-pub const STRIP_BUF_SIZE: usize = PHYS_BYTES_PER_ROW * STRIP_ROWS as usize; // 4000B
-pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS; // 12 strips
+pub const STRIP_BUF_SIZE: usize = PHYS_BYTES_PER_ROW * STRIP_ROWS as usize;
+pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS;
 
 pub struct StripBuffer {
     buf: [u8; STRIP_BUF_SIZE],
@@ -98,7 +97,6 @@ impl StripBuffer {
         (self.win_x, self.win_y, self.win_w, self.win_h)
     }
 
-    // physical window -> logical coords for widget culling
     pub fn logical_window(&self) -> Region {
         match self.rotation {
             Rotation::Deg0 => Region::new(self.win_x, self.win_y, self.win_w, self.win_h),
@@ -135,7 +133,6 @@ impl StripBuffer {
         (STRIP_BUF_SIZE / rb) as u16
     }
 
-    #[inline]
     fn to_physical(&self, lx: u16, ly: u16) -> (u16, u16) {
         match self.rotation {
             Rotation::Deg0 => (lx, ly),
@@ -145,7 +142,6 @@ impl StripBuffer {
         }
     }
 
-    #[inline]
     fn set_pixel_physical(&mut self, px: u16, py: u16, black: bool) {
         if px < self.win_x || px >= self.win_x + self.win_w {
             return;
@@ -166,7 +162,6 @@ impl StripBuffer {
         }
     }
 
-    // direct 1-bit glyph blit; bypasses DrawTarget overhead
     #[allow(clippy::too_many_arguments)]
     pub fn blit_1bpp(
         &mut self,
@@ -188,7 +183,6 @@ impl StripBuffer {
         }
     }
 
-    // Deg270: (lx,ly) -> (ly, HEIGHT-1-lx); inner loop is row-contiguous
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn blit_1bpp_270(
@@ -248,7 +242,6 @@ impl StripBuffer {
         }
     }
 
-    // generic fallback (Deg0/Deg90/Deg180)
     #[allow(clippy::too_many_arguments)]
     fn blit_1bpp_generic(
         &mut self,
@@ -285,7 +278,6 @@ impl StripBuffer {
         }
     }
 
-    // byte-aligned rect fill in physical coords, clipped to window
     fn fill_physical_rect(&mut self, px0: u16, py0: u16, px1: u16, py1: u16, black: bool) {
         let cx0 = px0.max(self.win_x);
         let cx1 = px1.min(self.win_x + self.win_w);
@@ -404,7 +396,6 @@ impl DrawTarget for StripBuffer {
     where
         I: IntoIterator<Item = Self::Color>,
     {
-        // contiguous fills rare on 1-bit; fall back to per-pixel
         let w = area.size.width as i32;
         if w == 0 {
             return Ok(());

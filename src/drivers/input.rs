@@ -1,15 +1,13 @@
-// Debounced input from ADC ladders and power button.
-// One button at a time (ladder hw limitation). Sources: Row1 (GPIO1),
-// Row2 (GPIO2), Power (GPIO3 interrupt). 15ms debounce, 1s long press, 150ms repeat.
-// ADC reads oversampled (4 samples averaged) to reject noise from ESP32-C3
-// non-linearity and battery sag during SPI traffic; ~40us per channel.
+// debounced input from ADC ladders and power button
+// one button at a time (ladder hw limitation)
+// 15 ms debounce, 1 s long press, 150 ms repeat
+// ADC reads oversampled 4x to reject noise (~40 us per channel)
 
 use esp_hal::time::{Duration, Instant};
 
 use crate::board::InputHw;
 use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
 
-// 4-sample average; ~40us per channel, rejects ADC noise from SPI/battery sag
 macro_rules! read_averaged {
     ($adc:expr, $pin:expr) => {{
         let mut sum: u32 = 0;
@@ -34,12 +32,12 @@ pub enum Event {
 }
 
 struct EventQueue {
-    buf: [Option<Event>; 2],
+    buf: [Option<Event>; 4],
 }
 
 impl EventQueue {
     const fn new() -> Self {
-        Self { buf: [None; 2] }
+        Self { buf: [None; 4] }
     }
 
     fn push(&mut self, ev: Event) {

@@ -1,6 +1,4 @@
-// Widget toolkit for 1-bit e-paper displays.
-// BitmapLabel/BitmapDynLabel with inverted highlight for selection.
-// Region-based layout, strip-buffered rendering.
+// widget toolkit for 1-bit e-paper displays
 
 mod bitmap_label;
 pub mod button_feedback;
@@ -14,8 +12,7 @@ pub use button_feedback::{BUTTON_BAR_H, ButtonFeedback};
 pub use quick_menu::QuickMenu;
 pub use stack_fmt::{StackFmt, stack_fmt};
 pub use statusbar::{
-    BAR_HEIGHT, CONTENT_TOP, StatusBar, SystemStatus, free_stack_bytes, paint_stack,
-    stack_high_water_mark,
+    BAR_HEIGHT, CONTENT_TOP, free_stack_bytes, paint_stack, stack_high_water_mark,
 };
 pub use widget::{Alignment, Region, wrap_next, wrap_prev};
 

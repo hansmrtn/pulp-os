@@ -1,4 +1,4 @@
-// pulp-os: Embassy event loop, app dispatch, rendering.
+// hardware init, construct Kernel + AppManager, boot, run
 
 #![no_std]
 #![no_main]
@@ -6,241 +6,37 @@
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::RtcPinWithResistors;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::rtc_cntl::Rtc;
-use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, WakeupLevel};
+use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
-use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Ticker};
-
+use pulp_os::apps::Launcher;
 use pulp_os::apps::files::FilesApp;
 use pulp_os::apps::home::HomeApp;
-use pulp_os::apps::reader::{self, ReaderApp};
+use pulp_os::apps::manager::AppManager;
+use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
-use pulp_os::apps::{
-    App, AppContext, AppId, BookmarkCache, Launcher, Redraw, Services, Transition,
-};
-use pulp_os::board::Board;
-use pulp_os::board::action::{Action, ActionEvent, ButtonMapper};
+use pulp_os::board::action::ButtonMapper;
+use pulp_os::board::{Board, speed_up_spi};
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
-use pulp_os::drivers::storage::{self, DirCache};
+use pulp_os::drivers::sdcard::SdStorage;
+use pulp_os::drivers::storage;
 use pulp_os::drivers::strip::StripBuffer;
-use pulp_os::fonts;
+use pulp_os::kernel::BookmarkCache;
+use pulp_os::kernel::Kernel;
+use pulp_os::kernel::dir_cache::DirCache;
 use pulp_os::kernel::tasks;
-use pulp_os::kernel::uptime_secs;
 use pulp_os::kernel::work_queue;
-use pulp_os::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
-use pulp_os::ui::{
-    BAR_HEIGHT, ButtonFeedback, QuickMenu, StatusBar, SystemStatus, free_stack_bytes, paint_stack,
-    stack_high_water_mark,
-};
+use pulp_os::ui::{ButtonFeedback, QuickMenu, paint_stack};
 use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const TICK_MS: u64 = 10;
-
-const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
-
-struct Apps {
-    home: &'static mut HomeApp,
-    files: &'static mut FilesApp,
-    reader: &'static mut ReaderApp,
-    settings: &'static mut SettingsApp,
-}
-
-impl Apps {
-    fn propagate_fonts(&mut self, quick_menu: &mut QuickMenu, bumps: &mut ButtonFeedback) {
-        let ui_idx = self.settings.system_settings().ui_font_size_idx;
-        let book_idx = self.settings.system_settings().book_font_size_idx;
-        self.home.set_ui_font_size(ui_idx);
-        self.files.set_ui_font_size(ui_idx);
-        self.settings.set_ui_font_size(ui_idx);
-        self.reader.set_book_font_size(book_idx);
-        let chrome = fonts::chrome_font();
-        self.reader.set_chrome_font(chrome);
-        quick_menu.set_chrome_font(chrome);
-        bumps.set_chrome_font(chrome);
-    }
-}
-
-macro_rules! with_app {
-    ($id:expr, $apps:expr, |$app:ident| $body:expr) => {
-        match $id {
-            AppId::Home => {
-                let $app = &mut *$apps.home;
-                $body
-            }
-            AppId::Files => {
-                let $app = &mut *$apps.files;
-                $body
-            }
-            AppId::Reader => {
-                let $app = &mut *$apps.reader;
-                $body
-            }
-            AppId::Settings => {
-                let $app = &mut *$apps.settings;
-                $body
-            }
-            AppId::Upload => {
-                unreachable!("Upload mode is handled outside the app dispatch loop");
-            }
-        }
-    };
-}
-
-macro_rules! apply_transition {
-    ($nav:expr, $launcher:expr, $apps:expr, $bm_cache:expr,
-     $quick_menu:expr, $bumps:expr) => {{
-        let nav = $nav;
-        info!("app: {:?} -> {:?}", nav.from, nav.to);
-
-        if nav.from == AppId::Reader {
-            $apps.reader.save_position($bm_cache);
-        }
-
-        if nav.from != AppId::Upload {
-            if nav.suspend {
-                with_app!(nav.from, $apps, |app| {
-                    app.on_suspend();
-                });
-            } else {
-                with_app!(nav.from, $apps, |app| {
-                    app.on_exit();
-                });
-            }
-        }
-
-        $apps.propagate_fonts($quick_menu, $bumps);
-
-        if nav.to != AppId::Upload {
-            if nav.resume {
-                with_app!(nav.to, $apps, |app| {
-                    app.on_resume(&mut $launcher.ctx);
-                });
-            } else {
-                with_app!(nav.to, $apps, |app| {
-                    app.on_enter(&mut $launcher.ctx);
-                });
-            }
-        }
-    }};
-}
-
-// busy-wait with input: selects on BUSY pin, input channel, work ticker.
-// macro because it .awaits inside the main async fn.
-macro_rules! busy_wait_with_input {
-    ($epd:expr, $mapper:expr,
-     $quick_menu:expr, $launcher:expr, $apps:expr,
-     $dir_cache:expr, $bm_cache:expr, $sd:expr) => {{
-        let mut _deferred: Option<Transition> = None;
-        let mut _work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
-        loop {
-            if !$epd.is_busy() {
-                break;
-            }
-
-            match select(
-                $epd.busy_pin().wait_for_low(),
-                select(tasks::INPUT_EVENTS.receive(), _work_ticker.next()),
-            )
-            .await
-            {
-                Either::First(_) => break,
-
-                Either::Second(Either::First(hw_event)) => {
-                    let event = $mapper.map_event(hw_event);
-
-                    if $quick_menu.open {
-                        continue;
-                    }
-
-                    let active = $launcher.active();
-                    let t = with_app!(active, $apps, |app| app.on_event(event, &mut $launcher.ctx));
-                    if !matches!(t, Transition::None) && _deferred.is_none() {
-                        _deferred = Some(t);
-                    }
-                }
-
-                Either::Second(Either::Second(_)) => {}
-            }
-
-            let active = $launcher.active();
-            let needs = with_app!(active, $apps, |app| app.needs_work());
-            if needs {
-                let mut svc = Services::new($dir_cache, $bm_cache, &$sd);
-                with_app!(active, $apps, |app| app
-                    .on_work(&mut svc, &mut $launcher.ctx));
-            }
-        }
-        _deferred
-    }};
-}
-
-macro_rules! enter_sleep {
-    ($reason:expr, $bm_cache:expr, $board:expr, $strip:expr, $delay:expr) => {{
-        info!("{}: entering sleep...", $reason);
-
-        if $bm_cache.is_dirty() {
-            $bm_cache.flush(&$board.storage.sd);
-        }
-
-        $board
-            .display
-            .epd
-            .full_refresh_async($strip, &mut $delay, &|s: &mut StripBuffer| {
-                use embedded_graphics::mono_font::MonoTextStyle;
-                use embedded_graphics::mono_font::ascii::FONT_6X13;
-                use embedded_graphics::pixelcolor::BinaryColor;
-                use embedded_graphics::prelude::*;
-                use embedded_graphics::text::Text;
-
-                let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
-                let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
-            })
-            .await;
-        info!("display: sleep screen rendered");
-
-        $board.display.epd.enter_deep_sleep();
-        info!("display: deep sleep mode 1");
-
-        let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
-        let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
-        let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
-            &mut [(&mut gpio3, WakeupLevel::Low)];
-        let rtcio = RtcioWakeupSource::new(wakeup_pins);
-
-        info!("mcu: entering deep sleep (power button to wake)");
-        rtc.sleep_deep(&[&rtcio]);
-    }};
-}
-
-// Build the per-strip draw closure: statusbar, active app, quick-menu overlay, button labels.
-// Macro because it captures borrows of different concrete app types (via with_app!).
-macro_rules! draw_scene {
-    ($app:expr, $statusbar:expr, $quick_menu:expr, $bumps:expr, $draw_bar:expr) => {
-        |s: &mut StripBuffer| {
-            if $draw_bar {
-                $statusbar.draw(s).unwrap();
-            }
-            $app.draw(s);
-            if $quick_menu.open {
-                $quick_menu.draw(s);
-            }
-            $bumps.draw(s);
-        }
-    };
-}
-
-// heavy statics out of the async future; ConstStaticCell for const-fn types, StaticCell otherwise
+// heavy statics: kept out of the async future to keep it ~200 B
 
 static STRIP: ConstStaticCell<StripBuffer> = ConstStaticCell::new(StripBuffer::new());
-static STATUSBAR: ConstStaticCell<StatusBar> = ConstStaticCell::new(StatusBar::new());
 static READER: ConstStaticCell<ReaderApp> = ConstStaticCell::new(ReaderApp::new());
 static LAUNCHER: ConstStaticCell<Launcher> = ConstStaticCell::new(Launcher::new());
 static QUICK_MENU: ConstStaticCell<QuickMenu> = ConstStaticCell::new(QuickMenu::new());
@@ -257,478 +53,76 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
-
     paint_stack();
-
-    // Heap budget — ESP32-C3 has ~320-328 KB DRAM after IRAM split.
-    // Static consumers (app statics ~60-70 KB, WiFi blob .bss ~37-65 KB,
-    // DMA 9 KB) are already laid out before heap_allocator! runs, so
-    // the size below is what's actually *left*.
-    //
-    // WiFi (esp-radio with `esp-alloc` feature) allocates its dynamic
-    // buffers from this heap at runtime — but only during Upload mode.
-    // Normal reading never touches the radio, so the full heap is
-    // available for chapter caches and image decoding.
-    //
-    // The ~28 KB gap between .bss end and the stack origin at
-    // 0x3FCCE400 is NOT free — it is consumed by runtime call depth
-    // (display driver rendering, ZIP decompression, etc.).  Increasing
-    // this value causes stack overflow in write_region_strips_dual.
-    esp_alloc::heap_allocator!(size: 143360);
+    // 108 KB main DRAM heap; leaves ~56 KB for stack
+    esp_alloc::heap_allocator!(size: 110_592);
+    // reclaim ~64 KB from 2nd-stage bootloader; net heap ~172 KB
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64_000);
 
     info!("booting...");
 
+    // Safety: TIMG0 and SW_INTERRUPT are cloned here and consumed by
+    // esp_rtos::start. They are never used again after this point.
+    // Board::init (which takes ownership of `peripherals`) does not
+    // touch TIMG0 or SW_INTERRUPT — see the pin ownership table in
+    // board/mod.rs for the full split.
     let timg0 = TimerGroup::new(unsafe { peripherals.TIMG0.clone_unchecked() });
     let sw_ints =
         SoftwareInterruptControl::new(unsafe { peripherals.SW_INTERRUPT.clone_unchecked() });
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
-    info!("esp-rtos scheduler started (TIMG0 + SW_INT0).");
 
-    let mut board = Board::init(peripherals);
+    // Peripherals move into Board::init, which splits them across
+    // init_input (ADC pins, GPIO3, IO_MUX) and init_spi_peripherals
+    // (SPI2, DMA, display + SD GPIOs). Each peripheral is used in
+    // exactly one place — see the ownership table in board/mod.rs.
+    let board = Board::init(peripherals);
+    let mut epd = board.display.epd;
     let mut delay = Delay::new();
-    board.display.epd.init(&mut delay);
-    info!("hardware initialized.");
+    epd.init(&mut delay);
+    speed_up_spi();
 
-    let strip = STRIP.take();
+    let sd = match board.storage.sd_card {
+        Some(card) => SdStorage::mount(card).await,
+        None => SdStorage::empty(),
+    };
 
-    let statusbar = STATUSBAR.take();
-    let mut sd_ok = board
-        .storage
-        .sd
-        .volume_mgr
-        .open_volume(embedded_sdmmc::VolumeIdx(0))
-        .is_ok();
-
-    if sd_ok && let Err(e) = storage::ensure_pulp_dir(&board.storage.sd) {
-        info!("warning: failed to create _PULP dir: {}", e);
+    let sd_ok = sd.probe_ok();
+    if sd_ok {
+        let _ = storage::ensure_pulp_dir_async(&sd).await;
     }
 
     let mut input = InputDriver::new(board.input);
-    let mapper = ButtonMapper::new();
+    let battery_mv = battery::adc_to_battery_mv(input.read_battery_mv());
 
-    let mut apps = Apps {
-        home: HOME.init(HomeApp::new()),
-        files: FILES.init(FilesApp::new()),
-        reader: READER.take(),
-        settings: SETTINGS.init(SettingsApp::new()),
-    };
+    let mut kernel = Kernel::new(
+        sd,
+        epd,
+        STRIP.take(),
+        DIR_CACHE.take(),
+        BM_CACHE.take(),
+        delay,
+        sd_ok,
+        battery_mv,
+    );
 
-    let launcher = LAUNCHER.take();
-    let quick_menu = QUICK_MENU.take();
-    let bumps = BUMPS.take();
+    let mut app_mgr = AppManager::new(
+        LAUNCHER.take(),
+        HOME.init(HomeApp::new()),
+        FILES.init(FilesApp::new()),
+        READER.take(),
+        SETTINGS.init(SettingsApp::new()),
+        QUICK_MENU.take(),
+        BUMPS.take(),
+        ButtonMapper::new(),
+    );
 
-    let dir_cache = DIR_CACHE.take();
-    let bm_cache = BM_CACHE.take();
-
-    bm_cache.ensure_loaded(&board.storage.sd);
-
-    {
-        let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
-        apps.settings.load_eager(&mut svc);
-        apps.propagate_fonts(quick_menu, bumps);
-        apps.home.load_recent(&mut svc);
-    }
-
-    tasks::set_idle_timeout(apps.settings.system_settings().sleep_timeout);
-
-    let cached_battery_mv_init = battery::adc_to_battery_mv(input.read_battery_mv());
-    update_statusbar(statusbar, cached_battery_mv_init, sd_ok);
-
-    apps.home.on_enter(&mut launcher.ctx);
-
-    board
-        .display
-        .epd
-        .full_refresh_async(strip, &mut delay, &|s: &mut StripBuffer| {
-            statusbar.draw(s).unwrap();
-            apps.home.draw(s);
-        })
-        .await;
-
-    let _ = launcher.ctx.take_redraw();
-    info!("ui ready.");
+    kernel.boot(&mut app_mgr).await;
 
     spawner.spawn(tasks::input_task(input)).unwrap();
     spawner.spawn(tasks::housekeeping_task()).unwrap();
     spawner.spawn(tasks::idle_timeout_task()).unwrap();
     spawner.spawn(work_queue::worker_task()).unwrap();
-    info!("tasks spawned (input_task, housekeeping_task, idle_timeout_task, worker_task).");
     info!("kernel ready.");
 
-    let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
-
-    let mut partial_refreshes: u32 = 0;
-    let mut cached_battery_mv: u16 = cached_battery_mv_init;
-    let mut red_stale: bool = false;
-
-    loop {
-        // 0. upload mode intercept: bypasses App trait, runs own async loop
-        if launcher.active() == AppId::Upload {
-            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            pulp_os::apps::upload::run_upload_mode(
-                wifi,
-                &mut board.display.epd,
-                strip,
-                &mut delay,
-                &board.storage.sd,
-                apps.settings.system_settings().ui_font_size_idx,
-                bumps,
-                apps.settings.wifi_config(),
-            )
-            .await;
-
-            // pop back and re-render
-            if let Some(nav) = launcher.apply(Transition::Pop) {
-                apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
-            }
-            launcher.ctx.request_full_redraw();
-            continue;
-        }
-
-        // 1. wait for input or work tick
-        let hw_event = match select(tasks::INPUT_EVENTS.receive(), work_ticker.next()).await {
-            Either::First(ev) => Some(ev),
-            Either::Second(_) => None,
-        };
-
-        // 2. input event
-        if let Some(hw_event) = hw_event {
-            // power long-press: intercept before mapping so no app sees it
-            if hw_event
-                == pulp_os::drivers::input::Event::LongPress(pulp_os::board::button::Button::Power)
-            {
-                enter_sleep!("power held", bm_cache, board, strip, delay);
-            }
-
-            let event = mapper.map_event(hw_event);
-
-            // quick-menu
-            if quick_menu.open {
-                if let ActionEvent::Press(action) | ActionEvent::Repeat(action) = event {
-                    let result = quick_menu.on_action(action);
-                    match result {
-                        QuickMenuResult::Consumed => {
-                            if quick_menu.dirty {
-                                launcher.ctx.mark_dirty(quick_menu.region());
-                                quick_menu.dirty = false;
-                            }
-                        }
-                        QuickMenuResult::Close => {
-                            let region = quick_menu.region();
-                            sync_quick_menu(
-                                quick_menu,
-                                launcher.active(),
-                                &mut apps,
-                                &mut launcher.ctx,
-                            );
-                            launcher.ctx.mark_dirty(region);
-                        }
-                        QuickMenuResult::RefreshScreen => {
-                            sync_quick_menu(
-                                quick_menu,
-                                launcher.active(),
-                                &mut apps,
-                                &mut launcher.ctx,
-                            );
-                            launcher.ctx.request_full_redraw();
-                        }
-                        QuickMenuResult::GoHome => {
-                            sync_quick_menu(
-                                quick_menu,
-                                launcher.active(),
-                                &mut apps,
-                                &mut launcher.ctx,
-                            );
-                            let transition = Transition::Home;
-                            if let Some(nav) = launcher.apply(transition) {
-                                apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
-                            }
-                        }
-                        QuickMenuResult::AppTrigger(id) => {
-                            let active = launcher.active();
-                            let region = quick_menu.region();
-                            sync_quick_menu(quick_menu, active, &mut apps, &mut launcher.ctx);
-                            with_app!(active, apps, |app| {
-                                app.on_quick_trigger(id, &mut launcher.ctx);
-                            });
-                            if active == AppId::Reader {
-                                apps.reader.save_position(bm_cache);
-                            }
-                            launcher.ctx.mark_dirty(region);
-                        }
-                    }
-                }
-            }
-            // menu toggle
-            else if matches!(event, ActionEvent::Press(Action::Menu)) {
-                let active = launcher.active();
-                let actions: &[_] = with_app!(active, apps, |app| app.quick_actions());
-                quick_menu.show(actions);
-                launcher.ctx.mark_dirty(quick_menu.region());
-            }
-            // app dispatch
-            else {
-                let active = launcher.active();
-                let transition = with_app!(active, apps, |app| {
-                    app.on_event(event, &mut launcher.ctx)
-                });
-
-                if let Some(nav) = launcher.apply(transition) {
-                    apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
-                }
-            }
-        }
-
-        // if we just landed on Upload, skip to top where intercept lives
-        if launcher.active() == AppId::Upload {
-            continue;
-        }
-
-        // 3. app work: one step per iteration; multi-step ops yield between SD reads
-        {
-            let active = launcher.active();
-            let needs = with_app!(active, apps, |app| app.needs_work());
-            if needs {
-                let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
-                with_app!(active, apps, |app| {
-                    app.on_work(&mut svc, &mut launcher.ctx);
-                });
-            }
-        }
-
-        // 3b. reader background caching — continues even while
-        //     another app is active (e.g. browsing files or settings).
-        if launcher.active() != AppId::Reader && apps.reader.has_bg_work() {
-            let mut svc = Services::new(dir_cache, bm_cache, &board.storage.sd);
-            apps.reader.bg_work_tick(&mut svc);
-        }
-
-        // 4. housekeeping
-
-        // battery mv (~30s, from input_task)
-        if let Some(mv) = tasks::BATTERY_MV.try_take() {
-            cached_battery_mv = mv;
-        }
-
-        // SD presence check (~30s)
-        if tasks::SD_CHECK_DUE.try_take().is_some() {
-            sd_ok = board
-                .storage
-                .sd
-                .volume_mgr
-                .open_volume(embedded_sdmmc::VolumeIdx(0))
-                .is_ok();
-        }
-
-        // bookmark flush (~30s)
-        if tasks::BOOKMARK_FLUSH_DUE.try_take().is_some() && bm_cache.is_dirty() {
-            bm_cache.flush(&board.storage.sd);
-        }
-
-        // status bar refresh (~5s)
-        if tasks::STATUS_DUE.try_take().is_some() {
-            update_statusbar(statusbar, cached_battery_mv, sd_ok);
-
-            // re-sync idle timeout in case settings changed
-            if apps.settings.is_loaded() {
-                tasks::set_idle_timeout(apps.settings.system_settings().sleep_timeout);
-            }
-        }
-
-        // idle sleep: flush, sleep screen, deep sleep; wake = full reset
-        if tasks::IDLE_SLEEP_DUE.try_take().is_some() {
-            enter_sleep!("idle timeout", bm_cache, board, strip, delay);
-        }
-
-        // 5. render
-        statusbar.refresh_bg_status();
-
-        if !launcher.ctx.has_redraw() {
-            continue;
-        }
-
-        let redraw = launcher.ctx.take_redraw();
-
-        // try partial; fall through to full on ghost-clear, initial refresh, or explicit Full
-        'render: {
-            if let Redraw::Partial(r) = redraw {
-                let ghost_clear_every = if apps.settings.is_loaded() {
-                    apps.settings.system_settings().ghost_clear_every as u32
-                } else {
-                    DEFAULT_GHOST_CLEAR_EVERY
-                };
-
-                if partial_refreshes < ghost_clear_every {
-                    let r = r.align8();
-                    let render_bar_overlaps = r.y < BAR_HEIGHT;
-
-                    // phase 1: write BW; if red_stale also write RED=!BW so DU drives all pixels
-                    let active = launcher.active();
-                    let rs = with_app!(active, apps, |app| {
-                        let draw =
-                            draw_scene!(app, statusbar, quick_menu, bumps, render_bar_overlaps);
-                        if red_stale {
-                            board.display.epd.partial_phase1_bw_inv_red(
-                                strip, r.x, r.y, r.w, r.h, &mut delay, &draw,
-                            )
-                        } else {
-                            board
-                                .display
-                                .epd
-                                .partial_phase1_bw(strip, r.x, r.y, r.w, r.h, &mut delay, &draw)
-                        }
-                    });
-
-                    if let Some(rs) = rs {
-                        // phase 2: kick DU waveform (~400-600ms)
-                        board.display.epd.partial_start_du(&rs);
-
-                        // process input + work while DU runs
-                        let deferred = busy_wait_with_input!(
-                            board.display.epd,
-                            mapper,
-                            quick_menu,
-                            launcher,
-                            apps,
-                            dir_cache,
-                            bm_cache,
-                            board.storage.sd
-                        );
-
-                        // phase 3: sync RED+BW; skip if content changed during DU (rapid nav).
-                        // draw() now produces the next page; writing it to both planes ghosts.
-                        // leave RED stale; next render uses inv-red to correct it.
-                        // merge region so the inv-red pass covers pixels this DU changed.
-                        if launcher.ctx.has_redraw() {
-                            // content changed; skip sync, mark region for inv-red pass
-                            launcher.ctx.mark_dirty(r);
-                            red_stale = true;
-                            partial_refreshes += 1;
-                        } else {
-                            // stable; sync planes, power off
-                            red_stale = false;
-                            let active = launcher.active();
-                            with_app!(active, apps, |app| {
-                                let draw = draw_scene!(
-                                    app,
-                                    statusbar,
-                                    quick_menu,
-                                    bumps,
-                                    render_bar_overlaps
-                                );
-                                board.display.epd.partial_phase3_sync(strip, &rs, &draw);
-                            });
-                            partial_refreshes += 1;
-                            board.display.epd.power_off_async().await;
-                        }
-
-                        // apply deferred transition from busy wait
-                        if let Some(transition) = deferred
-                            && let Some(nav) = launcher.apply(transition)
-                        {
-                            apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
-                        }
-
-                        break 'render;
-                    }
-
-                    if !board.display.epd.needs_initial_refresh() {
-                        break 'render; // degenerate zero-size region
-                    }
-                    // fall through to full GC
-                    info!("display: partial failed (initial refresh), promoting to full");
-                } else {
-                    info!("display: promoted partial to full (ghosting clear)");
-                }
-                // fall through to full GC
-            }
-
-            // full GC refresh: explicit Full, ghost-clear, or initial-refresh fallback
-            if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
-                // ensure analog off; no-op normally, required after skipped power-off
-                board.display.epd.power_off_async().await;
-
-                update_statusbar(statusbar, cached_battery_mv, sd_ok);
-
-                let active = launcher.active();
-                with_app!(active, apps, |app| {
-                    let draw = draw_scene!(app, statusbar, quick_menu, bumps, true);
-                    board.display.epd.write_full_frame(strip, &mut delay, &draw);
-                });
-
-                board.display.epd.start_full_update();
-
-                // process input during ~1.6s GC waveform
-                let deferred = busy_wait_with_input!(
-                    board.display.epd,
-                    mapper,
-                    quick_menu,
-                    launcher,
-                    apps,
-                    dir_cache,
-                    bm_cache,
-                    board.storage.sd
-                );
-
-                board.display.epd.finish_full_update();
-                partial_refreshes = 0;
-                red_stale = false;
-
-                if let Some(transition) = deferred
-                    && let Some(nav) = launcher.apply(transition)
-                {
-                    apply_transition!(nav, launcher, apps, bm_cache, quick_menu, bumps);
-                }
-            }
-        } // 'render
-    }
-}
-
-// helpers
-
-fn update_statusbar(bar: &mut StatusBar, battery_mv: u16, sd_ok: bool) {
-    const HEAP_TOTAL: usize = 143360;
-    let stats = esp_alloc::HEAP.stats();
-
-    let bat_pct = battery::battery_percentage(battery_mv);
-
-    bar.update(&SystemStatus {
-        uptime_secs: uptime_secs(),
-        battery_mv,
-        battery_pct: bat_pct,
-        heap_used: stats.current_usage,
-        heap_peak: stats.max_usage,
-        heap_total: HEAP_TOTAL,
-        stack_free: free_stack_bytes(),
-        stack_hwm: stack_high_water_mark(),
-        sd_ok,
-        bg_active: work_queue::status().is_active(),
-    });
-}
-
-// push quick-menu cycle changes into active app; persist settings-owned values.
-// hand-written match (not with_app!) because we also borrow apps.settings below.
-fn sync_quick_menu(qm: &QuickMenu, active: AppId, apps: &mut Apps, ctx: &mut AppContext) {
-    for id in 0..MAX_APP_ACTIONS as u8 {
-        if let Some(value) = qm.app_cycle_value(id) {
-            match active {
-                AppId::Home => apps.home.on_quick_cycle_update(id, value, ctx),
-                AppId::Files => apps.files.on_quick_cycle_update(id, value, ctx),
-                AppId::Reader => apps.reader.on_quick_cycle_update(id, value, ctx),
-                AppId::Settings => apps.settings.on_quick_cycle_update(id, value, ctx),
-                AppId::Upload => {}
-            }
-        }
-    }
-
-    // persist reader font-size change into settings
-    if active == AppId::Reader
-        && let Some(font_idx) = qm.app_cycle_value(reader::QA_FONT_SIZE)
-    {
-        let ss = apps.settings.system_settings_mut();
-        if ss.book_font_size_idx != font_idx {
-            ss.book_font_size_idx = font_idx;
-            apps.settings.mark_save_needed();
-        }
-    }
+    kernel.run(&mut app_mgr).await
 }

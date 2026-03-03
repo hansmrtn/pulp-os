@@ -1,6 +1,5 @@
-// Semantic actions decoupled from physical buttons.
-// Apps match on Action, never on HwButton. ButtonMapper translates
-// physical events using the fixed portrait one-handed layout.
+// semantic actions decoupled from physical buttons
+// apps match on Action, never on HwButton
 
 use crate::board::button::Button;
 use crate::drivers::input::Event;
@@ -44,6 +43,7 @@ impl ActionEvent {
     }
 }
 
+// fixed portrait one-handed layout
 #[derive(Default)]
 pub struct ButtonMapper;
 

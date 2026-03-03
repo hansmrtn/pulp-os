@@ -3,6 +3,7 @@ use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::Primiti
 use super::widget::{Alignment, Region};
 use crate::board::action::{Action, ButtonMapper};
 use crate::board::button::Button;
+use crate::board::layout::{CX_BACK, CX_CONFIRM, CX_LEFT, CX_RIGHT, CY_VOL_DOWN, CY_VOL_UP};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
@@ -15,14 +16,6 @@ pub const BUTTON_BAR_H: u16 = TAB_H + BOTTOM_INSET;
 
 const RIDGE_W: u16 = 22;
 const RIDGE_H: u16 = 36;
-
-const CX_BACK: u16 = 84;
-const CX_CONFIRM: u16 = 194;
-const CX_LEFT: u16 = 286;
-const CX_RIGHT: u16 = 396;
-
-const CY_VOL_UP: u16 = 364;
-const CY_VOL_DOWN: u16 = 484;
 
 const NUM_BUMPS: usize = 6;
 

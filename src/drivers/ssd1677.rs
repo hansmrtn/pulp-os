@@ -1,16 +1,13 @@
-// SSD1677 e-paper driver (board-independent).
-// Tested on GDEQ0426T82 (800x480). No framebuffer; pixels streamed
-// through a 4KB StripBuffer.
+// SSD1677 e-paper driver (board-independent)
+// tested on GDEQ0426T82 (800x480), no framebuffer, strip-streamed
 //
-// Partial refresh (3-phase):
-//   phase1_bw   -- write new content to BW RAM
-//   start_du    -- kick DU waveform; caller handles input while BUSY
-//   phase3_sync -- sync RED+BW; skipped on rapid nav (red_stale)
-//   power_off   -- shut down analog
+// partial refresh (3-phase):
+//   phase1_bw    -- write new content to BW RAM
+//   start_du     -- kick DU waveform; caller polls input while BUSY
+//   phase3_sync  -- sync RED+BW; skipped on rapid nav (red_stale)
 //
-// When phase3 is skipped, use phase1_bw_inv_red next: writes RED=!BW
-// so DU drives every pixel to the correct BW target without a full GC.
-// Async variants replace blocking busy-wait with .await.
+// when phase3 is skipped, phase1_bw_inv_red writes RED=!BW so DU
+// drives every pixel to the correct BW target without a full GC
 
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
@@ -24,7 +21,7 @@ pub const HEIGHT: u16 = 480;
 
 pub const SPI_FREQ_MHZ: u32 = 20;
 
-const POWER_OFF_TIME_MS: u32 = 200;
+const POWER_OFF_TIME_MS: u32 = 200; // analog shutdown timeout
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Rotation {
@@ -35,7 +32,6 @@ pub enum Rotation {
     Deg270,
 }
 
-// SSD1677 commands
 #[allow(dead_code)]
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
@@ -48,8 +44,8 @@ mod cmd {
     pub const MASTER_ACTIVATION: u8 = 0x20;
     pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
     pub const DISPLAY_UPDATE_CONTROL_2: u8 = 0x22;
-    pub const WRITE_RAM_BW: u8 = 0x24; // current/new buffer
-    pub const WRITE_RAM_RED: u8 = 0x26; // previous buffer (differential)
+    pub const WRITE_RAM_BW: u8 = 0x24;
+    pub const WRITE_RAM_RED: u8 = 0x26;
     pub const BORDER_WAVEFORM: u8 = 0x3C;
     pub const SET_RAM_X_RANGE: u8 = 0x44;
     pub const SET_RAM_Y_RANGE: u8 = 0x45;
@@ -305,7 +301,7 @@ where
         })
     }
 
-    // gates wired in reverse; Y flipped, X inc / Y dec per GxEPD2
+    // gates wired in reverse; Y flipped, X inc / Y dec
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
         let y_flipped = HEIGHT - y - h;
 
@@ -338,7 +334,6 @@ where
         ]);
     }
 
-    // WFI between polls; BUSY falling-edge IRQ wakes; timer backstop
     fn wait_busy(&mut self, timeout_ms: u32) {
         use esp_hal::time::{Duration, Instant};
 
@@ -515,7 +510,7 @@ where
         self.initial_refresh = false;
     }
 
-    // mode 1: image retained, ~3uA; requires hw reset to wake
+    // mode 1: image retained, ~3 uA; requires hw reset to wake
     pub fn enter_deep_sleep(&mut self) {
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);

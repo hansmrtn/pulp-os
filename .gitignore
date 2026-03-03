@@ -10,4 +10,4 @@ target/
 *.pdb
 **/.DS_Store
 
-wiki.md
+*.md

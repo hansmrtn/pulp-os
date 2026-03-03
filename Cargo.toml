@@ -15,15 +15,13 @@ path = "./src/bin/main.rs"
 esp-hal  = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
 esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3", "esp-radio", "log-04"] }
 
-# esp-rtos pulls in embassy-executor and the time-driver backend;
-# we still need these for user-facing types (Spawner, Timer, Ticker, select).
-# Versions MUST match what esp-rtos 0.2.0 resolves internally.
+# versions must match what esp-rtos 0.2.0 resolves internally
 embassy-executor = "0.9"
 embassy-time     = "0.5"
 embassy-futures  = "0.1"
 embassy-sync     = "0.7"
 
-# ── WiFi / networking (upload binary) ────────────────────────────────
+# wifi / networking
 esp-radio = { version = "0.17", default-features = false, features = [
   "esp32c3",
   "wifi",
@@ -50,11 +48,12 @@ embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
 embedded-hal-bus = { version = "0.3.0"  }
 nb = "1.1.0"
+
 embedded-graphics-core = "0.4.1"
 embedded-graphics = "0.8.2"
-embedded-sdmmc = "0.9.0"
-# smol-epub = { git = "https://github.com/hansmrtn/smol-epub" }
-smol-epub = { path = "../smol-epub" }
+# FAT filesystem over SD/SPI (local fork with async volume manager)
+embedded-sdmmc = { path = "../embedded-sdmmc-rs", features = ["async"] }
+smol-epub = { path = "../smol-epub", features = ["async"] }
 
 
 [build-dependencies]

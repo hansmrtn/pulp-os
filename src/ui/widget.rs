@@ -1,4 +1,4 @@
-// Region geometry and alignment helpers; x/w should be 8-aligned for partial refresh.
+// region geometry and alignment helpers
 
 use embedded_graphics::{prelude::*, primitives::Rectangle};
 

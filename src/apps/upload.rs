@@ -1,4 +1,4 @@
-// WiFi upload server: GET / serves HTML, POST /upload streams to SD, mDNS as pulp.local.
+// wifi upload server: HTTP file upload + mDNS (pulp.local)
 
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
@@ -13,7 +13,6 @@ use esp_hal::delay::Delay;
 use esp_radio::wifi::{ClientConfig, Config, ModeConfig};
 use log::info;
 
-use crate::apps::settings::WifiConfig;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
@@ -21,6 +20,7 @@ use crate::drivers::storage;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
+use crate::kernel::config::WifiConfig;
 use crate::kernel::tasks;
 use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region, stack_fmt};
 
@@ -67,18 +67,16 @@ enum ServerEvent {
     DeleteFailed,
 }
 
-pub async fn run_upload_mode<SPI>(
+pub async fn run_upload_mode(
     wifi: esp_hal::peripherals::WIFI<'static>,
     epd: &mut Epd,
     strip: &mut StripBuffer,
     delay: &mut Delay,
-    sd: &SdStorage<SPI>,
+    sd: &SdStorage,
     ui_font_size_idx: u8,
     bumps: &ButtonFeedback,
     wifi_cfg: &WifiConfig,
-) where
-    SPI: embedded_hal::spi::SpiDevice,
-{
+) {
     let heading = fonts::heading_font(ui_font_size_idx);
     let body = fonts::chrome_font();
 
@@ -326,14 +324,13 @@ pub async fn run_upload_mode<SPI>(
     info!("upload: exiting, tearing down WiFi");
 }
 
-async fn serve_one_request<SPI>(
+async fn serve_one_request(
     stack: embassy_net::Stack<'_>,
     rx_buf: &mut [u8],
     tx_buf: &mut [u8],
-    sd: &SdStorage<SPI>,
+    sd: &SdStorage,
 ) -> ServerEvent
 where
-    SPI: embedded_hal::spi::SpiDevice,
 {
     let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
     socket.set_timeout(Some(Duration::from_secs(30)));
@@ -546,14 +543,13 @@ where
     ServerEvent::Nothing
 }
 
-async fn handle_upload<SPI>(
+async fn handle_upload(
     socket: &mut TcpSocket<'_>,
-    sd: &SdStorage<SPI>,
+    sd: &SdStorage,
     boundary: &[u8],
     initial_body: &[u8],
 ) -> Result<([u8; 13], u8), &'static str>
 where
-    SPI: embedded_hal::spi::SpiDevice,
 {
     if boundary.len() > MAX_BOUNDARY_LEN {
         return Err("boundary too long");
@@ -581,6 +577,17 @@ where
             let (name_buf, name_len) = sanitize_83(raw_name);
             if name_len == 0 {
                 return Err("invalid filename");
+            }
+
+            // Warn if sanitisation changed the name — two different
+            // original names can map to the same 8.3 name, causing
+            // the second upload to silently overwrite the first.
+            if raw_name != &name_buf[..name_len as usize] {
+                log::warn!(
+                    "upload: sanitised '{}' -> '{}' (may overwrite existing file)",
+                    core::str::from_utf8(raw_name).unwrap_or("?"),
+                    core::str::from_utf8(&name_buf[..name_len as usize]).unwrap_or("?"),
+                );
             }
 
             let file_start = pos + 4;
@@ -851,7 +858,7 @@ async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
         return;
     }
 
-    info!("upload: mDNS query for pulp.local — responding");
+    info!("upload: mDNS query for pulp.local -- responding");
 
     let mut resp = [0u8; MDNS_RESPONSE_LEN];
     let len = build_mdns_response(&mut resp, ip_octets);

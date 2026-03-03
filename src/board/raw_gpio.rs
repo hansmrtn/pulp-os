@@ -1,10 +1,10 @@
-// Direct register GPIO for pins esp-hal does not expose.
-// DIO flash mode frees GPIO12/13; esp-hal 1.0 has no peripheral types
-// for GPIO12..17 on ESP32-C3. Only OutputPin is implemented.
+// direct register GPIO for pins esp-hal does not expose
+// DIO flash mode frees GPIO12/13; esp-hal 1.0 has no peripheral
+// types for GPIO12..17 on ESP32-C3
 
-const GPIO_OUT_W1TS: u32 = 0x6000_4008; // set output high
-const GPIO_OUT_W1TC: u32 = 0x6000_400C; // set output low
-const GPIO_ENABLE_W1TS: u32 = 0x6000_4024; // enable output
+const GPIO_OUT_W1TS: u32 = 0x6000_4008;
+const GPIO_OUT_W1TC: u32 = 0x6000_400C;
+const GPIO_ENABLE_W1TS: u32 = 0x6000_4024;
 const IO_MUX_BASE: u32 = 0x6000_9000;
 const IO_MUX_PIN_STRIDE: u32 = 0x04;
 
@@ -30,7 +30,6 @@ impl RawOutputPin {
             out_sel.write_volatile(0x80);
 
             (GPIO_ENABLE_W1TS as *mut u32).write_volatile(mask);
-
             (GPIO_OUT_W1TS as *mut u32).write_volatile(mask);
         }
 

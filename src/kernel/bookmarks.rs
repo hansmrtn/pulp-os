@@ -1,27 +1,14 @@
-// Bookmark cache: 16 slots, RAM-resident, flushed to SD on dirty.
+// bookmark cache: 16 slots, RAM-resident, flushed to SD on dirty
 //
-// Record layout (little-endian, 48 bytes per slot):
-//   [0..4)   name_hash    u32
-//   [4..8)   byte_offset  u32   font-independent file/chapter position
-//   [8..10)  chapter      u16   epub chapter; 0 for txt
-//   [10..12) flags        u16   bit 0 = valid
-//   [12..14) generation   u16   LRU counter (higher = more recent)
-//   [14]     name_len     u8
-//   [15]     _pad         u8
-//   [16..48) filename     [u8;32]
+// record layout (little-endian, 48 bytes per slot):
+//   [0..4)   name_hash  u32    [8..10)  chapter    u16
+//   [4..8)   byte_offset u32   [10..12) flags      u16 (bit 0 = valid)
+//   [12..14) generation u16    [14] name_len u8  [15] pad
+//   [16..48) filename [u8;32]
 
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
-pub use smol_epub::cache::fnv1a;
-
-fn fnv1a_icase(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in data {
-        h ^= b.to_ascii_lowercase() as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    h
-}
+pub use smol_epub::cache::fnv1a_icase;
 
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
@@ -121,6 +108,7 @@ impl BmListEntry {
     }
 }
 
+// 16-slot LRU bookmark cache; flushed to _PULP/BKMK.BIN periodically
 pub struct BookmarkCache {
     slots: [BookmarkSlot; SLOTS],
     count: usize, // slots present in file; new saves past this extend count
@@ -152,19 +140,20 @@ impl BookmarkCache {
         self.loaded
     }
 
-    pub fn ensure_loaded<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
+    pub fn ensure_loaded(&mut self, sd: &SdStorage) {
         if self.loaded {
             return;
         }
         self.force_load(sd);
     }
 
-    pub fn force_load<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
+    pub fn force_load(&mut self, sd: &SdStorage) {
         let mut buf = [0u8; FILE_LEN];
-        let slot_count = match storage::read_pulp_file_start(sd, BOOKMARK_FILE, &mut buf) {
-            Ok((_, n)) => (n / RECORD_LEN).min(SLOTS),
-            Err(_) => 0,
-        };
+        let slot_count =
+            match storage::read_file_start_in_dir(sd, storage::PULP_DIR, BOOKMARK_FILE, &mut buf) {
+                Ok((_, n)) => (n / RECORD_LEN).min(SLOTS),
+                Err(_) => 0,
+            };
 
         for i in 0..slot_count {
             let base = i * RECORD_LEN;
@@ -181,7 +170,6 @@ impl BookmarkCache {
         log::info!("bookmarks: loaded {} slots from SD", slot_count);
     }
 
-    // find bookmark by filename; None if not found or not loaded
     pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
         if !self.loaded {
             return None;
@@ -248,7 +236,7 @@ impl BookmarkCache {
         let mut max_gen: u16 = 0;
         let mut target: Option<usize> = None;
         let mut first_free: Option<usize> = None;
-        let mut lru_slot: usize = 0;
+        let mut lru_slot: Option<usize> = None;
         let mut lru_gen: u16 = u16::MAX;
 
         for i in 0..self.count {
@@ -266,7 +254,7 @@ impl BookmarkCache {
             }
             if slot.generation < lru_gen {
                 lru_gen = slot.generation;
-                lru_slot = i;
+                lru_slot = Some(i);
             }
 
             if slot.name_hash == key && slot.matches_name(filename) {
@@ -275,10 +263,17 @@ impl BookmarkCache {
             }
         }
 
-        let write_slot = target.or(first_free).unwrap_or(if self.count >= SLOTS {
-            lru_slot
-        } else {
-            self.count
+        let write_slot = target.or(first_free).unwrap_or_else(|| {
+            if self.count >= SLOTS {
+                // Evict the least-recently-used valid slot.  If no valid
+                // LRU candidate was found (every slot was invalid), they
+                // would all have been captured by first_free above, so
+                // this path is unreachable — fall back to 0 as a safe
+                // default rather than panicking.
+                lru_slot.unwrap_or(0)
+            } else {
+                self.count
+            }
         });
 
         let generation = max_gen.wrapping_add(1);
@@ -312,7 +307,7 @@ impl BookmarkCache {
         );
     }
 
-    pub fn flush<SPI: embedded_hal::spi::SpiDevice>(&mut self, sd: &SdStorage<SPI>) {
+    pub fn flush(&mut self, sd: &SdStorage) {
         if !self.dirty || !self.loaded {
             return;
         }
@@ -326,7 +321,7 @@ impl BookmarkCache {
             buf[base..base + RECORD_LEN].copy_from_slice(&rec);
         }
 
-        match storage::write_pulp_file(sd, BOOKMARK_FILE, &buf[..file_len]) {
+        match storage::write_file_in_dir(sd, storage::PULP_DIR, BOOKMARK_FILE, &buf[..file_len]) {
             Ok(_) => {
                 self.dirty = false;
                 log::info!("bookmarks: flushed {} slots to SD", self.count);

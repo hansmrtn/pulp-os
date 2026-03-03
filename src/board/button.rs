@@ -1,6 +1,5 @@
-// Button definitions and ADC resistance ladder decoding.
-// Two ADC ladders (Row1 GPIO1, Row2 GPIO2) plus discrete power button on GPIO3.
-// Each ladder encodes buttons as voltage levels.
+// button definitions and ADC resistance ladder decoding
+// two ADC ladders (Row1 GPIO1, Row2 GPIO2) plus power button (GPIO3)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
@@ -35,6 +34,7 @@ impl core::fmt::Display for Button {
 
 pub const DEFAULT_TOLERANCE: u16 = 150;
 
+// (center_mv, tolerance_mv, button)
 pub const ROW1_THRESHOLDS: &[(u16, u16, Button)] = &[
     (3, 50, Button::Right),
     (1113, DEFAULT_TOLERANCE, Button::Left),

@@ -1,11 +1,13 @@
-// XTEink X4 board support (ESP32-C3, SSD1677 800x480, SD over SPI2).
-// DMA-backed SPI (GDMA CH0); RefCellDevice arbitrates bus.
+// board support for the XTEink X4 (ESP32-C3, SSD1677 800x480, SD over SPI2)
+// DMA-backed SPI (GDMA CH0); CriticalSectionDevice arbitrates bus
 
 pub mod action;
+pub mod battery;
 pub mod button;
+pub mod layout;
 pub mod raw_gpio;
 
-pub use crate::drivers::sdcard::SdStorage;
+pub use crate::drivers::sdcard::{SdStorage, SyncSdCard};
 pub use crate::drivers::ssd1677::{DisplayDriver, HEIGHT, SPI_FREQ_MHZ, WIDTH};
 pub use crate::drivers::strip::StripBuffer;
 pub use button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
@@ -37,7 +39,10 @@ pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, 
 
 static SPI_BUS: StaticCell<Mutex<RefCell<SpiBus>>> = StaticCell::new();
 
-// ISR clears interrupt flag; any interrupt wakes the Embassy executor
+// cached ref to the SPI bus mutex, set once in Board::init
+static SPI_BUS_REF: Mutex<core::cell::Cell<Option<&'static Mutex<RefCell<SpiBus>>>>> =
+    Mutex::new(core::cell::Cell::new(None));
+
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
 #[esp_hal::handler]
@@ -47,7 +52,6 @@ fn gpio_handler() {
             && btn.is_interrupt_set()
         {
             btn.clear_interrupt();
-            // any interrupt wakes the Embassy executor; no explicit signal needed
         }
     });
 }
@@ -74,7 +78,8 @@ pub struct DisplayHw {
 }
 
 pub struct StorageHw {
-    pub sd: SdStorage<SdSpiDevice>,
+    // sd card, initialised at 400 kHz before EPD touches the bus
+    pub sd_card: Option<SyncSdCard>,
 }
 
 pub struct Board {
@@ -94,32 +99,57 @@ impl Board {
         }
     }
 
-    // Takes &Peripherals so init_spi_peripherals can consume them by value.
-    // Safety: each clone_unchecked targets a distinct GPIO/ADC peripheral;
-    // no pin is used by both init_input and init_spi_peripherals.
+    // gpio / peripheral ownership:
+    //
+    // init_input (clone_unchecked)     init_spi_peripherals (move/clone)
+    // ---                              ---
+    // GPIO0   battery ADC              GPIO4   EPD DC
+    // GPIO1   button row 1 ADC         GPIO5   EPD RST
+    // GPIO2   button row 2 ADC         GPIO6   EPD BUSY
+    // GPIO3   power button             GPIO7   SPI MISO
+    // ADC1                             GPIO8   SPI SCK
+    // IO_MUX                           GPIO10  SPI MOSI
+    //                                  GPIO12  SD CS (raw register)
+    //                                  GPIO21  EPD CS
+    //                                  SPI2, DMA_CH0
+
+    // Safety for all clone_unchecked calls below:
+    //
+    // init_input borrows Peripherals immutably and clones the pins it
+    // needs.  init_spi_peripherals later takes ownership of the full
+    // Peripherals struct but only touches a disjoint set of GPIOs
+    // (GPIO4-8, GPIO10, GPIO21, SPI2, DMA_CH0).  See the ownership
+    // table above for the complete split.  Each peripheral listed here
+    // is used exclusively by InputHw and never touched again.
     fn init_input(p: &Peripherals) -> InputHw {
         let mut adc_cfg = AdcConfig::new();
 
+        // Safety: GPIO1 is used only here (button row 1 ADC).
         let row1 = adc_cfg.enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(
             unsafe { p.GPIO1.clone_unchecked() },
             Attenuation::_11dB,
         );
 
+        // Safety: GPIO2 is used only here (button row 2 ADC).
         let row2 = adc_cfg.enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(
             unsafe { p.GPIO2.clone_unchecked() },
             Attenuation::_11dB,
         );
 
+        // Safety: GPIO0 is used only here (battery voltage ADC).
         let battery = adc_cfg.enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(
             unsafe { p.GPIO0.clone_unchecked() },
             Attenuation::_11dB,
         );
 
+        // Safety: ADC1 is used only here; init_spi_peripherals does not use ADC.
         let adc = Adc::new(unsafe { p.ADC1.clone_unchecked() }, adc_cfg);
 
+        // Safety: IO_MUX is used only here for the GPIO interrupt handler.
         let mut io = Io::new(unsafe { p.IO_MUX.clone_unchecked() });
         io.set_interrupt_handler(gpio_handler);
 
+        // Safety: GPIO3 is used only here (power button input with IRQ).
         let mut power = Input::new(
             unsafe { p.GPIO3.clone_unchecked() },
             InputConfig::default().with_pull(Pull::Up),
@@ -139,13 +169,11 @@ impl Board {
         }
     }
 
-    // 400kHz for SD probe, then 20MHz; DMA-backed
+    // 400 kHz for SD probe, then 20 MHz; DMA-backed
     fn init_spi_peripherals(p: Peripherals) -> (DisplayHw, StorageHw) {
         let epd_cs = Output::new(p.GPIO21, Level::High, OutputConfig::default());
         let dc = Output::new(p.GPIO4, Level::High, OutputConfig::default());
         let rst = Output::new(p.GPIO5, Level::High, OutputConfig::default());
-
-        // no pre-armed interrupt; esp-hal async Wait manages GPIO6
         let busy = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::None));
 
         // GPIO12 free in DIO mode; no esp-hal type, use raw registers
@@ -175,22 +203,29 @@ impl Board {
             SPI_BUS.init(Mutex::new(RefCell::new(spi_dma_bus)));
         info!("SPI bus: DMA enabled (CH0, 4096B TX+RX)");
 
-        let sd_spi = CriticalSectionDevice::new(spi_ref, sd_cs, Delay::new()).unwrap();
-        let sd = SdStorage::new(sd_spi);
+        critical_section::with(|cs| SPI_BUS_REF.borrow(cs).set(Some(spi_ref)));
 
-        let fast_cfg = spi::master::Config::default().with_frequency(Rate::from_mhz(SPI_FREQ_MHZ));
-        critical_section::with(|cs| {
-            spi_ref
-                .borrow(cs)
-                .borrow_mut()
-                .apply_config(&fast_cfg)
-                .unwrap();
-        });
-        info!("SPI bus: 400kHz -> {}MHz", SPI_FREQ_MHZ);
+        let sd_spi = CriticalSectionDevice::new(spi_ref, sd_cs, Delay::new()).unwrap();
+
+        // init SD card now, at 400 kHz on a pristine bus, before EPD
+        // traffic -- SD spec requires CMD0 on a clean bus
+        let sd_card = SdStorage::init_card(sd_spi);
 
         let epd_spi = CriticalSectionDevice::new(spi_ref, epd_cs, Delay::new()).unwrap();
         let epd = DisplayDriver::new(epd_spi, dc, rst, busy);
 
-        (DisplayHw { epd }, StorageHw { sd })
+        (DisplayHw { epd }, StorageHw { sd_card })
     }
+}
+
+// switch SPI bus from 400 kHz to operational frequency (20 MHz)
+// call after Board::init and before first EPD render
+pub fn speed_up_spi() {
+    let fast_cfg = spi::master::Config::default().with_frequency(Rate::from_mhz(SPI_FREQ_MHZ));
+    critical_section::with(|cs| {
+        if let Some(bus) = SPI_BUS_REF.borrow(cs).get() {
+            bus.borrow(cs).borrow_mut().apply_config(&fast_cfg).unwrap();
+            info!("SPI bus: 400kHz -> {}MHz", SPI_FREQ_MHZ);
+        }
+    });
 }

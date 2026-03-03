@@ -1,4 +1,4 @@
-// Launcher screen: menu, bookmarks browser.
+// launcher screen: menu, bookmarks browser
 
 use core::fmt::Write as _;
 
@@ -6,15 +6,14 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::PrimitiveStyle;
 
-use crate::apps::bookmarks::{self, BmListEntry};
-use crate::apps::reader::RECENT_FILE;
-use crate::apps::{App, AppContext, AppId, Services, Transition};
+use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
-use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::bitmap::byte_to_char;
+use crate::kernel::KernelHandle;
+use crate::kernel::bookmarks::{self, BmListEntry};
 use crate::ui::{Alignment, BUTTON_BAR_H, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
 
 const ITEM_W: u16 = 280;
@@ -55,8 +54,7 @@ enum MenuAction {
 pub struct HomeApp {
     state: HomeState,
     selected: usize,
-    body_font: &'static BitmapFont,
-    heading_font: &'static BitmapFont,
+    ui_fonts: fonts::UiFonts,
     item_regions: [Region; MAX_ITEMS],
     item_count: usize,
 
@@ -79,13 +77,12 @@ impl Default for HomeApp {
 
 impl HomeApp {
     pub fn new() -> Self {
-        let hf = fonts::heading_font(0);
+        let uf = fonts::UiFonts::for_size(0);
         Self {
             state: HomeState::Menu,
             selected: 0,
-            body_font: fonts::body_font(0),
-            heading_font: hf,
-            item_regions: compute_item_regions(hf.line_height),
+            ui_fonts: uf,
+            item_regions: compute_item_regions(uf.heading.line_height),
             item_count: 4, // updated after load; may include Continue
             recent_book: [0u8; 32],
             recent_book_len: 0,
@@ -99,17 +96,13 @@ impl HomeApp {
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
-        self.body_font = fonts::body_font(idx);
-        self.heading_font = fonts::heading_font(idx);
-        self.item_regions = compute_item_regions(self.heading_font.line_height);
+        self.ui_fonts = fonts::UiFonts::for_size(idx);
+        self.item_regions = compute_item_regions(self.ui_fonts.heading.line_height);
     }
 
-    pub fn load_recent<SPI: embedded_hal::spi::SpiDevice>(
-        &mut self,
-        services: &mut Services<'_, SPI>,
-    ) {
+    pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
         let mut buf = [0u8; 32];
-        match services.read_pulp_start(RECENT_FILE, &mut buf) {
+        match k.sync_read_app_data_start(RECENT_FILE, &mut buf) {
             Ok((_, n)) if n > 0 => {
                 let n = n.min(32);
                 self.recent_book[..n].copy_from_slice(&buf[..n]);
@@ -186,12 +179,12 @@ impl HomeApp {
     }
 
     fn bm_text_y(&self) -> u16 {
-        CONTENT_TOP + 4 + self.heading_font.line_height + BM_HEADER_GAP
+        CONTENT_TOP + 4 + self.ui_fonts.heading.line_height + BM_HEADER_GAP
     }
 
     fn bm_visible_lines(&self) -> usize {
         let area_h = BM_BOTTOM.saturating_sub(self.bm_text_y());
-        (area_h / self.body_font.line_height).max(1) as usize
+        (area_h / self.ui_fonts.body.line_height).max(1) as usize
     }
 
     fn bm_page_region(&self) -> Region {
@@ -200,7 +193,7 @@ impl HomeApp {
 }
 
 impl App for HomeApp {
-    fn on_enter(&mut self, ctx: &mut AppContext) {
+    async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         ctx.clear_message();
         self.state = HomeState::Menu;
         self.selected = 0;
@@ -212,7 +205,7 @@ impl App for HomeApp {
         ));
     }
 
-    fn on_resume(&mut self, ctx: &mut AppContext) {
+    async fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.state = HomeState::Menu;
         self.selected = 0;
         self.needs_load_recent = true;
@@ -224,19 +217,11 @@ impl App for HomeApp {
         ));
     }
 
-    fn needs_work(&self) -> bool {
-        self.needs_load_recent || self.needs_load_bookmarks
-    }
-
-    fn on_work<SPI: embedded_hal::spi::SpiDevice>(
-        &mut self,
-        svc: &mut Services<'_, SPI>,
-        ctx: &mut AppContext,
-    ) {
+    async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         if self.needs_load_recent {
             let old_count = self.item_count;
             let mut buf = [0u8; 32];
-            match svc.read_pulp_start(RECENT_FILE, &mut buf) {
+            match k.sync_read_app_data_start(RECENT_FILE, &mut buf) {
                 Ok((_, n)) if n > 0 => {
                     let n = n.min(32);
                     self.recent_book[..n].copy_from_slice(&buf[..n]);
@@ -254,7 +239,7 @@ impl App for HomeApp {
         }
 
         if self.needs_load_bookmarks {
-            self.bm_count = svc.bookmarks().load_all(&mut self.bm_entries);
+            self.bm_count = k.bookmark_cache().load_all(&mut self.bm_entries);
             self.needs_load_bookmarks = false;
             if self.state == HomeState::ShowBookmarks {
                 ctx.mark_dirty(self.bm_page_region());
@@ -397,16 +382,16 @@ impl HomeApp {
             ITEM_X,
             CONTENT_TOP + 8,
             ITEM_W,
-            self.heading_font.line_height,
+            self.ui_fonts.heading.line_height,
         );
-        BitmapLabel::new(title_region, "pulp-os", self.heading_font)
+        BitmapLabel::new(title_region, "pulp-os", self.ui_fonts.heading)
             .alignment(Alignment::Center)
             .draw(strip)
             .unwrap();
 
         for i in 0..self.item_count {
             let label = self.item_label(i);
-            BitmapLabel::new(self.item_regions[i], label, self.body_font)
+            BitmapLabel::new(self.item_regions[i], label, self.ui_fonts.body)
                 .alignment(Alignment::Center)
                 .inverted(i == self.selected)
                 .draw(strip)
@@ -419,9 +404,9 @@ impl HomeApp {
             BM_MARGIN,
             CONTENT_TOP + 4,
             SCREEN_W - BM_MARGIN * 2,
-            self.heading_font.line_height,
+            self.ui_fonts.heading.line_height,
         );
-        BitmapLabel::new(header_region, "Bookmarks", self.heading_font)
+        BitmapLabel::new(header_region, "Bookmarks", self.ui_fonts.heading)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
@@ -431,24 +416,29 @@ impl HomeApp {
                 SCREEN_W / 2,
                 CONTENT_TOP + 4,
                 SCREEN_W / 2 - BM_MARGIN,
-                self.heading_font.line_height,
+                self.ui_fonts.heading.line_height,
             );
-            let mut status = BitmapDynLabel::<20>::new(status_region, self.body_font)
+            let mut status = BitmapDynLabel::<20>::new(status_region, self.ui_fonts.body)
                 .alignment(Alignment::CenterRight);
             let _ = write!(status, "{}/{}", self.bm_selected + 1, self.bm_count);
             status.draw(strip).unwrap();
         }
 
         if self.bm_count == 0 {
-            let r = Region::new(BM_MARGIN, self.bm_text_y(), 300, self.body_font.line_height);
-            BitmapLabel::new(r, "No bookmarks saved", self.body_font)
+            let r = Region::new(
+                BM_MARGIN,
+                self.bm_text_y(),
+                300,
+                self.ui_fonts.body.line_height,
+            );
+            BitmapLabel::new(r, "No bookmarks saved", self.ui_fonts.body)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
             return;
         }
 
-        let font = self.body_font;
+        let font = self.ui_fonts.body;
         let line_h = font.line_height as i32;
         let ascent = font.ascent as i32;
         let text_y = self.bm_text_y() as i32;
