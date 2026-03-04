@@ -170,6 +170,19 @@ impl SdStorage {
     pub(crate) fn borrow_inner(&self) -> Option<core::cell::RefMut<'_, SdStorageInner>> {
         self.inner.as_ref().map(|c| c.borrow_mut())
     }
+
+    // flush pending writes and close fat handles; best-effort before halt.
+    // after this call no further sd i/o is possible until mcu reset
+    pub fn flush_and_close(&self) {
+        if let Some(ref cell) = self.inner {
+            let mut guard = cell.borrow_mut();
+            let inner = &mut *guard;
+            let _ = inner.mgr.close_dir(inner.root);
+            poll_once(async {
+                let _ = inner.mgr.close_volume(inner.vol).await;
+            });
+        }
+    }
 }
 
 // drive a future to completion in exactly one poll

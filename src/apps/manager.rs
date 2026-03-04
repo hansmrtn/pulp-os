@@ -164,8 +164,8 @@ impl AppManager {
         self.home.load_recent(k);
     }
 
-    pub async fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
-        self.home.on_enter(&mut self.launcher.ctx, k).await;
+    pub fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
+        self.home.on_enter(&mut self.launcher.ctx, k);
     }
 
     // power-button long-press must be intercepted by the scheduler
@@ -248,7 +248,7 @@ impl AppManager {
         }
     }
 
-    pub async fn apply_transition(&mut self, transition: Transition, k: &mut KernelHandle<'_>) {
+    pub fn apply_transition(&mut self, transition: Transition, k: &mut KernelHandle<'_>) {
         if let Some(nav) = self.launcher.apply(transition) {
             log::info!("app: {:?} -> {:?}", nav.from, nav.to);
 
@@ -268,11 +268,11 @@ impl AppManager {
             if nav.to != AppId::Upload {
                 if nav.resume {
                     with_app!(nav.to, self, |app| {
-                        app.on_resume(&mut self.launcher.ctx, k).await
+                        app.on_resume(&mut self.launcher.ctx, k)
                     });
                 } else {
                     with_app!(nav.to, self, |app| {
-                        app.on_enter(&mut self.launcher.ctx, k).await
+                        app.on_enter(&mut self.launcher.ctx, k)
                     });
                 }
             }
@@ -391,8 +391,8 @@ impl AppLayer for AppManager {
         AppManager::dispatch_event(self, event, bm)
     }
 
-    async fn apply_transition(&mut self, t: Transition, k: &mut KernelHandle<'_>) {
-        AppManager::apply_transition(self, t, k).await;
+    fn apply_transition(&mut self, t: Transition, k: &mut KernelHandle<'_>) {
+        AppManager::apply_transition(self, t, k);
     }
 
     async fn run_background(&mut self, k: &mut KernelHandle<'_>) {
@@ -447,8 +447,8 @@ impl AppLayer for AppManager {
         AppManager::load_home_recent(self, k);
     }
 
-    async fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
-        AppManager::enter_initial(self, k).await;
+    fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
+        AppManager::enter_initial(self, k);
     }
 
     fn needs_special_mode(&self) -> bool {

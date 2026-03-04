@@ -2,17 +2,25 @@
 //
 // all I/O through embedded-sdmmc AsyncVolumeManager; functions are
 // synchronous, wrapping async ops with poll_once (SPI bus is blocking
-// so every .await resolves immediately)
+// so every .await resolves immediately).
+//
+// Returns the unified `Error` type (re-exported as `StorageError` for
+// backward compatibility). Apps receive it directly through KernelHandle.
 
 use core::ops::ControlFlow;
 
 use embedded_sdmmc::Mode;
 
 use crate::drivers::sdcard::{SdStorage, SdStorageInner, poll_once};
+use crate::error::{Error, ErrorKind};
 
 pub const PULP_DIR: &str = "_PULP";
 pub const TITLES_FILE: &str = "TITLES.BIN";
 pub const TITLE_CAP: usize = 48;
+
+/// Backward-compatible alias — old code that references `StorageError`
+/// continues to compile while call-sites are migrated to `Error`.
+pub type StorageError = Error;
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {
@@ -90,9 +98,9 @@ fn sfn_to_bytes(name: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> u8 
     pos as u8
 }
 
-// file-operation macros
+// ── file-operation macros ─────────────────────────────────────────
 //
-// each evaluates to Result<T, &'static str>; none use `?` internally
+// each evaluates to Result<T, Error>; none use `?` internally
 // so caller cleanup (close_dir etc) is never bypassed
 
 macro_rules! op_file_size {
@@ -102,7 +110,7 @@ macro_rules! op_file_size {
             .find_directory_entry($dir, $name)
             .await
             .map(|e| e.size)
-            .map_err(|_| "open file failed")
+            .map_err(|_| Error::new(ErrorKind::OpenFile, "file_size"))
     };
 }
 
@@ -113,11 +121,15 @@ macro_rules! op_read_chunk {
             .open_file_in_dir($dir, $name, Mode::ReadOnly)
             .await
         {
-            Err(_) => Err("open file failed"),
+            Err(_) => Err(Error::new(ErrorKind::OpenFile, "read_chunk")),
             Ok(file) => {
                 let result = match $inner.mgr.file_seek_from_start(file, $offset) {
-                    Ok(()) => $inner.mgr.read(file, $buf).await.map_err(|_| "read failed"),
-                    Err(_) => Err("seek failed"),
+                    Ok(()) => $inner
+                        .mgr
+                        .read(file, $buf)
+                        .await
+                        .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_chunk")),
+                    Err(_) => Err(Error::new(ErrorKind::SeekFailed, "read_chunk")),
                 };
                 let _ = $inner.mgr.close_file(file).await;
                 result
@@ -133,10 +145,14 @@ macro_rules! op_read_start {
             .open_file_in_dir($dir, $name, Mode::ReadOnly)
             .await
         {
-            Err(_) => Err("open file failed"),
+            Err(_) => Err(Error::new(ErrorKind::OpenFile, "read_start")),
             Ok(file) => {
                 let size = $inner.mgr.file_length(file).unwrap_or(0);
-                let result = $inner.mgr.read(file, $buf).await.map_err(|_| "read failed");
+                let result = $inner
+                    .mgr
+                    .read(file, $buf)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_start"));
                 let _ = $inner.mgr.close_file(file).await;
                 result.map(|n| (size, n))
             }
@@ -151,7 +167,7 @@ macro_rules! op_write {
             .open_file_in_dir($dir, $name, Mode::ReadWriteCreateOrTruncate)
             .await
         {
-            Err(_) => Err("create file failed"),
+            Err(_) => Err(Error::new(ErrorKind::OpenFile, "write")),
             Ok(file) => {
                 let result = if ($data).is_empty() {
                     Ok(())
@@ -160,7 +176,7 @@ macro_rules! op_write {
                         .mgr
                         .write(file, $data)
                         .await
-                        .map_err(|_| "write failed")
+                        .map_err(|_| Error::new(ErrorKind::WriteFailed, "write"))
                 };
                 let _ = $inner.mgr.close_file(file).await;
                 result
@@ -176,7 +192,7 @@ macro_rules! op_append {
             .open_file_in_dir($dir, $name, Mode::ReadWriteCreateOrAppend)
             .await
         {
-            Err(_) => Err("create file failed"),
+            Err(_) => Err(Error::new(ErrorKind::OpenFile, "append")),
             Ok(file) => {
                 let result = if ($data).is_empty() {
                     Ok(())
@@ -185,7 +201,7 @@ macro_rules! op_append {
                         .mgr
                         .write(file, $data)
                         .await
-                        .map_err(|_| "write failed")
+                        .map_err(|_| Error::new(ErrorKind::WriteFailed, "append"))
                 };
                 let _ = $inner.mgr.close_file(file).await;
                 result
@@ -200,7 +216,7 @@ macro_rules! op_delete {
             .mgr
             .delete_entry_in_dir($dir, $name)
             .await
-            .map_err(|_| "delete failed")
+            .map_err(|_| Error::new(ErrorKind::DeleteFailed, "delete"))
     }};
 }
 
@@ -209,7 +225,7 @@ macro_rules! op_delete {
 macro_rules! in_dir {
     ($inner:expr, $dirname:expr, |$dir:ident| $body:expr) => {
         match $inner.mgr.open_dir($inner.root, $dirname).await {
-            Err(_) => Err("open dir failed"),
+            Err(_) => Err(Error::new(ErrorKind::OpenDir, "in_dir")),
             Ok($dir) => {
                 let _r = $body;
                 let _ = $inner.mgr.close_dir($dir);
@@ -222,11 +238,11 @@ macro_rules! in_dir {
 macro_rules! in_subdir {
     ($inner:expr, $d1:expr, $d2:expr, |$dir:ident| $body:expr) => {
         match $inner.mgr.open_dir($inner.root, $d1).await {
-            Err(_) => Err("open dir failed"),
+            Err(_) => Err(Error::new(ErrorKind::OpenDir, "in_subdir")),
             Ok(_mid) => match $inner.mgr.open_dir(_mid, $d2).await {
                 Err(_) => {
                     let _ = $inner.mgr.close_dir(_mid);
-                    Err("open dir failed")
+                    Err(Error::new(ErrorKind::OpenDir, "in_subdir"))
                 }
                 Ok($dir) => {
                     let _r = $body;
@@ -241,13 +257,14 @@ macro_rules! in_subdir {
 
 // borrow helper
 
-fn borrow(sd: &SdStorage) -> Result<core::cell::RefMut<'_, SdStorageInner>, &'static str> {
-    sd.borrow_inner().ok_or("SD not mounted")
+fn borrow(sd: &SdStorage) -> core::result::Result<core::cell::RefMut<'_, SdStorageInner>, Error> {
+    sd.borrow_inner()
+        .ok_or(Error::new(ErrorKind::NoCard, "storage::borrow"))
 }
 
-// root file operations
+// ── root file operations ──────────────────────────────────────────
 
-pub fn file_size(sd: &SdStorage, name: &str) -> Result<u32, &'static str> {
+pub fn file_size(sd: &SdStorage, name: &str) -> crate::error::Result<u32> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -260,7 +277,7 @@ pub fn read_file_chunk(
     name: &str,
     offset: u32,
     buf: &mut [u8],
-) -> Result<usize, &'static str> {
+) -> crate::error::Result<usize> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -272,7 +289,7 @@ pub fn read_file_start(
     sd: &SdStorage,
     name: &str,
     buf: &mut [u8],
-) -> Result<(u32, usize), &'static str> {
+) -> crate::error::Result<(u32, usize)> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -280,7 +297,7 @@ pub fn read_file_start(
     })
 }
 
-pub fn write_file(sd: &SdStorage, name: &str, data: &[u8]) -> Result<(), &'static str> {
+pub fn write_file(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -288,7 +305,7 @@ pub fn write_file(sd: &SdStorage, name: &str, data: &[u8]) -> Result<(), &'stati
     })
 }
 
-pub fn append_root_file(sd: &SdStorage, name: &str, data: &[u8]) -> Result<(), &'static str> {
+pub fn append_root_file(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -296,7 +313,7 @@ pub fn append_root_file(sd: &SdStorage, name: &str, data: &[u8]) -> Result<(), &
     })
 }
 
-pub fn delete_file(sd: &SdStorage, name: &str) -> Result<(), &'static str> {
+pub fn delete_file(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -304,9 +321,9 @@ pub fn delete_file(sd: &SdStorage, name: &str) -> Result<(), &'static str> {
     })
 }
 
-// directory listing
+// ── directory listing ─────────────────────────────────────────────
 
-pub fn list_root_files(sd: &SdStorage, buf: &mut [DirEntry]) -> Result<usize, &'static str> {
+pub fn list_root_files(sd: &SdStorage, buf: &mut [DirEntry]) -> crate::error::Result<usize> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -348,7 +365,7 @@ pub fn list_root_files(sd: &SdStorage, buf: &mut [DirEntry]) -> Result<usize, &'
                 ControlFlow::Continue(())
             })
             .await
-            .map_err(|_| "iterate dir failed")?;
+            .map_err(|_| Error::new(ErrorKind::ReadFailed, "list_root_files"))?;
 
         if total > count {
             log::warn!(
@@ -362,9 +379,9 @@ pub fn list_root_files(sd: &SdStorage, buf: &mut [DirEntry]) -> Result<usize, &'
     })
 }
 
-// directory management
+// ── directory management ──────────────────────────────────────────
 
-pub fn ensure_dir(sd: &SdStorage, name: &str) -> Result<(), &'static str> {
+pub fn ensure_dir(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
     // two poll_once calls so the large make_dir future never shares
     // a stack frame with open_dir, halving peak stack usage
     let exists = poll_once(async {
@@ -373,7 +390,7 @@ pub fn ensure_dir(sd: &SdStorage, name: &str) -> Result<(), &'static str> {
         match inner.mgr.open_dir(inner.root, name).await {
             Ok(dir) => {
                 let _ = inner.mgr.close_dir(dir);
-                Ok::<_, &'static str>(true)
+                Ok::<_, Error>(true)
             }
             Err(_) => Ok(false),
         }
@@ -389,19 +406,19 @@ pub fn ensure_dir(sd: &SdStorage, name: &str) -> Result<(), &'static str> {
         match inner.mgr.make_dir_in_dir(inner.root, name).await {
             Ok(()) => Ok(()),
             Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-            Err(_) => Err("make dir failed"),
+            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_dir")),
         }
     })
 }
 
-// single-directory file operations
+// ── single-directory file operations ──────────────────────────────
 
 pub fn write_file_in_dir(
     sd: &SdStorage,
     dir: &str,
     name: &str,
     data: &[u8],
-) -> Result<(), &'static str> {
+) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -414,7 +431,7 @@ pub fn append_file_in_dir(
     dir: &str,
     name: &str,
     data: &[u8],
-) -> Result<(), &'static str> {
+) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -428,7 +445,7 @@ pub fn read_file_chunk_in_dir(
     name: &str,
     offset: u32,
     buf: &mut [u8],
-) -> Result<usize, &'static str> {
+) -> crate::error::Result<usize> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -443,7 +460,7 @@ pub fn read_file_start_in_dir(
     dir: &str,
     name: &str,
     buf: &mut [u8],
-) -> Result<(u32, usize), &'static str> {
+) -> crate::error::Result<(u32, usize)> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -451,9 +468,9 @@ pub fn read_file_start_in_dir(
     })
 }
 
-// async boot path (runs inside the real executor)
+// ── async boot path (runs inside the real executor) ───────────────
 
-pub async fn ensure_pulp_dir_async(sd: &SdStorage) -> Result<(), &'static str> {
+pub async fn ensure_pulp_dir_async(sd: &SdStorage) -> crate::error::Result<()> {
     let mut guard = borrow(sd)?;
     let inner = &mut *guard;
 
@@ -467,13 +484,13 @@ pub async fn ensure_pulp_dir_async(sd: &SdStorage) -> Result<(), &'static str> {
     match inner.mgr.make_dir_in_dir(inner.root, PULP_DIR).await {
         Ok(()) => Ok(()),
         Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-        Err(_) => Err("make dir failed"),
+        Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_dir_async")),
     }
 }
 
-// _PULP subdirectory operations
+// ── _PULP subdirectory operations ─────────────────────────────────
 
-pub fn ensure_pulp_subdir(sd: &SdStorage, name: &str) -> Result<(), &'static str> {
+pub fn ensure_pulp_subdir(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
     let exists = poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -481,7 +498,7 @@ pub fn ensure_pulp_subdir(sd: &SdStorage, name: &str) -> Result<(), &'static str
             match inner.mgr.open_dir(pulp_h, name).await {
                 Ok(sub) => {
                     let _ = inner.mgr.close_dir(sub);
-                    Ok::<_, &'static str>(true)
+                    Ok::<_, Error>(true)
                 }
                 Err(_) => Ok(false),
             }
@@ -497,9 +514,9 @@ pub fn ensure_pulp_subdir(sd: &SdStorage, name: &str) -> Result<(), &'static str
         let inner = &mut *guard;
         in_dir!(inner, PULP_DIR, |pulp_h| {
             match inner.mgr.make_dir_in_dir(pulp_h, name).await {
-                Ok(()) => Ok::<_, &'static str>(()),
+                Ok(()) => Ok::<_, Error>(()),
                 Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-                Err(_) => Err("make dir failed"),
+                Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_subdir")),
             }
         })
     })
@@ -510,7 +527,7 @@ pub fn write_in_pulp_subdir(
     dir: &str,
     name: &str,
     data: &[u8],
-) -> Result<(), &'static str> {
+) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -525,7 +542,7 @@ pub fn append_in_pulp_subdir(
     dir: &str,
     name: &str,
     data: &[u8],
-) -> Result<(), &'static str> {
+) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -541,7 +558,7 @@ pub fn read_chunk_in_pulp_subdir(
     name: &str,
     offset: u32,
     buf: &mut [u8],
-) -> Result<usize, &'static str> {
+) -> crate::error::Result<usize> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -555,7 +572,7 @@ pub fn file_size_in_pulp_subdir(
     sd: &SdStorage,
     dir: &str,
     name: &str,
-) -> Result<u32, &'static str> {
+) -> crate::error::Result<u32> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -565,7 +582,7 @@ pub fn file_size_in_pulp_subdir(
     })
 }
 
-pub fn delete_in_pulp_subdir(sd: &SdStorage, dir: &str, name: &str) -> Result<(), &'static str> {
+pub fn delete_in_pulp_subdir(sd: &SdStorage, dir: &str, name: &str) -> crate::error::Result<()> {
     poll_once(async {
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
@@ -573,14 +590,19 @@ pub fn delete_in_pulp_subdir(sd: &SdStorage, dir: &str, name: &str) -> Result<()
     })
 }
 
-// append a title mapping line to _PULP/TITLES.BIN
-pub fn save_title(sd: &SdStorage, filename: &str, title: &str) -> Result<(), &'static str> {
+// ── title mapping ─────────────────────────────────────────────────
+
+/// Append a title mapping line to _PULP/TITLES.BIN
+pub fn save_title(sd: &SdStorage, filename: &str, title: &str) -> crate::error::Result<()> {
     let name_bytes = filename.as_bytes();
     let title_bytes = title.as_bytes();
     let title_len = title_bytes.len().min(TITLE_CAP);
     let line_len = name_bytes.len() + 1 + title_len + 1; // name + \t + title + \n
     if line_len > 128 {
-        return Err("title line too long");
+        return Err(Error::new(
+            ErrorKind::WriteFailed,
+            "save_title: line too long",
+        ));
     }
     let mut line = [0u8; 128];
     line[..name_bytes.len()].copy_from_slice(name_bytes);

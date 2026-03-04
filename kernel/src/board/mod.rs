@@ -40,8 +40,16 @@ pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, 
 static SPI_BUS: StaticCell<Mutex<RefCell<SpiBus>>> = StaticCell::new();
 
 // cached ref to the SPI bus mutex, set once in Board::init
-static SPI_BUS_REF: Mutex<core::cell::Cell<Option<&'static Mutex<RefCell<SpiBus>>>>> =
+// cached ref to the SPI bus mutex; pub(crate) so scheduler can
+// access the bus in sd_card_sleep before deep sleep
+pub(crate) static SPI_BUS_REF: Mutex<core::cell::Cell<Option<&'static Mutex<RefCell<SpiBus>>>>> =
     Mutex::new(core::cell::Cell::new(None));
+
+// sd cs clone; only used in enter_sleep to send cmd0
+// safety: same clone_unchecked pattern as gpio0/1/2/3 in init_input;
+// only accessed after all normal sd i/o has stopped and before mcu halts
+pub(crate) static SD_CS_SLEEP: Mutex<RefCell<Option<raw_gpio::RawOutputPin>>> =
+    Mutex::new(RefCell::new(None));
 
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
@@ -178,6 +186,12 @@ impl Board {
 
         // GPIO12 free in DIO mode; no esp-hal type, use raw registers
         let sd_cs = unsafe { raw_gpio::RawOutputPin::new(12) };
+
+        // second handle to GPIO12 for sending cmd0 before deep sleep
+        let sd_cs_sleep = unsafe { raw_gpio::RawOutputPin::new(12) };
+        critical_section::with(|cs| {
+            SD_CS_SLEEP.borrow_ref_mut(cs).replace(sd_cs_sleep);
+        });
 
         let slow_cfg = spi::master::Config::default().with_frequency(Rate::from_khz(400));
 

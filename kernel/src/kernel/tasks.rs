@@ -14,27 +14,44 @@ pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, Event, INPUT_CHANNEL_C
 
 pub static BATTERY_MV: Signal<CriticalSectionRawMutex, u16> = Signal::new();
 
-const BATTERY_INTERVAL_TICKS: u32 = 3000; // 3000 x 10 ms = 30 s
+const POLL_ACTIVE_MS: u64 = 10; // 100 hz: during/after input
+const POLL_IDLE_MS: u64 = 50; //  20 hz: no recent input
+const POLL_DROWSY_MS: u64 = 200; //   5 hz: approaching sleep timeout
+
+const IDLE_AFTER_MS: u64 = 2_000;
+const DROWSY_AFTER_MS: u64 = 30_000;
+
+const BATTERY_INTERVAL_MS: u64 = 30_000;
 
 #[embassy_executor::task]
 pub async fn input_task(mut input: InputDriver) -> ! {
-    let mut ticker = Ticker::every(Duration::from_millis(10));
-    let mut battery_counter: u32 = 0;
+    let mut poll_ms = POLL_ACTIVE_MS;
+    let mut battery_accum_ms: u64 = 0;
 
     let raw = input.read_battery_mv();
     BATTERY_MV.signal(battery::adc_to_battery_mv(raw));
 
     loop {
-        ticker.next().await;
+        Timer::after(Duration::from_millis(poll_ms)).await;
 
         if let Some(ev) = input.poll() {
             let _ = INPUT_EVENTS.try_send(ev);
             IDLE_RESET.signal(());
+            poll_ms = POLL_ACTIVE_MS;
+        } else {
+            let since = input.ms_since_last_event();
+            poll_ms = if since > DROWSY_AFTER_MS {
+                POLL_DROWSY_MS
+            } else if since > IDLE_AFTER_MS {
+                POLL_IDLE_MS
+            } else {
+                POLL_ACTIVE_MS
+            };
         }
 
-        battery_counter += 1;
-        if battery_counter >= BATTERY_INTERVAL_TICKS {
-            battery_counter = 0;
+        battery_accum_ms += poll_ms;
+        if battery_accum_ms >= BATTERY_INTERVAL_MS {
+            battery_accum_ms = 0;
             let raw = input.read_battery_mv();
             BATTERY_MV.signal(battery::adc_to_battery_mv(raw));
         }

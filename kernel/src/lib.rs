@@ -10,5 +10,9 @@ extern crate alloc;
 
 pub mod board;
 pub mod drivers;
+pub mod error;
 pub mod kernel;
 pub mod ui;
+
+// Re-export the core error types at crate root for convenience.
+pub use error::{Error, ErrorKind, Result, ResultExt};

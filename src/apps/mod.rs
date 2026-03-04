@@ -34,3 +34,10 @@ pub type NavEvent = crate::kernel::app::NavEvent<AppId>;
 pub type Launcher = crate::kernel::app::Launcher<AppId>;
 
 pub use crate::kernel::app::{App, AppContext, PendingSetting, RECENT_FILE, Redraw};
+
+// Unified error types — available to all app code as `crate::apps::Error` etc.
+pub use crate::kernel::{Error, ErrorKind, Result, ResultExt};
+
+// Backward-compatible alias; old app code referencing `StorageError`
+// keeps compiling — it is now `type StorageError = Error`.
+pub use crate::kernel::StorageError;

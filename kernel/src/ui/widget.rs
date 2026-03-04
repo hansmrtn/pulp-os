@@ -1,6 +1,10 @@
-// region geometry and alignment helpers
+// region geometry and alignment helpers, progress bar drawing
 
-use embedded_graphics::{prelude::*, primitives::Rectangle};
+use embedded_graphics::{
+    pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle, primitives::Rectangle,
+};
+
+use crate::drivers::strip::StripBuffer;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Region {
@@ -109,4 +113,39 @@ pub fn wrap_prev(current: usize, count: usize) -> usize {
         return 0;
     }
     if current == 0 { count - 1 } else { current - 1 }
+}
+
+// horizontal progress bar for 1-bit e-paper.
+// draws a 1px black border around the full track and fills
+// proportionally from the left. pct is clamped to 0..=100.
+// region should be at least 4px wide and 4px tall.
+pub fn draw_progress_bar(strip: &mut StripBuffer, region: Region, pct: u8) {
+    let pct = pct.min(100) as u32;
+
+    // clear region
+    region
+        .to_rect()
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+        .draw(strip)
+        .unwrap();
+
+    // 1px border shows full extent even at 0%
+    region
+        .to_rect()
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .draw(strip)
+        .unwrap();
+
+    // filled portion inside the border
+    if pct > 0 && region.w > 2 && region.h > 2 {
+        let inner_w = (region.w - 2) as u32;
+        let fill_w = (inner_w * pct / 100).max(1);
+        Rectangle::new(
+            Point::new((region.x + 1) as i32, (region.y + 1) as i32),
+            Size::new(fill_w, (region.h - 2) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(strip)
+        .unwrap();
+    }
 }

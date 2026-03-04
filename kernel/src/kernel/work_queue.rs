@@ -24,15 +24,13 @@ use smol_epub::DecodedImage;
 #[repr(u8)]
 pub enum BgWorkKind {
     Idle = 0,
-    StripChapter = 1,
-    DecodeImage = 2,
+    DecodeImage = 1,
 }
 
 impl BgWorkKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Idle => "",
-            Self::StripChapter => "CH",
             Self::DecodeImage => "IMG",
         }
     }
@@ -100,10 +98,6 @@ pub fn set_active_generation(g: u16) {
 }
 
 pub enum WorkTask {
-    StripChapter {
-        chapter_idx: u16,
-        xhtml: Vec<u8>,
-    },
     DecodeImage {
         path_hash: u32,
         data: Vec<u8>,
@@ -119,22 +113,8 @@ pub struct WorkItem {
 }
 
 pub enum WorkOutcome {
-    ChapterReady {
-        chapter_idx: u16,
-        text: Vec<u8>,
-    },
-    ChapterFailed {
-        chapter_idx: u16,
-        error: &'static str,
-    },
-    ImageReady {
-        path_hash: u32,
-        image: DecodedImage,
-    },
-    ImageFailed {
-        path_hash: u32,
-        error: &'static str,
-    },
+    ImageReady { path_hash: u32, image: DecodedImage },
+    ImageFailed { path_hash: u32, error: &'static str },
 }
 
 pub struct WorkResult {
@@ -149,8 +129,8 @@ impl WorkResult {
     }
 }
 
-static WORK_IN: Channel<CriticalSectionRawMutex, WorkItem, 1> = Channel::new();
-static WORK_OUT: Channel<CriticalSectionRawMutex, WorkResult, 1> = Channel::new();
+static WORK_IN: Channel<CriticalSectionRawMutex, WorkItem, 2> = Channel::new();
+static WORK_OUT: Channel<CriticalSectionRawMutex, WorkResult, 2> = Channel::new();
 
 pub fn submit(generation: u16, task: WorkTask) -> bool {
     WORK_IN.try_send(WorkItem { generation, task }).is_ok()
@@ -193,55 +173,6 @@ pub async fn worker_task() -> ! {
         }
 
         match item.task {
-            WorkTask::StripChapter { chapter_idx, xhtml } => {
-                set_status(BgStatus {
-                    kind: BgWorkKind::StripChapter,
-                    generation: g,
-                });
-
-                let src_len = xhtml.len();
-                log::info!(
-                    "[work] ch{}: strip {} bytes (gen {})",
-                    chapter_idx,
-                    src_len,
-                    g,
-                );
-
-                let result = smol_epub::cache::strip_html_buf(&xhtml);
-                drop(xhtml);
-
-                if g != active_generation() {
-                    log::info!("[work] ch{}: discarded (gen {} stale)", chapter_idx, g,);
-                    continue;
-                }
-
-                let outcome = match result {
-                    Ok(text) => {
-                        log::info!(
-                            "[work] ch{}: {} -> {} bytes",
-                            chapter_idx,
-                            src_len,
-                            text.len(),
-                        );
-                        WorkOutcome::ChapterReady { chapter_idx, text }
-                    }
-                    Err(e) => {
-                        log::warn!("[work] ch{}: strip failed: {}", chapter_idx, e);
-                        WorkOutcome::ChapterFailed {
-                            chapter_idx,
-                            error: e,
-                        }
-                    }
-                };
-
-                WORK_OUT
-                    .send(WorkResult {
-                        generation: g,
-                        outcome,
-                    })
-                    .await;
-            }
-
             WorkTask::DecodeImage {
                 path_hash,
                 data,

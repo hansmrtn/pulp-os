@@ -92,7 +92,7 @@ impl SettingsApp {
         self.settings = SystemSettings::defaults();
         self.wifi = WifiConfig::empty();
 
-        match k.sync_read_app_data_start(config::SETTINGS_FILE, &mut buf) {
+        match k.read_app_data_start(config::SETTINGS_FILE, &mut buf) {
             Ok((_size, n)) if n > 0 => {
                 parse_settings_txt(&buf[..n], &mut self.settings, &mut self.wifi);
                 self.settings.sanitize();
@@ -109,7 +109,7 @@ impl SettingsApp {
     fn save(&self, k: &mut KernelHandle<'_>) -> bool {
         let mut buf = [0u8; 512];
         let len = write_settings_txt(&self.settings, &self.wifi, &mut buf);
-        match k.sync_write_app_data(config::SETTINGS_FILE, &buf[..len]) {
+        match k.write_app_data(config::SETTINGS_FILE, &buf[..len]) {
             Ok(_) => {
                 log::info!("settings: saved to {}", config::SETTINGS_FILE);
                 true
@@ -249,7 +249,7 @@ impl SettingsApp {
 }
 
 impl App<AppId> for SettingsApp {
-    async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.selected = 0;
         self.save_needed = false;
         ctx.mark_dirty(Region::new(
@@ -269,8 +269,8 @@ impl App<AppId> for SettingsApp {
                 let old = self.selected;
                 self.selected = wrap_next(self.selected, NUM_ITEMS);
                 if self.selected != old {
-                    ctx.mark_dirty(self.row_region(old));
-                    ctx.mark_dirty(self.row_region(self.selected));
+                    ctx.mark_dirty_immediate(self.row_region(old));
+                    ctx.mark_dirty_immediate(self.row_region(self.selected));
                 }
                 Transition::None
             }
@@ -279,21 +279,21 @@ impl App<AppId> for SettingsApp {
                 let old = self.selected;
                 self.selected = wrap_prev(self.selected, NUM_ITEMS);
                 if self.selected != old {
-                    ctx.mark_dirty(self.row_region(old));
-                    ctx.mark_dirty(self.row_region(self.selected));
+                    ctx.mark_dirty_immediate(self.row_region(old));
+                    ctx.mark_dirty_immediate(self.row_region(self.selected));
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
                 self.increment();
-                ctx.mark_dirty(self.value_region(self.selected));
+                ctx.mark_dirty_immediate(self.value_region(self.selected));
                 Transition::None
             }
 
             ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
                 self.decrement();
-                ctx.mark_dirty(self.value_region(self.selected));
+                ctx.mark_dirty_immediate(self.value_region(self.selected));
                 Transition::None
             }
 

@@ -17,13 +17,20 @@ pub mod tasks;
 pub mod wake;
 pub mod work_queue;
 
+// Unified error types (primary home: crate::error)
+pub use crate::error::{Error, ErrorKind, Result, ResultExt};
+
+// Backward-compatible alias so `kernel::StorageError` keeps working
+// during migration.  It is now `type StorageError = Error`.
+pub use crate::drivers::storage::StorageError;
+
 pub use app::{
     App, AppContext, AppIdType, AppLayer, Launcher, NavEvent, PendingSetting, QuickAction,
     QuickActionKind, RECENT_FILE, Redraw, Transition,
 };
 pub use bookmarks::BookmarkCache;
 pub use console::BootConsole;
-pub use handle::{KernelHandle, StorageError};
+pub use handle::KernelHandle;
 pub use wake::uptime_secs;
 
 use esp_hal::delay::Delay;

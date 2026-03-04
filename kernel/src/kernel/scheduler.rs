@@ -1,11 +1,21 @@
 // scheduler: main event loop, render pipeline, housekeeping, sleep
 //
-// EPD and SD share a single SPI bus via CriticalSectionDevice;
-// busy_wait_with_input() does NOT run background SD I/O while
-// the EPD is refreshing to avoid RefCell borrow conflicts
+// EPD and SD share a single SPI bus via CriticalSectionDevice.
+// during normal operation, all SD I/O completes before render()
+// touches the EPD. during the DU/GC waveform (~400ms), the EPD
+// charge pump drives pixels with no SPI commands, so the bus is
+// free for SD I/O. busy_wait_with_background exploits this window
+// to run background caching and housekeeping during the waveform.
+//
+// handle_input and poll_housekeeping are synchronous; they return
+// a bool flag when the caller should enter_sleep (which is async
+// because it renders a sleep screen via the EPD).
+//
+// sd_card_sleep sends cmd0 before deep sleep to reduce sd card
+// idle current from ~150 µa to ~10 µa
 
 use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Ticker, with_timeout};
 use log::info;
 
 use super::app::{AppLayer, Redraw, Transition};
@@ -20,7 +30,7 @@ use crate::ui::{free_stack_bytes, stack_high_water_mark};
 const TICK_MS: u64 = 10;
 
 impl super::Kernel {
-    // render boot console to EPD -- call before boot() to show
+    // render boot console to EPD; call before boot() to show
     // hardware init progress in the built-in mono font
     pub async fn show_boot_console(&mut self, console: &super::BootConsole) {
         let draw = |s: &mut StripBuffer| console.draw(s);
@@ -41,7 +51,7 @@ impl super::Kernel {
 
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
         self.log_stats();
-        app_mgr.enter_initial(&mut self.handle()).await;
+        app_mgr.enter_initial(&mut self.handle());
 
         {
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
@@ -54,7 +64,12 @@ impl super::Kernel {
         info!("ui ready.");
     }
 
-    // event-driven main loop -- never returns
+    // event-driven main loop; never returns
+    //
+    // two genuine async suspension points in steady state:
+    //   1. select(INPUT_EVENTS.receive(), work_ticker.next())
+    //   2. EPD busy pin wait inside render()
+    // everything between them is synchronous function calls
     pub async fn run<A: AppLayer>(&mut self, app_mgr: &mut A) -> ! {
         let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
@@ -64,45 +79,71 @@ impl super::Kernel {
                 continue;
             }
 
+            // async point 1: wait for input or tick
             let hw_event = match select(tasks::INPUT_EVENTS.receive(), work_ticker.next()).await {
                 Either::First(ev) => Some(ev),
                 Either::Second(_) => None,
             };
 
             if let Some(ev) = hw_event {
-                self.handle_input(ev, app_mgr).await;
+                if self.handle_input(ev, app_mgr) {
+                    self.enter_sleep("power held").await;
+                    continue;
+                }
             }
 
             if app_mgr.needs_special_mode() {
                 continue;
             }
 
-            // SAFETY-CRITICAL: SPI bus sharing invariant
+            // SPI bus sharing invariant
             //
-            // The EPD and SD card share a single SPI2 bus via
-            // CriticalSectionDevice (RefCell under the hood).  SD I/O
-            // and EPD rendering must NEVER overlap, concurrent access
-            // would cause a RefCell borrow panic at runtime.
+            // the EPD and SD card share a single SPI2 bus via
+            // CriticalSectionDevice (RefCell under the hood).
             //
-            // This ordering enforces that:
-            //   1. All background SD I/O (app caching, title scan, etc.)
-            //      completes here, before any EPD access.
-            //   2. poll_housekeeping may do SD I/O (bookmark flush,
-            //      SD probe), also before render.
-            //   3. render() is the only code below that touches the EPD.
-            //   4. busy_wait_with_input() does NOT run background work
-            //      while the EPD is refreshing, only input collection.
+            //   1. background SD I/O runs here, before EPD access;
+            //      interruptible by input so the user can navigate
+            //      away during long-running caching operations
+            //   2. poll_housekeeping may do SD I/O, also before render
+            //   3. render() touches the EPD; during the waveform window
+            //      busy_wait_with_background runs SD I/O because the
+            //      EPD charge pump is driving pixels with no SPI commands
+            //   4. no SD I/O outside these three sites
             //
-            // If you add new SD I/O call sites, they MUST go above the
-            // render() call.  Violating this will panic, not corrupt.
-            {
+            // when input arrives during run_background, the background
+            // future is dropped. this is safe: partial chapter cache
+            // writes leave ch_cached=false so the chapter is recached
+            // on the next attempt
+            let bg_input = {
                 let mut handle = self.handle();
-                app_mgr.run_background(&mut handle).await;
+                match select(
+                    app_mgr.run_background(&mut handle),
+                    tasks::INPUT_EVENTS.receive(),
+                )
+                .await
+                {
+                    Either::First(()) => None,
+                    Either::Second(ev) => Some(ev),
+                }
+            };
+
+            if let Some(ev) = bg_input {
+                if self.handle_input(ev, app_mgr) {
+                    self.enter_sleep("power held").await;
+                    continue;
+                }
+
+                if app_mgr.needs_special_mode() {
+                    continue;
+                }
             }
 
-            self.poll_housekeeping(app_mgr).await;
+            if self.poll_housekeeping(app_mgr) {
+                self.enter_sleep("idle timeout").await;
+                continue;
+            }
 
-            if app_mgr.has_redraw() {
+            if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
                 self.render(app_mgr, redraw).await;
             }
@@ -116,28 +157,32 @@ impl super::Kernel {
             .run_special_mode(&mut self.epd, self.strip, &mut self.delay, &self.sd)
             .await;
 
-        app_mgr
-            .apply_transition(Transition::Pop, &mut self.handle())
-            .await;
+        app_mgr.apply_transition(Transition::Pop, &mut self.handle());
         app_mgr.request_full_redraw();
     }
 
-    async fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) {
-        // power long-press -> sleep (intercept before app dispatch)
+    // returns true if caller should call enter_sleep
+    //
+    // note: the original async version called enter_sleep inline
+    // on power-long-press and then fell through to dispatch_event
+    // if sleep_deep somehow returned; this version correctly returns
+    // early so the caller can enter_sleep and continue the loop
+    fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> bool {
         if hw_event == Event::LongPress(Button::Power) {
-            self.enter_sleep("power held").await;
+            return true;
         }
 
         let transition = app_mgr.dispatch_event(hw_event, &mut *self.bm_cache);
 
         if transition != Transition::None {
-            app_mgr
-                .apply_transition(transition, &mut self.handle())
-                .await;
+            app_mgr.apply_transition(transition, &mut self.handle());
         }
+
+        false
     }
 
-    async fn poll_housekeeping<A: AppLayer>(&mut self, app_mgr: &A) {
+    // returns true if idle sleep is due
+    fn poll_housekeeping<A: AppLayer>(&mut self, app_mgr: &A) -> bool {
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
             self.cached_battery_mv = mv;
         }
@@ -157,9 +202,30 @@ impl super::Kernel {
             }
         }
 
-        if tasks::IDLE_SLEEP_DUE.try_take().is_some() {
-            self.enter_sleep("idle timeout").await;
+        tasks::IDLE_SLEEP_DUE.try_take().is_some()
+    }
+
+    // housekeeping without idle-sleep check; do not initiate sleep mid-refresh
+    fn poll_housekeeping_waveform<A: AppLayer>(&mut self, app_mgr: &A) {
+        if let Some(mv) = tasks::BATTERY_MV.try_take() {
+            self.cached_battery_mv = mv;
         }
+
+        if tasks::SD_CHECK_DUE.try_take().is_some() {
+            self.sd_ok = self.sd.probe_ok();
+        }
+
+        if tasks::BOOKMARK_FLUSH_DUE.try_take().is_some() && self.bm_cache.is_dirty() {
+            self.bm_cache.flush(&self.sd);
+        }
+
+        if tasks::STATUS_DUE.try_take().is_some() {
+            self.log_stats();
+            if app_mgr.settings_loaded() {
+                tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
+            }
+        }
+        // idle sleep not checked here; never sleep during a waveform
     }
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
@@ -199,7 +265,7 @@ impl super::Kernel {
 
                     if let Some(rs) = rs {
                         self.epd.partial_start_du(&rs);
-                        let deferred = self.busy_wait_with_input(app_mgr).await;
+                        let deferred = self.busy_wait_with_background(app_mgr).await;
 
                         if app_mgr.has_redraw() {
                             // content changed mid-DU; leave RED stale
@@ -217,9 +283,7 @@ impl super::Kernel {
                         }
 
                         if let Some(transition) = deferred {
-                            app_mgr
-                                .apply_transition(transition, &mut self.handle())
-                                .await;
+                            app_mgr.apply_transition(transition, &mut self.handle());
                         }
 
                         break 'render;
@@ -247,68 +311,67 @@ impl super::Kernel {
 
                 self.epd.start_full_update();
 
-                let deferred = self.busy_wait_with_input(app_mgr).await;
+                let deferred = self.busy_wait_with_background(app_mgr).await;
 
                 self.epd.finish_full_update();
                 self.partial_refreshes = 0;
                 self.red_stale = false;
 
                 if let Some(transition) = deferred {
-                    app_mgr
-                        .apply_transition(transition, &mut self.handle())
-                        .await;
+                    app_mgr.apply_transition(transition, &mut self.handle());
                 }
             }
         } // 'render
     }
 
-    // Collect input events while EPD is busy refreshing.
+    // collect input and run background work while EPD is busy refreshing
     //
-    // SAFETY-CRITICAL: no SD I/O or background work may run here.
-    // The EPD is actively driving the SPI bus during refresh; any
-    // SD access would cause a RefCell borrow panic.  Only input
-    // events (from the ADC-based input_task) are collected.
-    async fn busy_wait_with_input<A: AppLayer>(
+    // during the DU/GC waveform the EPD charge pump drives pixels;
+    // no SPI commands are sent, so the bus is free for SD I/O.
+    // is_busy() is a sync GPIO read; no epd borrow is held across
+    // any .await point, so self is fully available for handle() etc.
+    async fn busy_wait_with_background<A: AppLayer>(
         &mut self,
         app_mgr: &mut A,
     ) -> Option<Transition<A::Id>> {
         let mut deferred: Option<Transition<A::Id>> = None;
 
         loop {
+            // sync gpio read; no borrow held after this line
             if !self.epd.is_busy() {
                 break;
             }
 
-            match select(
-                self.epd.busy_pin().wait_for_low(),
-                select(
-                    tasks::INPUT_EVENTS.receive(),
-                    Timer::after(Duration::from_millis(TICK_MS)),
-                ),
+            // wait up to TICK_MS for input; no epd borrow involved
+            let input_event = with_timeout(
+                Duration::from_millis(TICK_MS),
+                tasks::INPUT_EVENTS.receive(),
             )
             .await
-            {
-                Either::First(_) => break,
+            .ok();
 
-                Either::Second(Either::First(hw_event)) => {
-                    if app_mgr.suppress_deferred_input() {
-                        continue;
-                    }
-
+            if let Some(hw_event) = input_event {
+                if !app_mgr.suppress_deferred_input() {
                     let t = app_mgr.dispatch_event(hw_event, &mut *self.bm_cache);
                     if t != Transition::None && deferred.is_none() {
                         deferred = Some(t);
                     }
                 }
-
-                Either::Second(Either::Second(_)) => {}
+                continue;
             }
+
+            // timeout elapsed; spi bus is free during waveform
+            {
+                let mut handle = self.handle();
+                app_mgr.run_background(&mut handle).await;
+            }
+            self.poll_housekeeping_waveform(app_mgr);
         }
 
         deferred
     }
 
-    // flush bookmarks, render sleep screen, enter MCU deep sleep
+    // flush bookmarks, render sleep screen, enter MCU deep sleep;
     // on real hardware this never returns (wake = full MCU reset)
     pub async fn enter_sleep(&mut self, reason: &str) {
         use embedded_graphics::mono_font::MonoTextStyle;
@@ -326,6 +389,8 @@ impl super::Kernel {
             self.bm_cache.flush(&self.sd);
         }
 
+        self.sd_card_sleep();
+
         self.epd
             .full_refresh_async(self.strip, &mut self.delay, &|s: &mut StripBuffer| {
                 let style = MonoTextStyle::new(&FONT_6X13, BinaryColor::On);
@@ -339,8 +404,8 @@ impl super::Kernel {
 
         // safety: deep sleep never returns, the MCU resets on wake, so
         // these stolen peripherals cannot alias with their original
-        // owners.  LPWR is not used elsewhere; GPIO3 was previously
-        // cloned into InputHw but we are about to halt the CPU.
+        // owners. LPWR is not used elsewhere; GPIO3 was previously
+        // cloned into InputHw but we are about to halt the CPU
         let mut rtc = Rtc::new(unsafe { esp_hal::peripherals::LPWR::steal() });
         let mut gpio3 = unsafe { esp_hal::peripherals::GPIO3::steal() };
         let wakeup_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
@@ -355,6 +420,31 @@ impl super::Kernel {
         loop {
             core::hint::spin_loop();
         }
+    }
+
+    // send cmd0 to put sd card into idle/sleep state;
+    // reduces sd current from ~150 µa to ~10 µa during deep sleep.
+    // call after all sd i/o is done and before epd sleep-screen render
+    fn sd_card_sleep(&self) {
+        use embedded_hal::digital::OutputPin;
+
+        self.sd.flush_and_close();
+
+        critical_section::with(|cs| {
+            let bus_ref = crate::board::SPI_BUS_REF.borrow(cs).get();
+            let mut cs_pin = crate::board::SD_CS_SLEEP.borrow_ref_mut(cs);
+
+            if let (Some(bus_ref), Some(pin)) = (bus_ref, cs_pin.as_mut()) {
+                let mut bus: core::cell::RefMut<'_, _> = bus_ref.borrow(cs).borrow_mut();
+                // 80 clocks cs high (sd spec: card ready for command)
+                let _ = bus.write(&[0xFF; 10]);
+                let _ = pin.set_low();
+                // cmd0 (GO_IDLE_STATE) with valid crc
+                let _ = bus.write(&[0x40, 0x00, 0x00, 0x00, 0x00, 0x95]);
+                let _ = bus.write(&[0xFF]);
+                let _ = pin.set_high();
+            }
+        });
     }
 
     pub fn log_stats(&self) {

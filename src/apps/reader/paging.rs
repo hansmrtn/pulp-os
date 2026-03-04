@@ -99,7 +99,7 @@ impl ReaderApp {
     pub(super) fn load_and_prefetch(
         &mut self,
         k: &mut KernelHandle<'_>,
-    ) -> Result<(), &'static str> {
+    ) -> crate::error::Result<()> {
         if !self.ch_cache.is_empty() {
             let start = (self.offsets[self.page] as usize).min(self.ch_cache.len());
             let end = (start + PAGE_BUF).min(self.ch_cache.len());
@@ -128,11 +128,10 @@ impl ReaderApp {
             let dir = cache::dir_name_str(&dir_buf);
             let ch_file = cache::chapter_file_name(self.chapter);
             let ch_str = cache::chapter_file_str(&ch_file);
-            let n =
-                k.sync_read_app_subdir_chunk(dir, ch_str, self.offsets[self.page], &mut self.buf)?;
+            let n = k.read_app_subdir_chunk(dir, ch_str, self.offsets[self.page], &mut self.buf)?;
             self.buf_len = n;
         } else if self.file_size == 0 {
-            let (size, n) = k.sync_read_file_start(name, &mut self.buf)?;
+            let (size, n) = k.read_file_start(name, &mut self.buf)?;
             self.file_size = size;
             self.buf_len = n;
             log::info!("reader: opened {} ({} bytes)", name, size);
@@ -143,7 +142,7 @@ impl ReaderApp {
                 return Ok(());
             }
         } else {
-            let n = k.sync_read_chunk(name, self.offsets[self.page], &mut self.buf)?;
+            let n = k.read_chunk(name, self.offsets[self.page], &mut self.buf)?;
             self.buf_len = n;
         }
 
@@ -170,9 +169,9 @@ impl ReaderApp {
                 let dir = cache::dir_name_str(&dir_buf);
                 let ch_file = cache::chapter_file_name(self.chapter);
                 let ch_str = cache::chapter_file_str(&ch_file);
-                k.sync_read_app_subdir_chunk(dir, ch_str, pf_offset, &mut self.prefetch)
+                k.read_app_subdir_chunk(dir, ch_str, pf_offset, &mut self.prefetch)
             } else {
-                k.sync_read_chunk(name, pf_offset, &mut self.prefetch)
+                k.read_chunk(name, pf_offset, &mut self.prefetch)
             };
             match pf_result {
                 Ok(n) => {
@@ -228,7 +227,7 @@ impl ReaderApp {
     pub(super) fn scan_to_last_page(
         &mut self,
         k: &mut KernelHandle<'_>,
-    ) -> Result<(), &'static str> {
+    ) -> crate::error::Result<()> {
         while !self.fully_indexed && self.total_pages < MAX_PAGES {
             self.page = self.total_pages - 1;
             self.load_and_prefetch(k)?;

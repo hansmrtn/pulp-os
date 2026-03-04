@@ -530,7 +530,7 @@ where
             }
             Err(e) => {
                 info!("upload: delete failed for '{}': {}", name, e);
-                send_error_response(&mut socket, e).await;
+                send_error_response(&mut socket, "delete failed").await;
                 close_socket(&mut socket).await;
                 return ServerEvent::DeleteFailed;
             }
@@ -616,7 +616,7 @@ where
 
     info!("upload: receiving file '{}'", name_str);
 
-    storage::write_file(sd, name_str, &[])?;
+    storage::write_file(sd, name_str, &[]).map_err(|_| "write failed")?;
 
     // holdback last end_marker.len() bytes to detect boundary spanning two reads
 
@@ -625,7 +625,8 @@ where
     loop {
         if let Some(pos) = find_subsequence(&work[..filled], end_marker) {
             if pos > 0 {
-                storage::append_root_file(sd, name_str, &work[..pos])?;
+                storage::append_root_file(sd, name_str, &work[..pos])
+                    .map_err(|_| "write failed")?;
                 total_written += pos as u32;
             }
             info!("upload: complete, {} bytes written", total_written);
@@ -634,7 +635,7 @@ where
 
         if filled > end_marker.len() {
             let safe = filled - end_marker.len();
-            storage::append_root_file(sd, name_str, &work[..safe])?;
+            storage::append_root_file(sd, name_str, &work[..safe]).map_err(|_| "write failed")?;
             total_written += safe as u32;
 
             work.copy_within(safe..filled, 0);

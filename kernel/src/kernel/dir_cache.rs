@@ -5,6 +5,7 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{
     DirEntry, DirPage, PULP_DIR, TITLES_FILE, list_root_files, read_file_start_in_dir,
 };
+use crate::error::Result;
 
 const MAX_DIR_ENTRIES: usize = 128;
 
@@ -29,7 +30,7 @@ impl DirCache {
         }
     }
 
-    pub fn ensure_loaded(&mut self, sd: &SdStorage) -> Result<(), &'static str> {
+    pub fn ensure_loaded(&mut self, sd: &SdStorage) -> Result<()> {
         if self.valid {
             return Ok(());
         }

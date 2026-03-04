@@ -15,6 +15,7 @@ use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::storage::DirEntry;
 use crate::drivers::strip::StripBuffer;
+use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
@@ -46,12 +47,13 @@ pub struct FilesApp {
     selected: usize,
     needs_load: bool,
     stale_cache: bool,
-    error: Option<&'static str>,
+    error: Option<Error>,
     ui_fonts: fonts::UiFonts,
     list_y: u16,
 
     title_scan_idx: usize,
     title_scanning: bool,
+    title_reload: bool,
 }
 
 impl FilesApp {
@@ -70,6 +72,7 @@ impl FilesApp {
             list_y: CONTENT_TOP + 8 + uf.heading.line_height + HEADER_LIST_GAP,
             title_scan_idx: 0,
             title_scanning: false,
+            title_reload: false,
         }
     }
 
@@ -98,9 +101,9 @@ impl FilesApp {
         }
     }
 
-    fn load_failed(&mut self, msg: &'static str) {
+    fn load_failed(&mut self, e: Error) {
         self.needs_load = false;
-        self.error = Some(msg);
+        self.error = Some(e);
         self.count = 0;
     }
 
@@ -177,7 +180,7 @@ impl FilesApp {
 }
 
 impl App<AppId> for FilesApp {
-    async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.scroll = 0;
         self.selected = 0;
         self.needs_load = true;
@@ -200,7 +203,7 @@ impl App<AppId> for FilesApp {
 
     fn on_suspend(&mut self) {}
 
-    async fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         ctx.mark_dirty(Region::new(
             0,
             CONTENT_TOP,
@@ -217,7 +220,7 @@ impl App<AppId> for FilesApp {
             }
 
             let mut buf = [DirEntry::EMPTY; PAGE_SIZE];
-            match k.sync_dir_page(self.scroll, &mut buf) {
+            match k.dir_page(self.scroll, &mut buf) {
                 Ok(page) => {
                     self.load_page(&buf[..page.count], page.total);
                 }
@@ -227,8 +230,14 @@ impl App<AppId> for FilesApp {
                 }
             }
 
-            ctx.mark_dirty(self.list_region());
-            ctx.mark_dirty(STATUS_REGION);
+            if self.title_reload {
+                self.title_reload = false;
+                ctx.mark_dirty_coalesced(self.list_region());
+                ctx.mark_dirty_coalesced(STATUS_REGION);
+            } else {
+                ctx.mark_dirty(self.list_region());
+                ctx.mark_dirty(STATUS_REGION);
+            }
             return;
         }
 
@@ -237,6 +246,7 @@ impl App<AppId> for FilesApp {
                 self.title_scan_idx = dirty.next_idx;
                 if dirty.resolved {
                     self.needs_load = true;
+                    self.title_reload = true;
                 }
             } else {
                 self.title_scanning = false;
@@ -308,17 +318,20 @@ impl App<AppId> for FilesApp {
             .unwrap();
 
         if self.total > 0 {
-            let mut status = BitmapDynLabel::<20>::new(STATUS_REGION, self.ui_fonts.body)
+            let mut status = BitmapDynLabel::<24>::new(STATUS_REGION, self.ui_fonts.body)
                 .alignment(Alignment::CenterRight);
             let _ = write!(status, "{}/{}", self.scroll + self.selected + 1, self.total);
+            if self.title_scanning {
+                let _ = write!(status, " ...");
+            }
             status.draw(strip).unwrap();
         }
 
-        if let Some(msg) = self.error {
-            BitmapLabel::new(self.row_region(0), msg, self.ui_fonts.body)
-                .alignment(Alignment::CenterLeft)
-                .draw(strip)
-                .unwrap();
+        if let Some(e) = self.error {
+            let mut label = BitmapDynLabel::<32>::new(self.row_region(0), self.ui_fonts.body)
+                .alignment(Alignment::CenterLeft);
+            let _ = core::fmt::Write::write_fmt(&mut label, format_args!("{}", e));
+            label.draw(strip).unwrap();
             return;
         }
 
@@ -373,30 +386,35 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
 
     log::info!("titles: scanning {} (idx {})", name, idx);
 
-    let result = (|| -> Result<(), &'static str> {
-        let file_size = k.sync_file_size(name)?;
+    let result = (|| -> crate::error::Result<()> {
+        let file_size = k.file_size(name)?;
         if file_size < 22 {
-            return Err("too small");
+            return Err(Error::new(ErrorKind::InvalidData, "title_scan: too small"));
         }
 
         let tail_size = (file_size as usize).min(512);
         let tail_offset = file_size - tail_size as u32;
         let mut buf = [0u8; 512];
-        let n = k.sync_read_chunk(name, tail_offset, &mut buf[..tail_size])?;
+        let n = k.read_chunk(name, tail_offset, &mut buf[..tail_size])?;
 
+        // ZipIndex::parse_eocd returns Result<_, &'static str>;
+        // the From<&'static str> impl on Error converts automatically via ?
         let (cd_offset, cd_size) = ZipIndex::parse_eocd(&buf[..n], file_size)?;
 
         let mut cd_buf = Vec::new();
         cd_buf
             .try_reserve_exact(cd_size as usize)
-            .map_err(|_| "CD too large")?;
+            .map_err(|_| Error::new(ErrorKind::OutOfMemory, "title_scan: CD alloc"))?;
         cd_buf.resize(cd_size as usize, 0);
 
         let mut total = 0usize;
         while total < cd_buf.len() {
-            let rd = k.sync_read_chunk(name, cd_offset + total as u32, &mut cd_buf[total..])?;
+            let rd = k.read_chunk(name, cd_offset + total as u32, &mut cd_buf[total..])?;
             if rd == 0 {
-                return Err("CD truncated");
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "title_scan: CD truncated",
+                ));
             }
             total += rd;
         }
@@ -410,7 +428,10 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
             let container = smol_epub::zip::extract_entry(
                 zip.entry(ci),
                 zip.entry(ci).local_offset,
-                |off, b| k.sync_read_chunk(name, off, b),
+                |off, b| {
+                    k.read_chunk(name, off, b)
+                        .map_err(|e: Error| -> &'static str { e.into() })
+                },
             )?;
             let len = epub::parse_container(&container, &mut opf_path_buf)?;
             drop(container);
@@ -419,18 +440,21 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
             epub::find_opf_in_zip(&zip, &mut opf_path_buf)?
         };
 
-        let opf_path =
-            core::str::from_utf8(&opf_path_buf[..opf_path_len]).map_err(|_| "bad OPF path")?;
+        let opf_path = core::str::from_utf8(&opf_path_buf[..opf_path_len])
+            .map_err(|_| Error::new(ErrorKind::BadEncoding, "title_scan: OPF path"))?;
 
         let opf_idx = zip
             .find(opf_path)
             .or_else(|| zip.find_icase(opf_path))
-            .ok_or("OPF not found")?;
+            .ok_or(Error::new(ErrorKind::NotFound, "title_scan: OPF entry"))?;
 
         let opf_data = smol_epub::zip::extract_entry(
             zip.entry(opf_idx),
             zip.entry(opf_idx).local_offset,
-            |off, b| k.sync_read_chunk(name, off, b),
+            |off, b| {
+                k.read_chunk(name, off, b)
+                    .map_err(|e: Error| -> &'static str { e.into() })
+            },
         )?;
 
         let opf_dir = opf_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -441,17 +465,20 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
 
         let title = meta.title_str();
         if title.is_empty() {
-            return Err("no title in OPF");
+            return Err(Error::new(
+                ErrorKind::ParseFailed,
+                "title_scan: no title in OPF",
+            ));
         }
 
         log::info!("titles: {} -> \"{}\"", name, title);
-        let _ = k.sync_save_title(name, title);
+        let _ = k.save_title(name, title);
         k.dir_cache_mut().set_entry_title(idx, title.as_bytes());
 
         Ok(())
     })();
 
-    if let Err(e) = result {
+    if let Err(e) = &result {
         log::warn!("titles: {} failed: {}", name, e);
     }
 

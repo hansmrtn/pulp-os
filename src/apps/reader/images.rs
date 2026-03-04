@@ -17,6 +17,7 @@ use smol_epub::epub;
 use smol_epub::html_strip::{IMG_REF, MARKER};
 use smol_epub::zip::{self, ZipIndex};
 
+use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 
@@ -113,6 +114,19 @@ impl ReaderApp {
             return;
         }
 
+        // background precache will decode this image eventually;
+        // skip the blocking inline decode so the page renders
+        // immediately without it. once the user is in Ready state
+        // defer_image_decode is cleared and a page revisit will
+        // either hit the cache or do the full decode.
+        if self.defer_image_decode {
+            log::info!(
+                "reader: deferring image decode (bg will handle {})",
+                full_path
+            );
+            return;
+        }
+
         let zip_idx = match self
             .zip
             .find(full_path)
@@ -131,7 +145,7 @@ impl ReaderApp {
 
         let data_offset = {
             let mut hdr = [0u8; 30];
-            if k.sync_read_chunk(epub_name, entry.local_offset, &mut hdr)
+            if k.read_chunk(epub_name, entry.local_offset, &mut hdr)
                 .is_err()
             {
                 log::warn!("reader: failed to read ZIP local header");
@@ -157,7 +171,7 @@ impl ReaderApp {
         } else if entry.method == zip::METHOD_STORED {
             let mut magic = [0u8; 8];
             let n = k
-                .sync_read_chunk(epub_name, data_offset, &mut magic)
+                .read_chunk(epub_name, data_offset, &mut magic)
                 .unwrap_or(0);
             (
                 n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
@@ -180,9 +194,15 @@ impl ReaderApp {
 
         let do_decode = |k_ref: &mut KernelHandle<'_>| -> Result<DecodedImage, &'static str> {
             let k_cell = RefCell::new(k_ref);
+            let read_err = |e: Error| -> &'static str { e.into() };
             if is_jpeg && entry.method == zip::METHOD_STORED {
                 smol_epub::jpeg::decode_jpeg_sd(
-                    |off, buf| k_cell.borrow_mut().sync_read_chunk(epub_name, off, buf),
+                    |off, buf| {
+                        k_cell
+                            .borrow_mut()
+                            .read_chunk(epub_name, off, buf)
+                            .map_err(read_err)
+                    },
                     data_offset,
                     entry.uncomp_size,
                     TEXT_W as u16,
@@ -190,7 +210,12 @@ impl ReaderApp {
                 )
             } else if is_jpeg {
                 smol_epub::jpeg::decode_jpeg_deflate_sd(
-                    |off, buf| k_cell.borrow_mut().sync_read_chunk(epub_name, off, buf),
+                    |off, buf| {
+                        k_cell
+                            .borrow_mut()
+                            .read_chunk(epub_name, off, buf)
+                            .map_err(read_err)
+                    },
                     data_offset,
                     entry.comp_size,
                     entry.uncomp_size,
@@ -199,7 +224,12 @@ impl ReaderApp {
                 )
             } else if entry.method == zip::METHOD_STORED {
                 smol_epub::png::decode_png_sd(
-                    |off, buf| k_cell.borrow_mut().sync_read_chunk(epub_name, off, buf),
+                    |off, buf| {
+                        k_cell
+                            .borrow_mut()
+                            .read_chunk(epub_name, off, buf)
+                            .map_err(read_err)
+                    },
                     data_offset,
                     entry.uncomp_size,
                     TEXT_W as u16,
@@ -207,7 +237,12 @@ impl ReaderApp {
                 )
             } else {
                 smol_epub::png::decode_png_deflate_sd(
-                    |off, buf| k_cell.borrow_mut().sync_read_chunk(epub_name, off, buf),
+                    |off, buf| {
+                        k_cell
+                            .borrow_mut()
+                            .read_chunk(epub_name, off, buf)
+                            .map_err(read_err)
+                    },
                     data_offset,
                     entry.comp_size,
                     TEXT_W as u16,
@@ -263,7 +298,7 @@ impl ReaderApp {
         k: &mut KernelHandle<'_>,
         ch: usize,
         start_offset: usize,
-    ) -> Result<ScanResult, &'static str> {
+    ) -> crate::error::Result<ScanResult> {
         if ch >= cache::MAX_CACHE_CHAPTERS || !self.ch_cached[ch] {
             return Ok(ScanResult::NoneFound);
         }
@@ -285,7 +320,7 @@ impl ReaderApp {
         let mut offset = start_offset;
         while offset < ch_size {
             let read_len = PAGE_BUF.min(ch_size - offset);
-            let n = k.sync_read_app_subdir_chunk(
+            let n = k.read_app_subdir_chunk(
                 dir,
                 ch_str,
                 offset as u32,
@@ -341,7 +376,7 @@ impl ReaderApp {
                 let resume = (offset + path_start + path_len) as u32;
 
                 // already cached or skip-marked
-                if k.sync_file_size_app_subdir(dir, img_file).is_ok() {
+                if k.file_size_app_subdir(dir, img_file).is_ok() {
                     i = path_start + path_len;
                     continue;
                 }
@@ -351,7 +386,7 @@ impl ReaderApp {
 
                 if !is_jpeg && !is_png {
                     log::info!("precache: skip unsupported: {}", full_path);
-                    let _ = k.sync_write_app_subdir(dir, img_file, &[]);
+                    let _ = k.write_app_subdir(dir, img_file, &[]);
                     i = path_start + path_len;
                     continue;
                 }
@@ -397,11 +432,20 @@ impl ReaderApp {
                         }
                         Err(e) => {
                             log::warn!("precache: streaming failed: {}", e);
-                            let _ = k.sync_write_app_subdir(dir, img_file, &[]);
+                            let _ = k.write_app_subdir(dir, img_file, &[]);
                         }
                     }
                     return Ok(ScanResult::DecodedInline {
                         resume_offset: resume,
+                    });
+                }
+
+                // wait for worker to have capacity before expensive
+                // extraction; caller sees Dispatched + worker busy
+                // and transitions to WaitImage, retrying after drain
+                if !work_queue::is_idle() {
+                    return Ok(ScanResult::Dispatched {
+                        resume_offset: (offset + i) as u32,
                     });
                 }
 
@@ -410,7 +454,7 @@ impl ReaderApp {
                     Ok(d) => d,
                     Err(e) => {
                         log::warn!("precache: extract failed: {}", e);
-                        let _ = k.sync_write_app_subdir(dir, img_file, &[]);
+                        let _ = k.write_app_subdir(dir, img_file, &[]);
                         i = path_start + path_len;
                         continue;
                     }
@@ -430,7 +474,11 @@ impl ReaderApp {
                         resume_offset: resume,
                     });
                 }
-                return Err("cache: worker channel full");
+                // queue full despite idle check; skip this image,
+                // it will be decoded on demand if the user views it
+                log::warn!("precache: worker queue full, skipping {}", full_path);
+                i = path_start + path_len;
+                continue;
             }
 
             // advance with overlap so markers at chunk boundaries are not missed
@@ -449,7 +497,7 @@ impl ReaderApp {
     pub(super) fn epub_find_and_dispatch_image(
         &mut self,
         k: &mut KernelHandle<'_>,
-    ) -> Result<bool, &'static str> {
+    ) -> crate::error::Result<bool> {
         let spine_len = self.spine.len();
 
         while (self.img_cache_ch as usize) < spine_len {
@@ -493,10 +541,10 @@ impl ReaderApp {
     pub(super) fn epub_recv_image_result(
         &mut self,
         k: &mut KernelHandle<'_>,
-    ) -> Result<Option<bool>, &'static str> {
+    ) -> crate::error::Result<Option<bool>> {
         let result = match work_queue::try_recv() {
             Some(r) if r.is_current() => r,
-            Some(_) => return Ok(None), // stale generation -- discard
+            Some(_) => return Ok(None), // stale generation; discard
             None => return Ok(None),
         };
 
@@ -523,10 +571,6 @@ impl ReaderApp {
             work_queue::WorkOutcome::ImageFailed { path_hash, error } => {
                 log::warn!("precache: image {:#010X} failed: {}", path_hash, error);
                 Ok(Some(true))
-            }
-            _ => {
-                log::warn!("precache: unexpected result while waiting for image decode");
-                Ok(None)
             }
         }
     }
@@ -602,16 +646,18 @@ pub(super) fn decode_image_streaming(
     is_jpeg: bool,
     max_w: u16,
     max_h: u16,
-) -> Result<DecodedImage, &'static str> {
+) -> crate::error::Result<DecodedImage> {
     let mut hdr = [0u8; 30];
-    k.sync_read_chunk(epub_name, entry.local_offset, &mut hdr)
-        .map_err(|_| "read local header failed")?;
-    let skip = ZipIndex::local_header_data_skip(&hdr)?;
+    k.read_chunk(epub_name, entry.local_offset, &mut hdr)?;
+    let skip = ZipIndex::local_header_data_skip(&hdr)
+        .map_err(|_| Error::new(ErrorKind::ParseFailed, "decode_image: local header"))?;
     let data_offset = entry.local_offset + skip;
 
-    if is_jpeg && entry.method == zip::METHOD_STORED {
+    let read_err = |_: Error| -> &'static str { "read failed" };
+
+    let result = if is_jpeg && entry.method == zip::METHOD_STORED {
         smol_epub::jpeg::decode_jpeg_sd(
-            |off, buf| k.sync_read_chunk(epub_name, off, buf),
+            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.uncomp_size,
             max_w,
@@ -619,7 +665,7 @@ pub(super) fn decode_image_streaming(
         )
     } else if is_jpeg {
         smol_epub::jpeg::decode_jpeg_deflate_sd(
-            |off, buf| k.sync_read_chunk(epub_name, off, buf),
+            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.comp_size,
             entry.uncomp_size,
@@ -628,7 +674,7 @@ pub(super) fn decode_image_streaming(
         )
     } else if entry.method == zip::METHOD_STORED {
         smol_epub::png::decode_png_sd(
-            |off, buf| k.sync_read_chunk(epub_name, off, buf),
+            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.uncomp_size,
             max_w,
@@ -636,45 +682,51 @@ pub(super) fn decode_image_streaming(
         )
     } else {
         smol_epub::png::decode_png_deflate_sd(
-            |off, buf| k.sync_read_chunk(epub_name, off, buf),
+            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.comp_size,
             max_w,
             max_h,
         )
-    }
+    };
+    result.map_err(|msg| Error::from(msg).with_source("decode_image_streaming"))
 }
 
 pub(super) fn load_cached_image(
     k: &mut KernelHandle<'_>,
     dir: &str,
     name: &str,
-) -> Result<DecodedImage, &'static str> {
-    let size = k
-        .sync_file_size_app_subdir(dir, name)
-        .map_err(|_| "no cache file")?;
+) -> crate::error::Result<DecodedImage> {
+    let size = k.file_size_app_subdir(dir, name)?;
     if size < 5 {
-        return Err("cache file too small");
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "load_cached_image: too small",
+        ));
     }
     let mut header = [0u8; 4];
-    k.sync_read_app_subdir_chunk(dir, name, 0, &mut header)
-        .map_err(|_| "read header failed")?;
+    k.read_app_subdir_chunk(dir, name, 0, &mut header)?;
     let width = u16::from_le_bytes([header[0], header[1]]);
     let height = u16::from_le_bytes([header[2], header[3]]);
     if width == 0 || height == 0 {
-        return Err("zero dimensions in cache");
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "load_cached_image: zero dimensions",
+        ));
     }
     let stride = (width as usize).div_ceil(8);
     let data_len = stride * height as usize;
     if size as usize != 4 + data_len {
-        return Err("cache size mismatch");
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "load_cached_image: size mismatch",
+        ));
     }
     let mut data = Vec::new();
     data.try_reserve_exact(data_len)
-        .map_err(|_| "OOM for cached image")?;
+        .map_err(|_| Error::new(ErrorKind::OutOfMemory, "load_cached_image"))?;
     data.resize(data_len, 0);
-    k.sync_read_app_subdir_chunk(dir, name, 4, &mut data)
-        .map_err(|_| "read data failed")?;
+    k.read_app_subdir_chunk(dir, name, 4, &mut data)?;
     Ok(DecodedImage {
         width,
         height,
@@ -688,11 +740,11 @@ pub(super) fn save_cached_image(
     dir: &str,
     name: &str,
     img: &DecodedImage,
-) -> Result<(), &'static str> {
+) -> crate::error::Result<()> {
     let mut header = [0u8; 4];
     header[0..2].copy_from_slice(&img.width.to_le_bytes());
     header[2..4].copy_from_slice(&img.height.to_le_bytes());
-    k.sync_write_app_subdir(dir, name, &header)?;
-    k.sync_append_app_subdir(dir, name, &img.data)?;
+    k.write_app_subdir(dir, name, &header)?;
+    k.append_app_subdir(dir, name, &img.data)?;
     Ok(())
 }

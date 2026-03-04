@@ -102,7 +102,7 @@ impl HomeApp {
 
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
         let mut buf = [0u8; 32];
-        match k.sync_read_app_data_start(RECENT_FILE, &mut buf) {
+        match k.read_app_data_start(RECENT_FILE, &mut buf) {
             Ok((_, n)) if n > 0 => {
                 let n = n.min(32);
                 self.recent_book[..n].copy_from_slice(&buf[..n]);
@@ -193,7 +193,7 @@ impl HomeApp {
 }
 
 impl App<AppId> for HomeApp {
-    async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         ctx.clear_message();
         self.state = HomeState::Menu;
         self.selected = 0;
@@ -205,7 +205,7 @@ impl App<AppId> for HomeApp {
         ));
     }
 
-    async fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.state = HomeState::Menu;
         self.selected = 0;
         self.needs_load_recent = true;
@@ -221,7 +221,7 @@ impl App<AppId> for HomeApp {
         if self.needs_load_recent {
             let old_count = self.item_count;
             let mut buf = [0u8; 32];
-            match k.sync_read_app_data_start(RECENT_FILE, &mut buf) {
+            match k.read_app_data_start(RECENT_FILE, &mut buf) {
                 Ok((_, n)) if n > 0 => {
                     let n = n.min(32);
                     self.recent_book[..n].copy_from_slice(&buf[..n]);

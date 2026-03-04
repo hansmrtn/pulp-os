@@ -1,4 +1,4 @@
-// app protocol: trait, context, transitions, and redraw types
+// app protocol: trait, context, transitions, redraw types, and coalescing
 //
 // these types define the contract between the kernel scheduler and
 // the app layer. concrete apps implement the App trait; the kernel
@@ -12,6 +12,7 @@
 // what actions an app exposes. the renderer (QuickMenu widget) is
 // app-side, but the protocol is kernel-side.
 
+use embassy_time::Instant;
 use esp_hal::delay::Delay;
 
 use crate::board::Epd;
@@ -107,6 +108,8 @@ pub struct AppContext {
     msg_buf: [u8; MSG_BUF_SIZE],
     msg_len: usize,
     redraw: Redraw,
+    coalesce_until: Option<Instant>,
+    immediate: bool,
 }
 
 impl Default for AppContext {
@@ -121,6 +124,8 @@ impl AppContext {
             msg_buf: [0u8; MSG_BUF_SIZE],
             msg_len: 0,
             redraw: Redraw::None,
+            coalesce_until: None,
+            immediate: false,
         }
     }
 
@@ -156,25 +161,65 @@ impl AppContext {
         }
     }
 
+    // mark dirty and render on next tick; the default for all callers
     #[inline]
     pub fn mark_dirty(&mut self, region: Region) {
         self.request_partial_redraw(region);
+        self.immediate = true;
+        self.coalesce_until = None;
+    }
+
+    // alias; kept so callers in on_event that were already converted
+    // continue to compile without churn
+    #[inline]
+    pub fn mark_dirty_immediate(&mut self, region: Region) {
+        self.mark_dirty(region);
+    }
+
+    // mark dirty with 50ms coalescing window; use only for background
+    // batch updates (title scanner) where many rapid dirty marks
+    // should coalesce into a single refresh
+    #[inline]
+    pub fn mark_dirty_coalesced(&mut self, region: Region) {
+        self.request_partial_redraw(region);
+        if !self.immediate && self.coalesce_until.is_none() {
+            self.coalesce_until = Some(Instant::now() + embassy_time::Duration::from_millis(50));
+        }
     }
 
     pub fn has_redraw(&self) -> bool {
         !matches!(self.redraw, Redraw::None)
     }
 
+    // true when a pending redraw is ready to render
+    pub fn render_ready(&self) -> bool {
+        match self.redraw {
+            Redraw::None => false,
+            Redraw::Full => true,
+            Redraw::Partial(_) => {
+                self.immediate
+                    || self
+                        .coalesce_until
+                        .map(|t| Instant::now() >= t)
+                        .unwrap_or(true)
+            }
+        }
+    }
+
     pub fn take_redraw(&mut self) -> Redraw {
         let r = self.redraw;
         self.redraw = Redraw::None;
+        self.coalesce_until = None;
+        self.immediate = false;
         r
     }
 }
 
+// background is async for epub streaming (stream_strip_entry_async);
+// other app impls compile to immediately-ready futures
 #[allow(async_fn_in_trait)]
 pub trait App<Id> {
-    async fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>);
+    fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>);
 
     fn on_exit(&mut self) {}
 
@@ -182,8 +227,8 @@ pub trait App<Id> {
         self.on_exit();
     }
 
-    async fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
-        self.on_enter(ctx, k).await;
+    fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+        self.on_enter(ctx, k);
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition<Id>;
@@ -312,6 +357,7 @@ impl<Id: AppIdType> Launcher<Id> {
 // scheduler is generic over AppLayer without importing any concrete
 // app types.
 
+// run_special_mode is genuinely async (wifi radio); the rest is sync
 #[allow(async_fn_in_trait)]
 pub trait AppLayer {
     type Id: AppIdType;
@@ -319,9 +365,9 @@ pub trait AppLayer {
     // active app and event dispatch
     fn active(&self) -> Self::Id;
     fn dispatch_event(&mut self, event: Event, bm: &mut BookmarkCache) -> Transition<Self::Id>;
-    async fn apply_transition(&mut self, t: Transition<Self::Id>, k: &mut KernelHandle<'_>);
+    fn apply_transition(&mut self, t: Transition<Self::Id>, k: &mut KernelHandle<'_>);
 
-    // background work (SD I/O, caching) -- runs before render
+    // background work (SD I/O, caching); async for epub streaming
     async fn run_background(&mut self, k: &mut KernelHandle<'_>);
 
     // rendering
@@ -340,7 +386,7 @@ pub trait AppLayer {
     // boot-time init: load settings, populate caches, enter first app
     fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>);
     fn load_initial_state(&mut self, k: &mut KernelHandle<'_>);
-    async fn enter_initial(&mut self, k: &mut KernelHandle<'_>);
+    fn enter_initial(&mut self, k: &mut KernelHandle<'_>);
 
     // true when the active app wants to take over the main loop
     // (e.g. wifi upload mode bypasses the normal event dispatch)

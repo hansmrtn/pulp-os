@@ -23,12 +23,13 @@ use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
+use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
-use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt};
+use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt, draw_progress_bar};
 use smol_epub::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
@@ -79,6 +80,7 @@ pub(super) const POSITION_OVERLAY: Region = Region::new(
 );
 
 pub(super) const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, 464, 20);
+pub(super) const LOADING_BAR_REGION: Region = Region::new(MARGIN, TEXT_Y + 26, 200, 8);
 
 pub const QA_FONT_SIZE: u8 = 1;
 pub(super) const QA_PREV_CHAPTER: u8 = 3;
@@ -87,7 +89,7 @@ pub(super) const QA_TOC: u8 = 5;
 
 pub(super) const QA_MAX: usize = 4;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum State {
     NeedBookmark,
     NeedInit,
@@ -101,6 +103,21 @@ pub(super) enum State {
     Error,
 }
 
+impl State {
+    pub(super) fn loading_pct(self) -> u8 {
+        match self {
+            Self::NeedBookmark => 0,
+            Self::NeedInit => 5,
+            Self::NeedOpf => 15,
+            Self::NeedToc => 30,
+            Self::NeedCache => 45,
+            Self::NeedIndex => 70,
+            Self::NeedPage => 90,
+            Self::Ready | Self::ShowToc | Self::Error => 100,
+        }
+    }
+}
+
 // background caching progress, runs independently of the reading
 // state so the user can read while chapters/images are cached
 #[derive(Clone, Copy, PartialEq)]
@@ -108,7 +125,6 @@ pub(super) enum BgCacheState {
     // nothing to do
     Idle,
     CacheChapter,
-    WaitChapter,
     WaitNearbyImage,
     CacheImage,
     WaitImage,
@@ -190,7 +206,7 @@ pub struct ReaderApp {
     pub(super) prefetch_page: usize,
 
     pub(super) state: State,
-    pub(super) error: Option<&'static str>,
+    pub(super) error: Option<Error>,
     pub(super) show_position: bool,
 
     pub(super) is_epub: bool,
@@ -218,6 +234,7 @@ pub struct ReaderApp {
     pub(super) ch_cache: Vec<u8>,
     pub(super) page_img: Option<DecodedImage>,
     pub(super) fullscreen_img: bool,
+    pub(super) defer_image_decode: bool,
     pub(super) toc: EpubToc,
     pub(super) toc_source: Option<TocSource>,
     pub(super) toc_selected: usize,
@@ -289,6 +306,7 @@ impl ReaderApp {
 
             page_img: None,
             fullscreen_img: false,
+            defer_image_decode: false,
 
             toc: EpubToc::new(),
             toc_source: None,
@@ -325,10 +343,32 @@ impl ReaderApp {
         self.is_epub && self.bg_cache != BgCacheState::Idle
     }
 
-    // run one step of background caching while suspended
+    // run one step of image work queue polling while suspended;
+    // chapter caching is async and only runs during active background,
+    // so this only handles the sync image recv states
     pub fn bg_work_tick(&mut self, k: &mut KernelHandle<'_>) {
-        if self.bg_cache != BgCacheState::Idle {
-            self.bg_cache_step(k);
+        match self.bg_cache {
+            BgCacheState::WaitNearbyImage => match self.epub_recv_image_result(k) {
+                Ok(Some(_)) => {
+                    if !self.try_dispatch_nearby_image(k) {
+                        self.bg_cache = BgCacheState::CacheChapter;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("bg: nearby image error (suspended): {}", e);
+                    self.bg_cache = BgCacheState::CacheChapter;
+                }
+            },
+            BgCacheState::WaitImage => match self.epub_recv_image_result(k) {
+                Ok(Some(_)) => self.bg_cache = BgCacheState::CacheImage,
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("bg: image recv error (suspended): {}", e);
+                    self.bg_cache = BgCacheState::CacheImage;
+                }
+            },
+            _ => {}
         }
     }
 
@@ -468,12 +508,15 @@ pub(super) fn read_full(
     name: &str,
     offset: u32,
     buf: &mut [u8],
-) -> Result<(), &'static str> {
+) -> crate::error::Result<()> {
     let mut total = 0usize;
     while total < buf.len() {
-        let n = k.sync_read_chunk(name, offset + total as u32, &mut buf[total..])?;
+        let n = k.read_chunk(name, offset + total as u32, &mut buf[total..])?;
         if n == 0 {
-            return Err("epub: unexpected EOF");
+            return Err(Error::new(
+                ErrorKind::ReadFailed,
+                "read_full: unexpected EOF",
+            ));
         }
         total += n;
     }
@@ -491,7 +534,9 @@ pub(super) fn extract_zip_entry(
     let entry = zip_index.entry(entry_idx);
     let k = RefCell::new(k);
     zip::extract_entry(entry, entry.local_offset, |offset, buf| {
-        k.borrow_mut().sync_read_chunk(name, offset, buf)
+        k.borrow_mut()
+            .read_chunk(name, offset, buf)
+            .map_err(|e: Error| -> &'static str { e.into() })
     })
 }
 
@@ -523,7 +568,7 @@ fn draw_chrome_text(
 }
 
 impl App<AppId> for ReaderApp {
-    async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         let msg = ctx.message();
         let len = msg.len().min(32);
         self.filename[..len].copy_from_slice(&msg[..len]);
@@ -549,6 +594,7 @@ impl App<AppId> for ReaderApp {
         self.chapter = 0;
         self.error = None;
         self.show_position = false;
+        self.defer_image_decode = true;
         self.goto_last_page = false;
         self.restore_offset = None;
 
@@ -589,7 +635,7 @@ impl App<AppId> for ReaderApp {
         // task runs independently and our work_gen stays valid
     }
 
-    async fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         // Restore our generation so the worker considers in-flight
         // results current again (another app may have submitted work
         // under a different generation while we were suspended).
@@ -616,7 +662,7 @@ impl App<AppId> for ReaderApp {
                 State::NeedBookmark => {
                     self.bookmark_load(k.bookmark_cache());
 
-                    let _ = k.sync_write_app_data(RECENT_FILE, &self.filename[..self.filename_len]);
+                    let _ = k.write_app_data(RECENT_FILE, &self.filename[..self.filename_len]);
 
                     if self.is_epub {
                         self.zip.clear();
@@ -633,7 +679,8 @@ impl App<AppId> for ReaderApp {
 
                 State::NeedInit => match self.epub_init_zip(k) {
                     Ok(()) => {
-                        self.state = State::NeedOpf; // yield; CD heap freed
+                        self.state = State::NeedOpf;
+                        ctx.mark_dirty(LOADING_BAR_REGION);
                     }
                     Err(e) => {
                         log::info!("reader: epub init (zip) failed: {}", e);
@@ -645,7 +692,8 @@ impl App<AppId> for ReaderApp {
 
                 State::NeedOpf => match self.epub_init_opf(k) {
                     Ok(()) => {
-                        self.state = State::NeedToc; // yield; OPF heap freed
+                        self.state = State::NeedToc;
+                        ctx.mark_dirty(LOADING_BAR_REGION);
                     }
                     Err(e) => {
                         log::info!("reader: epub init (opf) failed: {}", e);
@@ -684,14 +732,18 @@ impl App<AppId> for ReaderApp {
                                 );
                                 log::info!("epub: TOC has {} entries", self.toc.len());
                             }
-                            Err(e) => {
-                                log::warn!("epub: failed to read TOC: {}", e);
+                            Err(_e) => {
+                                log::warn!("epub: failed to read TOC");
                             }
                         }
                     }
                     self.rebuild_quick_actions();
                     self.state = State::NeedCache;
-                    continue;
+                    // break instead of continue so the progress bar
+                    // renders before potentially heavy chapter caching;
+                    // for cached books this mark coalesces with Ready
+                    // because both complete during the initial waveform
+                    ctx.mark_dirty(LOADING_BAR_REGION);
                 }
 
                 State::NeedCache => match self.epub_check_cache(k) {
@@ -700,19 +752,18 @@ impl App<AppId> for ReaderApp {
                         continue;
                     }
                     Ok(false) => {
-                        // Cache only the current chapter synchronously
-                        // so the user can start reading immediately.
+                        // cache the current chapter; async version yields
+                        // during deflate so the scheduler's select can
+                        // interrupt if the user presses back
                         let ch = self.chapter as usize;
-                        match self.epub_cache_single_chapter(k, ch) {
+                        match self.epub_cache_chapter_async(k, ch).await {
                             Ok(()) => {
                                 self.chapters_cached = true;
                                 self.cache_chapter = 0;
 
-                                // Eagerly dispatch nearby images to
+                                // eagerly dispatch nearby images to
                                 // the worker so they decode while the
-                                // user reads the first page.  The
-                                // worker is idle at this point so the
-                                // dispatch is immediate.
+                                // user reads the first page
                                 if self.try_dispatch_nearby_image(k) {
                                     self.bg_cache = BgCacheState::WaitNearbyImage;
                                 } else {
@@ -723,7 +774,7 @@ impl App<AppId> for ReaderApp {
                                 continue;
                             }
                             Err(e) => {
-                                log::info!("reader: sync cache ch{} failed: {}", ch, e);
+                                log::info!("reader: cache ch{} failed: {}", ch, e);
                                 self.error = Some(e);
                                 self.state = State::Error;
                                 ctx.mark_dirty(PAGE_REGION);
@@ -739,14 +790,19 @@ impl App<AppId> for ReaderApp {
                 },
 
                 State::NeedIndex => {
-                    // Ensure the target chapter is cached before
+                    // ensure the target chapter is cached before
                     // indexing (it may not be if background caching
-                    // hasn't reached it yet).
+                    // hasn't reached it yet)
                     if self.is_epub
                         && self.chapters_cached
                         && !self.ch_cached[self.chapter as usize]
                     {
-                        if let Err(e) = self.epub_cache_single_chapter(k, self.chapter as usize) {
+                        // async version yields during deflate so the
+                        // scheduler's select can interrupt on input
+                        if let Err(e) = self
+                            .epub_cache_chapter_async(k, self.chapter as usize)
+                            .await
+                        {
                             self.error = Some(e);
                             self.state = State::Error;
                             ctx.mark_dirty(PAGE_REGION);
@@ -766,6 +822,7 @@ impl App<AppId> for ReaderApp {
                     if want_last {
                         match self.scan_to_last_page(k) {
                             Ok(()) => {
+                                self.defer_image_decode = false;
                                 self.state = State::Ready;
                                 ctx.mark_dirty(PAGE_REGION);
                             }
@@ -803,12 +860,14 @@ impl App<AppId> for ReaderApp {
                             self.page += 1;
                         }
                         if self.state != State::Error {
+                            self.defer_image_decode = false;
                             self.state = State::Ready;
                             ctx.mark_dirty(PAGE_REGION);
                         }
                     } else {
                         match self.load_and_prefetch(k) {
                             Ok(()) => {
+                                self.defer_image_decode = false;
                                 self.state = State::Ready;
                                 ctx.mark_dirty(PAGE_REGION);
                             }
@@ -827,13 +886,18 @@ impl App<AppId> for ReaderApp {
             break;
         }
 
-        // background caching (runs while the user reads)
-        // runs in any stable state -- page turns momentarily leave
-        // Ready, but background work resumes on the next tick
-        if matches!(self.state, State::Ready | State::ShowToc)
-            && self.bg_cache != BgCacheState::Idle
+        // background caching; runs whenever the page content is
+        // settled and there is work to do. NeedIndex is included so
+        // adjacent-chapter caching can overlap with page indexing
+        // after a chapter jump. the scheduler wraps run_background
+        // in select(run_background, input) so every .await inside
+        // bg_cache_step is interruptible by user input.
+        if matches!(
+            self.state,
+            State::Ready | State::ShowToc | State::NeedIndex | State::NeedPage
+        ) && self.bg_cache != BgCacheState::Idle
         {
-            self.bg_cache_step(k);
+            self.bg_cache_step(k).await;
         }
     }
 
@@ -842,7 +906,7 @@ impl App<AppId> for ReaderApp {
             match event {
                 ActionEvent::Press(Action::Back) => {
                     self.state = State::Ready;
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                     return Transition::None;
                 }
                 ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
@@ -858,7 +922,7 @@ impl App<AppId> for ReaderApp {
                         if self.toc_selected >= self.toc_scroll + vis {
                             self.toc_scroll = self.toc_selected + 1 - vis;
                         }
-                        ctx.mark_dirty(PAGE_REGION);
+                        ctx.mark_dirty_immediate(PAGE_REGION);
                     }
                     return Transition::None;
                 }
@@ -877,7 +941,7 @@ impl App<AppId> for ReaderApp {
                         if self.toc_selected < self.toc_scroll {
                             self.toc_scroll = self.toc_selected;
                         }
-                        ctx.mark_dirty(PAGE_REGION);
+                        ctx.mark_dirty_immediate(PAGE_REGION);
                     }
                     return Transition::None;
                 }
@@ -893,14 +957,14 @@ impl App<AppId> for ReaderApp {
                         self.page = 0;
                         self.goto_last_page = false;
                         self.state = State::NeedIndex;
-                        ctx.mark_dirty(PAGE_REGION);
+                        ctx.mark_dirty_immediate(PAGE_REGION);
                     } else {
                         log::warn!(
                             "toc: entry \"{}\" unresolved (spine_idx=0xFFFF), ignoring",
                             entry.title_str()
                         );
                         self.state = State::Ready;
-                        ctx.mark_dirty(PAGE_REGION);
+                        ctx.mark_dirty_immediate(PAGE_REGION);
                     }
                     return Transition::None;
                 }
@@ -917,7 +981,7 @@ impl App<AppId> for ReaderApp {
                     self.show_position = true;
                 }
                 if self.page_forward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                 }
                 Transition::None
             }
@@ -926,7 +990,7 @@ impl App<AppId> for ReaderApp {
                     self.show_position = true;
                 }
                 if self.page_backward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                 }
                 Transition::None
             }
@@ -934,35 +998,35 @@ impl App<AppId> for ReaderApp {
             ActionEvent::Release(Action::Next) | ActionEvent::Release(Action::Prev) => {
                 if self.show_position {
                     self.show_position = false;
-                    ctx.mark_dirty(POSITION_OVERLAY);
+                    ctx.mark_dirty_immediate(POSITION_OVERLAY);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
                 if self.page_forward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
                 if self.page_backward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
                 if self.jump_forward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
                 if self.jump_backward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    ctx.mark_dirty_immediate(PAGE_REGION);
                 }
                 Transition::None
             }
@@ -1110,8 +1174,16 @@ impl App<AppId> for ReaderApp {
             );
         }
 
-        if let Some(msg) = self.error {
-            draw_chrome_text(strip, LOADING_REGION, msg, Alignment::CenterLeft, cf);
+        if let Some(e) = self.error {
+            let mut ebuf = StackFmt::<32>::new();
+            let _ = write!(ebuf, "{}", e);
+            draw_chrome_text(
+                strip,
+                LOADING_REGION,
+                ebuf.as_str(),
+                Alignment::CenterLeft,
+                cf,
+            );
             return;
         }
 
@@ -1139,6 +1211,7 @@ impl App<AppId> for ReaderApp {
                 Alignment::CenterLeft,
                 cf,
             );
+            draw_progress_bar(strip, LOADING_BAR_REGION, self.state.loading_pct());
             return;
         }
 
