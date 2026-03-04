@@ -35,7 +35,7 @@ impl SystemSettings {
 
     pub fn sanitize_with_max_font(&mut self, max_font: u8) {
         self.sleep_timeout = self.sleep_timeout.min(120);
-        self.ghost_clear_every = self.ghost_clear_every.clamp(1, 50);
+        self.ghost_clear_every = self.ghost_clear_every.clamp(5, 100);
         self.book_font_size_idx = self.book_font_size_idx.min(max_font);
         self.ui_font_size_idx = self.ui_font_size_idx.min(max_font);
     }

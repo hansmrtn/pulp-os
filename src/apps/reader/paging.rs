@@ -19,8 +19,14 @@ impl ReaderApp {
         let fonts_copy = self.fonts;
 
         if let Some(fs) = fonts_copy {
-            let (c, count) =
-                wrap_proportional(&self.pg.buf, n, &fs, &mut self.pg.lines, self.max_lines, TEXT_W);
+            let (c, count) = wrap_proportional(
+                &self.pg.buf,
+                n,
+                &fs,
+                &mut self.pg.lines,
+                self.max_lines,
+                TEXT_W,
+            );
             self.pg.line_count = count;
             c
         } else {
@@ -128,7 +134,12 @@ impl ReaderApp {
             let dir = cache::dir_name_str(&dir_buf);
             let ch_file = cache::chapter_file_name(self.epub.chapter);
             let ch_str = cache::chapter_file_str(&ch_file);
-            let n = k.read_app_subdir_chunk(dir, ch_str, self.pg.offsets[self.pg.page], &mut self.pg.buf)?;
+            let n = k.read_app_subdir_chunk(
+                dir,
+                ch_str,
+                self.pg.offsets[self.pg.page],
+                &mut self.pg.buf,
+            )?;
             self.pg.buf_len = n;
         } else if self.file_size == 0 {
             let (size, n) = k.read_file_start(name, &mut self.pg.buf)?;
@@ -255,7 +266,10 @@ impl ReaderApp {
             return true;
         }
 
-        if self.is_epub && self.pg.fully_indexed && (self.epub.chapter as usize + 1) < self.epub.spine.len() {
+        if self.is_epub
+            && self.pg.fully_indexed
+            && (self.epub.chapter as usize + 1) < self.epub.spine.len()
+        {
             self.epub.chapter += 1;
             self.goto_last_page = false;
             self.state = State::NeedIndex;

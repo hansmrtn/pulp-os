@@ -173,7 +173,7 @@ impl SettingsApp {
             }
             1 => {
                 self.settings.ghost_clear_every =
-                    self.settings.ghost_clear_every.saturating_add(5).min(50);
+                    self.settings.ghost_clear_every.saturating_add(5).min(100);
             }
             2 => {
                 if self.settings.book_font_size_idx < max_size_idx() {
@@ -200,7 +200,7 @@ impl SettingsApp {
             }
             1 => {
                 self.settings.ghost_clear_every =
-                    self.settings.ghost_clear_every.saturating_sub(5).max(1);
+                    self.settings.ghost_clear_every.saturating_sub(5).max(5);
             }
             2 => {
                 if self.settings.book_font_size_idx > 0 {
