@@ -1,4 +1,9 @@
 // epub init, chapter cache pipeline, and background cache state machine
+//
+// pure epub-state methods live on impl EpubState (init_zip,
+// check_cache, finish_cache, cache_chapter_async, try_cache_chapter).
+// methods that also touch PageState or ReaderApp fields stay on
+// impl ReaderApp (epub_init_opf, epub_index_chapter, bg_cache_step).
 
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -10,7 +15,7 @@ use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 
-use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, PAGE_BUF, ReaderApp, ZipIndex};
+use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
 
 // one cell shared between reader and writer; safe because
 // stream_strip_entry_async never borrows both simultaneously
@@ -35,11 +40,13 @@ impl smol_epub::async_io::AsyncWriteChunk for CellWriter<'_, '_> {
     }
 }
 
-impl ReaderApp {
-    pub(super) fn epub_init_zip(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-
+impl EpubState {
+    pub(super) fn init_zip(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        name: &str,
+        scratch: &mut [u8],
+    ) -> crate::error::Result<()> {
         let epub_size = k.file_size(name)?;
         if epub_size < 22 {
             return Err(Error::new(
@@ -47,14 +54,14 @@ impl ReaderApp {
                 "epub_init_zip: too small",
             ));
         }
-        self.epub.archive_size = epub_size;
-        self.epub.name_hash = cache::fnv1a(name.as_bytes());
-        self.epub.cache_dir = cache::dir_name_for_hash(self.epub.name_hash);
+        self.archive_size = epub_size;
+        self.name_hash = cache::fnv1a(name.as_bytes());
+        self.cache_dir = cache::dir_name_for_hash(self.name_hash);
 
         let tail_size = (epub_size as usize).min(EOCD_TAIL);
         let tail_offset = epub_size - tail_size as u32;
-        let n = k.read_chunk(name, tail_offset, &mut self.pg.buf[..tail_size])?;
-        let (cd_offset, cd_size) = ZipIndex::parse_eocd(&self.pg.buf[..n], epub_size)
+        let n = k.read_chunk(name, tail_offset, &mut scratch[..tail_size])?;
+        let (cd_offset, cd_size) = ZipIndex::parse_eocd(&scratch[..n], epub_size)
             .map_err(|_| Error::new(ErrorKind::ParseFailed, "epub_init_zip: EOCD"))?;
 
         log::info!(
@@ -70,18 +77,183 @@ impl ReaderApp {
             .map_err(|_| Error::new(ErrorKind::OutOfMemory, "epub_init_zip: CD alloc"))?;
         cd_buf.resize(cd_size as usize, 0);
         super::read_full(k, name, cd_offset, &mut cd_buf)?;
-        self.epub.zip.clear();
-        self.epub
-            .zip
+        self.zip.clear();
+        self.zip
             .parse_central_directory(&cd_buf)
             .map_err(|_| Error::new(ErrorKind::ParseFailed, "epub_init_zip: CD parse"))?;
         drop(cd_buf);
 
-        log::info!("epub: {} entries in ZIP", self.epub.zip.count());
+        log::info!("epub: {} entries in ZIP", self.zip.count());
 
         Ok(())
     }
 
+    pub(super) fn check_cache(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        scratch: &mut [u8],
+    ) -> crate::error::Result<bool> {
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+
+        let meta_cap = cache::META_MAX_SIZE.min(scratch.len());
+        if let Ok(n) = k.read_app_subdir_chunk(dir, cache::META_FILE, 0, &mut scratch[..meta_cap])
+            && let Ok(count) = cache::parse_cache_meta(
+                &scratch[..n],
+                self.archive_size,
+                self.name_hash,
+                self.spine.len(),
+                &mut self.chapter_sizes,
+            )
+        {
+            self.chapters_cached = true;
+            for i in 0..count {
+                self.ch_cached[i] = true;
+            }
+            log::info!("epub: cache hit ({} chapters)", count);
+            return Ok(true);
+        }
+
+        log::info!("epub: building cache for {} chapters", self.spine.len());
+        k.ensure_app_subdir(dir)?;
+        self.cache_chapter = 0;
+        Ok(false)
+    }
+
+    pub(super) fn finish_cache(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<bool> {
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let spine_len = self.spine.len();
+
+        let mut meta_buf = [0u8; cache::META_MAX_SIZE];
+        let meta_len = cache::encode_cache_meta(
+            self.archive_size,
+            self.name_hash,
+            &self.chapter_sizes[..spine_len],
+            &mut meta_buf,
+        );
+        k.write_app_subdir(dir, cache::META_FILE, &meta_buf[..meta_len])?;
+
+        self.chapters_cached = true;
+        log::info!("epub: cache complete");
+        Ok(false)
+    }
+
+    // async streaming chapter cache: decompress, strip HTML, write to SD.
+    pub(super) async fn cache_chapter_async(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        ch: usize,
+        epub_name: &str,
+    ) -> crate::error::Result<()> {
+        if ch >= self.spine.len() || self.ch_cached[ch] {
+            return Ok(());
+        }
+
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let entry_idx = self.spine.items[ch] as usize;
+        let entry = *self.zip.entry(entry_idx);
+        let ch_file = cache::chapter_file_name(ch as u16);
+        let ch_str = cache::chapter_file_str(&ch_file);
+
+        // truncate stale data before streaming begins
+        k.write_app_subdir(dir, ch_str, &[])?;
+
+        let k_cell = RefCell::new(&mut *k);
+
+        let mut reader = CellReader(&k_cell, epub_name);
+        let mut writer = CellWriter(&k_cell, dir, ch_str);
+
+        let text_size = smol_epub::async_io::stream_strip_entry_async(
+            &entry,
+            entry.local_offset,
+            &mut reader,
+            &mut writer,
+        )
+        .await
+        .map_err(|msg| Error::from(msg).with_source("cache_chapter_async: stream"))?;
+
+        self.chapter_sizes[ch] = text_size;
+        self.ch_cached[ch] = true;
+
+        log::info!(
+            "epub: cached ch{}/{} = {} bytes",
+            ch,
+            self.spine.len(),
+            text_size
+        );
+        Ok(())
+    }
+
+    pub(super) fn try_cache_chapter(&mut self, k: &mut KernelHandle<'_>) -> bool {
+        if !self.chapters_cached {
+            return false;
+        }
+
+        let ch = self.chapter as usize;
+        let ch_size = if ch < cache::MAX_CACHE_CHAPTERS {
+            self.chapter_sizes[ch] as usize
+        } else {
+            return false;
+        };
+
+        if ch_size == 0 || ch_size > CHAPTER_CACHE_MAX {
+            self.ch_cache = Vec::new();
+            return false;
+        }
+
+        if self.ch_cache.len() == ch_size {
+            log::info!("chapter cache: reusing {} bytes in RAM", ch_size);
+            return true;
+        }
+
+        self.ch_cache = Vec::new();
+        if self.ch_cache.try_reserve_exact(ch_size).is_err() {
+            log::info!("chapter cache: OOM for {} bytes", ch_size);
+            return false;
+        }
+        self.ch_cache.resize(ch_size, 0);
+
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let ch_file = cache::chapter_file_name(self.chapter);
+        let ch_str = cache::chapter_file_str(&ch_file);
+
+        let mut pos = 0usize;
+        while pos < ch_size {
+            let chunk = (ch_size - pos).min(PAGE_BUF);
+            match k.read_app_subdir_chunk(
+                dir,
+                ch_str,
+                pos as u32,
+                &mut self.ch_cache[pos..pos + chunk],
+            ) {
+                Ok(n) if n > 0 => pos += n,
+                Ok(_) => break,
+                Err(e) => {
+                    log::info!("chapter cache: SD read failed at {}: {}", pos, e);
+                    self.ch_cache = Vec::new();
+                    return false;
+                }
+            }
+        }
+
+        log::info!(
+            "chapter cache: loaded ch{} ({} bytes) into RAM",
+            self.chapter,
+            ch_size,
+        );
+        true
+    }
+
+    #[inline]
+    pub(super) fn current_chapter_size(&self) -> u32 {
+        self.chapter_size(self.chapter as usize)
+    }
+}
+
+impl ReaderApp {
     pub(super) fn epub_init_opf(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
@@ -155,127 +327,12 @@ impl ReaderApp {
         Ok(())
     }
 
-    pub(super) fn epub_check_cache(
-        &mut self,
-        k: &mut KernelHandle<'_>,
-    ) -> crate::error::Result<bool> {
-        let dir_buf = self.epub.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
-
-        // read into self.buf to avoid ~2 KB stack temporaries
-        let meta_cap = cache::META_MAX_SIZE.min(self.pg.buf.len());
-        if let Ok(n) =
-            k.read_app_subdir_chunk(dir, cache::META_FILE, 0, &mut self.pg.buf[..meta_cap])
-            && let Ok(count) = cache::parse_cache_meta(
-                &self.pg.buf[..n],
-                self.epub.archive_size,
-                self.epub.name_hash,
-                self.epub.spine.len(),
-                &mut self.epub.chapter_sizes,
-            )
-        {
-            self.epub.chapters_cached = true;
-            for i in 0..count {
-                self.epub.ch_cached[i] = true;
-            }
-            log::info!("epub: cache hit ({} chapters)", count);
-            return Ok(true);
-        }
-
-        log::info!(
-            "epub: building cache for {} chapters",
-            self.epub.spine.len()
-        );
-        k.ensure_app_subdir(dir)?;
-        self.epub.cache_chapter = 0;
-        Ok(false)
-    }
-
-    pub(super) fn epub_finish_cache(
-        &mut self,
-        k: &mut KernelHandle<'_>,
-    ) -> crate::error::Result<bool> {
-        let dir_buf = self.epub.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
-        let spine_len = self.epub.spine.len();
-
-        let mut meta_buf = [0u8; cache::META_MAX_SIZE];
-        let meta_len = cache::encode_cache_meta(
-            self.epub.archive_size,
-            self.epub.name_hash,
-            &self.epub.chapter_sizes[..spine_len],
-            &mut meta_buf,
-        );
-        k.write_app_subdir(dir, cache::META_FILE, &meta_buf[..meta_len])?;
-
-        self.epub.chapters_cached = true;
-        log::info!("epub: cache complete");
-        Ok(false)
-    }
-
-    // async streaming chapter cache; used for both initial and background
-    // caching. decompresses, strips html, and writes chunks to sd without
-    // ever holding full xhtml in ram. yields between decompression
-    // iterations so the scheduler's select(run_background, input) can
-    // interrupt on user input (e.g. pressing back during book open)
-    pub(super) async fn epub_cache_chapter_async(
-        &mut self,
-        k: &mut KernelHandle<'_>,
-        ch: usize,
-    ) -> crate::error::Result<()> {
-        if ch >= self.epub.spine.len() || self.epub.ch_cached[ch] {
-            return Ok(());
-        }
-
-        let dir_buf = self.epub.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-        let entry_idx = self.epub.spine.items[ch] as usize;
-        let entry = *self.epub.zip.entry(entry_idx);
-        let ch_file = cache::chapter_file_name(ch as u16);
-        let ch_str = cache::chapter_file_str(&ch_file);
-
-        // truncate stale data before streaming begins
-        k.write_app_subdir(dir, ch_str, &[])?;
-
-        let k_cell = RefCell::new(&mut *k);
-
-        let mut reader = CellReader(&k_cell, epub_name);
-        let mut writer = CellWriter(&k_cell, dir, ch_str);
-
-        let text_size = smol_epub::async_io::stream_strip_entry_async(
-            &entry,
-            entry.local_offset,
-            &mut reader,
-            &mut writer,
-        )
-        .await
-        .map_err(|msg| Error::from(msg).with_source("epub_cache_chapter_async: stream"))?;
-
-        self.epub.chapter_sizes[ch] = text_size;
-        self.epub.ch_cached[ch] = true;
-
-        log::info!(
-            "epub: cached ch{}/{} = {} bytes",
-            ch,
-            self.epub.spine.len(),
-            text_size
-        );
-        Ok(())
-    }
-
     pub(super) fn epub_index_chapter(&mut self) {
         self.reset_paging();
         // force reload; ch_cache may hold a different chapter's data
         // with the same byte count (try_cache_chapter only checks len)
         self.epub.ch_cache = Vec::new();
-        let ch = self.epub.chapter as usize;
-        self.file_size = if ch < cache::MAX_CACHE_CHAPTERS {
-            self.epub.chapter_sizes[ch]
-        } else {
-            0
-        };
+        self.file_size = self.epub.current_chapter_size();
         log::info!(
             "epub: index chapter {}/{} ({} bytes cached text)",
             self.epub.chapter + 1,
@@ -284,69 +341,8 @@ impl ReaderApp {
         );
     }
 
-    pub(super) fn try_cache_chapter(&mut self, k: &mut KernelHandle<'_>) -> bool {
-        if !self.is_epub || !self.epub.chapters_cached {
-            return false;
-        }
-
-        let ch = self.epub.chapter as usize;
-        let ch_size = if ch < cache::MAX_CACHE_CHAPTERS {
-            self.epub.chapter_sizes[ch] as usize
-        } else {
-            return false;
-        };
-
-        if ch_size == 0 || ch_size > CHAPTER_CACHE_MAX {
-            self.epub.ch_cache = Vec::new();
-            return false;
-        }
-
-        if self.epub.ch_cache.len() == ch_size {
-            log::info!("chapter cache: reusing {} bytes in RAM", ch_size);
-            return true;
-        }
-
-        self.epub.ch_cache = Vec::new();
-        if self.epub.ch_cache.try_reserve_exact(ch_size).is_err() {
-            log::info!("chapter cache: OOM for {} bytes", ch_size);
-            return false;
-        }
-        self.epub.ch_cache.resize(ch_size, 0);
-
-        let dir_buf = self.epub.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
-        let ch_file = cache::chapter_file_name(self.epub.chapter);
-        let ch_str = cache::chapter_file_str(&ch_file);
-
-        let mut pos = 0usize;
-        while pos < ch_size {
-            let chunk = (ch_size - pos).min(PAGE_BUF);
-            match k.read_app_subdir_chunk(
-                dir,
-                ch_str,
-                pos as u32,
-                &mut self.epub.ch_cache[pos..pos + chunk],
-            ) {
-                Ok(n) if n > 0 => pos += n,
-                Ok(_) => break,
-                Err(e) => {
-                    log::info!("chapter cache: SD read failed at {}: {}", pos, e);
-                    self.epub.ch_cache = Vec::new();
-                    return false;
-                }
-            }
-        }
-
-        log::info!(
-            "chapter cache: loaded ch{} ({} bytes) into RAM",
-            self.epub.chapter,
-            ch_size,
-        );
-        true
-    }
-
     // run one step of background caching; async because CacheChapter
-    // awaits epub_cache_chapter_async which yields during deflate
+    // awaits cache_chapter_async which yields during deflate
     pub(super) async fn bg_cache_step(&mut self, k: &mut KernelHandle<'_>) {
         match self.epub.bg_cache {
             BgCacheState::CacheChapter => {
@@ -363,6 +359,8 @@ impl ReaderApp {
                 // before continuing the sequential scan; forward/backward
                 // nav stays instant
                 let reading_ch = self.epub.chapter as usize;
+                let (nb, nl) = self.name_copy();
+                let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
                 for &adj in &[reading_ch + 1, reading_ch.saturating_sub(1)] {
                     if adj < spine_len && adj != reading_ch && !self.epub.ch_cached[adj] {
                         log::info!(
@@ -370,7 +368,7 @@ impl ReaderApp {
                             adj,
                             reading_ch,
                         );
-                        if let Err(e) = self.epub_cache_chapter_async(k, adj).await {
+                        if let Err(e) = self.epub.cache_chapter_async(k, adj, &name).await {
                             log::warn!("epub: priority ch{} failed: {}", adj, e);
                         }
                     }
@@ -378,7 +376,7 @@ impl ReaderApp {
 
                 let ch = self.epub.cache_chapter as usize;
                 if ch >= spine_len {
-                    let _ = self.epub_finish_cache(k);
+                    let _ = self.epub.finish_cache(k);
                     self.epub.img_cache_ch = self.epub.chapter;
                     self.epub.img_cache_offset = 0;
                     self.epub.img_scan_wrapped = false;
@@ -386,7 +384,7 @@ impl ReaderApp {
                     return;
                 }
 
-                match self.epub_cache_chapter_async(k, ch).await {
+                match self.epub.cache_chapter_async(k, ch, &name).await {
                     Ok(()) => {
                         self.epub.cache_chapter += 1;
                         // try nearby image dispatch before next chapter

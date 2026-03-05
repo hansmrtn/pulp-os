@@ -1,7 +1,6 @@
 // app modules, AppId definition, and re-exports from kernel::app
 //
-// AppId is defined here (the distro side) -- the kernel is generic
-// over AppIdType and never knows which concrete apps exist
+// AppId is defined here (the distro side) the kernel attempts to be generic
 
 pub mod files;
 pub mod home;

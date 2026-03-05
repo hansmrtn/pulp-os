@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use smol_epub::DecodedImage;
+use crate::kernel::work_queue::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub;
 use smol_epub::html_strip::{IMG_REF, MARKER};
@@ -22,6 +22,15 @@ use crate::kernel::work_queue;
 use super::{
     DEFAULT_IMG_H, MAX_IMAGES_PER_PAGE, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp,
 };
+
+fn from_smol_image(img: smol_epub::DecodedImage) -> DecodedImage {
+    DecodedImage {
+        width: img.width,
+        height: img.height,
+        data: img.data,
+        stride: img.stride,
+    }
+}
 
 // result of scanning a chapter for the next uncached image
 enum ScanResult {
@@ -216,7 +225,7 @@ impl ReaderApp {
         let do_decode = |k_ref: &mut KernelHandle<'_>| -> Result<DecodedImage, &'static str> {
             let k_cell = RefCell::new(k_ref);
             let read_err = |e: Error| -> &'static str { e.into() };
-            if is_jpeg && entry.method == zip::METHOD_STORED {
+            let raw = if is_jpeg && entry.method == zip::METHOD_STORED {
                 smol_epub::jpeg::decode_jpeg_sd(
                     |off, buf| {
                         k_cell
@@ -269,7 +278,8 @@ impl ReaderApp {
                     img_max_w,
                     img_max_h,
                 )
-            }
+            };
+            raw.map(from_smol_image)
         };
 
         let result = do_decode(k);
@@ -325,8 +335,7 @@ impl ReaderApp {
         let ch_path = self.epub.zip.entry_name(ch_zip_idx);
         let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
-        let dir_buf = self.epub.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
+        let dir = self.epub.cache_dir_str();
 
         let (nb, nl) = self.name_copy();
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
@@ -412,7 +421,7 @@ impl ReaderApp {
         {
             return Ok(ScanResult::NoneFound);
         }
-        let ch_size = self.epub.chapter_sizes[ch] as usize;
+        let ch_size = self.epub.chapter_size(ch) as usize;
         if ch_size == 0 {
             return Ok(ScanResult::NoneFound);
         }
@@ -676,8 +685,7 @@ impl ReaderApp {
 
         match result.outcome {
             work_queue::WorkOutcome::ImageReady { path_hash, image } => {
-                let dir_buf = self.epub.cache_dir;
-                let dir = cache::dir_name_str(&dir_buf);
+                let dir = self.epub.cache_dir_str();
                 let img_name = img_cache_name(path_hash);
                 let img_file = img_cache_str(&img_name);
 
@@ -816,7 +824,9 @@ pub(super) fn decode_image_streaming(
             max_h,
         )
     };
-    result.map_err(|msg| Error::from(msg).with_source("decode_image_streaming"))
+    result
+        .map(from_smol_image)
+        .map_err(|msg| Error::from(msg).with_source("decode_image_streaming"))
 }
 
 pub(super) fn load_cached_image(

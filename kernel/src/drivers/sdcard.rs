@@ -27,7 +27,7 @@ use crate::board::SdSpiDevice;
 //
 // sync SdCard uses RefCell internally, takes &self for BlockDevice
 // methods; we delegate AsyncBlockDevice &mut self to the inner &self
-// methods -- all resolve immediately since SPI is DMA-blocking
+// methods. All resolve immediately since SPI is DMA-blocking
 
 pub(crate) struct BlockDeviceAdapter<D: BlockDevice>(D);
 
@@ -107,7 +107,7 @@ impl SdStorage {
     // num_bytes() to force init and verify the card responds
     //
     // pub so Board::init can run this before other SPI peripherals
-    // touch the bus -- SD spec requires a clean 400 kHz bus for CMD0
+    // touch the bus - SD spec requires a clean 400 kHz bus for CMD0
     pub fn init_card(spi_device: SdSpiDevice) -> Option<SyncSdCard> {
         let sd = SdCard::new(spi_device, esp_hal::delay::Delay::new());
 
@@ -188,7 +188,7 @@ impl SdStorage {
 // drive a future to completion in exactly one poll
 //
 // correct because the SPI bus is blocking and the sync SdCard
-// completes every operation before returning -- no inner .await
+// completes every operation before returning - no inner .await
 // ever returns Pending
 //
 // only use for file-level operations (open, read, write, seek,

@@ -9,7 +9,7 @@
 // distros define their own AppId enum and implement AppIdType for
 // it. the kernel never knows which specific apps exist.
 //
-// QuickAction types also live here -- they are pure data describing
+// QuickAction types also live here - they are pure data describing
 // what actions an app exposes; the renderer (QuickMenu widget) is
 // app-side, but the protocol is kernel-side
 

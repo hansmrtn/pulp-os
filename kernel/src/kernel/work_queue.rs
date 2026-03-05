@@ -18,7 +18,37 @@ use critical_section::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
-use smol_epub::DecodedImage;
+// 1-bit decoded image
+pub struct DecodedImage {
+    pub width: u16,
+    pub height: u16,
+    pub data: Vec<u8>,
+    pub stride: usize,
+}
+
+impl core::fmt::Debug for DecodedImage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DecodedImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("data_len", &self.data.len())
+            .field("stride", &self.stride)
+            .finish()
+    }
+}
+
+pub type ImageDecodeFn = fn(&[u8], bool, u16, u16) -> Result<DecodedImage, &'static str>;
+
+static IMAGE_DECODER: Mutex<Cell<Option<ImageDecodeFn>>> = Mutex::new(Cell::new(None));
+
+pub fn register_image_decoder(f: ImageDecodeFn) {
+    critical_section::with(|cs| IMAGE_DECODER.borrow(cs).set(Some(f)));
+}
+
+fn get_image_decoder() -> ImageDecodeFn {
+    critical_section::with(|cs| IMAGE_DECODER.borrow(cs).get())
+        .expect("work_queue: no image decoder registered")
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -133,8 +163,6 @@ static WORK_IN: Channel<CriticalSectionRawMutex, WorkItem, 2> = Channel::new();
 static WORK_OUT: Channel<CriticalSectionRawMutex, WorkResult, 2> = Channel::new();
 
 // true if the input channel has room for at least one more item.
-// use before expensive extraction to avoid wasted work when the
-// worker hasn't consumed its previous item yet.
 #[inline]
 pub fn can_submit() -> bool {
     !WORK_IN.is_full()
@@ -204,11 +232,8 @@ pub async fn worker_task() -> ! {
                     g,
                 );
 
-                let result = if is_jpeg {
-                    smol_epub::jpeg::decode_jpeg_fit(&data, max_w, max_h)
-                } else {
-                    smol_epub::png::decode_png_fit(&data, max_w, max_h)
-                };
+                let decode = get_image_decoder();
+                let result = decode(&data, is_jpeg, max_w, max_h);
                 drop(data);
 
                 if g != active_generation() {

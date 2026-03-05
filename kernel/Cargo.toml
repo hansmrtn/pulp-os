@@ -24,5 +24,4 @@ critical-section.workspace    = true
 static_cell.workspace         = true
 nb.workspace                  = true
 log.workspace                 = true
-smol-epub.workspace           = true
 esp-alloc = { version = "0.9.0", features = ["internal-heap-stats"] }

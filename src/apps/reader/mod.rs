@@ -27,8 +27,8 @@ use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
+use crate::kernel::work_queue::DecodedImage;
 use crate::ui::{Alignment, CONTENT_TOP, HEADER_W, Region, StackFmt, TITLE_Y_OFFSET};
-use smol_epub::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -233,15 +233,14 @@ impl PageState {
 // epub-specific state: zip index, metadata, spine, toc, chapter
 // cache, background cache progress, image cache scan position
 pub(super) struct EpubState {
+    // --- publicly accessible from sibling modules ---
     pub(super) zip: ZipIndex,
     pub(super) meta: EpubMeta,
     pub(super) spine: EpubSpine,
     pub(super) chapter: u16,
 
     pub(super) cache_dir: [u8; 8],
-    pub(super) name_hash: u32,
-    pub(super) archive_size: u32,
-    pub(super) chapter_sizes: [u32; cache::MAX_CACHE_CHAPTERS],
+    chapter_sizes: [u32; cache::MAX_CACHE_CHAPTERS],
     pub(super) chapters_cached: bool,
     pub(super) cache_chapter: u16,
     pub(super) ch_cached: [bool; cache::MAX_CACHE_CHAPTERS],
@@ -258,6 +257,10 @@ pub(super) struct EpubState {
     pub(super) toc_source: Option<TocSource>,
     pub(super) toc_selected: usize,
     pub(super) toc_scroll: usize,
+
+    // --- private: only accessed by impl EpubState methods ---
+    name_hash: u32,
+    archive_size: u32,
 }
 
 impl EpubState {
@@ -284,6 +287,20 @@ impl EpubState {
             toc_source: None,
             toc_selected: 0,
             toc_scroll: 0,
+        }
+    }
+
+    #[inline]
+    pub(super) fn cache_dir_str(&self) -> &str {
+        cache::dir_name_str(&self.cache_dir)
+    }
+
+    #[inline]
+    pub(super) fn chapter_size(&self, ch: usize) -> u32 {
+        if ch < cache::MAX_CACHE_CHAPTERS {
+            self.chapter_sizes[ch]
+        } else {
+            0
         }
     }
 }
@@ -875,16 +892,20 @@ impl App<AppId> for ReaderApp {
                     continue;
                 }
 
-                State::NeedInit => match self.epub_init_zip(k) {
-                    Ok(()) => {
-                        self.state = State::NeedOpf;
-                        ctx.set_loading(LOADING_REGION, "Loading", 25);
+                State::NeedInit => {
+                    let (nb, nl) = self.name_copy();
+                    let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                    match self.epub.init_zip(k, name, &mut self.pg.buf) {
+                        Ok(()) => {
+                            self.state = State::NeedOpf;
+                            ctx.set_loading(LOADING_REGION, "Loading", 25);
+                        }
+                        Err(e) => {
+                            log::info!("reader: epub init (zip) failed: {}", e);
+                            self.enter_error(ctx, e);
+                        }
                     }
-                    Err(e) => {
-                        log::info!("reader: epub init (zip) failed: {}", e);
-                        self.enter_error(ctx, e);
-                    }
-                },
+                }
 
                 State::NeedOpf => match self.epub_init_opf(k) {
                     Ok(()) => {
@@ -941,7 +962,7 @@ impl App<AppId> for ReaderApp {
                     ctx.set_loading(LOADING_REGION, "Caching", 55);
                 }
 
-                State::NeedCache => match self.epub_check_cache(k) {
+                State::NeedCache => match self.epub.check_cache(k, &mut self.pg.buf) {
                     Ok(true) => {
                         self.state = State::NeedIndex;
                         ctx.set_loading(LOADING_REGION, "Indexing", 75);
@@ -951,7 +972,9 @@ impl App<AppId> for ReaderApp {
                         // during deflate so the scheduler's select can
                         // interrupt if the user presses back
                         let ch = self.epub.chapter as usize;
-                        match self.epub_cache_chapter_async(k, ch).await {
+                        let (nb, nl) = self.name_copy();
+                        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                        match self.epub.cache_chapter_async(k, ch, epub_name).await {
                             Ok(()) => {
                                 self.epub.chapters_cached = true;
                                 self.epub.cache_chapter = 0;
@@ -990,10 +1013,10 @@ impl App<AppId> for ReaderApp {
                     {
                         // async version yields during deflate so the
                         // scheduler's select can interrupt on input
-                        if let Err(e) = self
-                            .epub_cache_chapter_async(k, self.epub.chapter as usize)
-                            .await
-                        {
+                        let ch = self.epub.chapter as usize;
+                        let (nb, nl) = self.name_copy();
+                        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                        if let Err(e) = self.epub.cache_chapter_async(k, ch, epub_name).await {
                             self.enter_error(ctx, e);
                             break;
                         }
@@ -1004,7 +1027,7 @@ impl App<AppId> for ReaderApp {
 
                     self.epub_index_chapter();
 
-                    if self.try_cache_chapter(k) {
+                    if self.is_epub && self.epub.try_cache_chapter(k) {
                         self.preindex_all_pages();
                     }
 

@@ -133,8 +133,7 @@ impl ReaderApp {
             self.pg.prefetch_page = NO_PREFETCH;
             self.pg.prefetch_len = 0;
         } else if self.is_epub && self.epub.chapters_cached {
-            let dir_buf = self.epub.cache_dir;
-            let dir = cache::dir_name_str(&dir_buf);
+            let dir = self.epub.cache_dir_str();
             let ch_file = cache::chapter_file_name(self.epub.chapter);
             let ch_str = cache::chapter_file_str(&ch_file);
             let n = k.read_app_subdir_chunk(
@@ -180,8 +179,7 @@ impl ReaderApp {
         if self.pg.page + 1 < self.pg.total_pages {
             let pf_offset = self.pg.offsets[self.pg.page + 1];
             let pf_result = if self.is_epub && self.epub.chapters_cached {
-                let dir_buf = self.epub.cache_dir;
-                let dir = cache::dir_name_str(&dir_buf);
+                let dir = self.epub.cache_dir_str();
                 let ch_file = cache::chapter_file_name(self.epub.chapter);
                 let ch_str = cache::chapter_file_str(&ch_file);
                 k.read_app_subdir_chunk(dir, ch_str, pf_offset, &mut self.pg.prefetch)

@@ -144,6 +144,22 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     kernel.boot(&mut app_mgr).await;
 
+    // register the image decoder so the kernel's worker task can
+    // decode JPEG/PNG without depending on smol-epub directly
+    work_queue::register_image_decoder(|data, is_jpeg, max_w, max_h| {
+        let raw = if is_jpeg {
+            smol_epub::jpeg::decode_jpeg_fit(data, max_w, max_h)
+        } else {
+            smol_epub::png::decode_png_fit(data, max_w, max_h)
+        };
+        raw.map(|img| work_queue::DecodedImage {
+            width: img.width,
+            height: img.height,
+            data: img.data,
+            stride: img.stride,
+        })
+    });
+
     spawner
         .spawn(tasks::input_task(input))
         .expect("spawn input_task");
