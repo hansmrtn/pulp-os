@@ -29,6 +29,11 @@ use crate::ui::{free_stack_bytes, stack_high_water_mark};
 
 use super::timing;
 
+#[inline]
+fn is_power_event(ev: Event) -> bool {
+    matches!(ev, Event::Press(Button::Power) | Event::Release(Button::Power))
+}
+
 impl super::Kernel {
     // render boot console to EPD; call before boot() to show
     // hardware init progress in the built-in mono font
@@ -40,9 +45,28 @@ impl super::Kernel {
     }
 
     // one-time boot: load caches, settings, render the home screen
+    // if waking from deep sleep with valid RTC session, restore it
     pub async fn boot<A: AppLayer>(&mut self, app_mgr: &mut A) {
+        use super::rtc_session;
+
         self.bm_cache.ensure_loaded(&self.sd);
 
+        // check for valid RTC session before loading settings
+        // (session may contain cached settings to skip SD reads)
+        let has_rtc_session = rtc_session::is_valid_session();
+        let rtc_session_data = if has_rtc_session {
+            let session = rtc_session::load();
+            info!(
+                "boot: RTC session valid (wake count {})",
+                session.wake_count()
+            );
+            Some(session)
+        } else {
+            info!("boot: no RTC session (power-on or first boot)");
+            None
+        };
+
+        // load settings - may use cached values from RTC session
         {
             let mut handle = self.handle();
             app_mgr.load_eager_settings(&mut handle);
@@ -51,7 +75,17 @@ impl super::Kernel {
 
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
         self.log_stats();
-        app_mgr.enter_initial(&mut self.handle());
+
+        // try to restore session from RTC memory
+        let restored = if let Some(session) = rtc_session_data {
+            app_mgr.apply_session(&session, &mut self.handle())
+        } else {
+            false
+        };
+
+        if !restored {
+            app_mgr.enter_initial(&mut self.handle());
+        }
 
         {
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
@@ -86,8 +120,11 @@ impl super::Kernel {
             };
 
             if let Some(ev) = hw_event {
+                if matches!(ev, Event::LongPress(_)) {
+                    info!("scheduler: received {:?}", ev);
+                }
                 if self.handle_input(ev, app_mgr) {
-                    self.enter_sleep("power held").await;
+                    self.sleep_with_session(app_mgr, "power held").await;
                     continue;
                 }
             }
@@ -129,7 +166,7 @@ impl super::Kernel {
 
             if let Some(ev) = bg_input {
                 if self.handle_input(ev, app_mgr) {
-                    self.enter_sleep("power held").await;
+                    self.sleep_with_session(app_mgr, "power held").await;
                     continue;
                 }
 
@@ -139,13 +176,16 @@ impl super::Kernel {
             }
 
             if self.poll_housekeeping(app_mgr) {
-                self.enter_sleep("idle timeout").await;
+                self.sleep_with_session(app_mgr, "idle timeout").await;
                 continue;
             }
 
             if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
-                self.render(app_mgr, redraw).await;
+                if self.render(app_mgr, redraw).await {
+                    self.sleep_with_session(app_mgr, "power held").await;
+                    continue;
+                }
             }
         }
     }
@@ -171,17 +211,25 @@ impl super::Kernel {
         let _ = tasks::IDLE_SLEEP_DUE.try_take();
 
         if hw_event == Event::LongPress(Button::Power) {
+            info!("handle_input: LongPress(Power) detected, triggering sleep");
             return true;
         }
 
         let suppressed_before = app_mgr.suppress_deferred_input();
         let transition = app_mgr.dispatch_event(hw_event, &mut *self.bm_cache);
+        let power = is_power_event(hw_event);
 
         if transition != Transition::None {
             app_mgr.apply_transition(transition, &mut self.handle());
-            tasks::request_hold_reset();
+            // don't consume hold for power button - we still want LongPress for sleep
+            if !power {
+                tasks::request_hold_reset();
+            }
         } else if app_mgr.suppress_deferred_input() != suppressed_before {
-            tasks::request_hold_reset();
+            // quick menu opened/closed; don't consume hold for power button
+            if !power {
+                tasks::request_hold_reset();
+            }
         }
 
         false
@@ -222,7 +270,12 @@ impl super::Kernel {
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~1.6 s) clears ghosting
-    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) {
+    //
+    // returns true if power-long-press arrived during the waveform and
+    // the caller should enter sleep
+    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> bool {
+        let mut sleep_requested = false;
+
         'render: {
             if let Redraw::Partial(r) = redraw {
                 let ghost_clear_every = app_mgr.ghost_clear_every();
@@ -257,7 +310,8 @@ impl super::Kernel {
 
                     if let Some(rs) = rs {
                         self.epd.partial_start_du(&rs);
-                        let deferred = self.busy_wait_with_background(app_mgr).await;
+                        let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
+                        sleep_requested = sleep;
 
                         if app_mgr.has_redraw() {
                             // content changed mid-DU; leave RED stale
@@ -303,7 +357,8 @@ impl super::Kernel {
 
                 self.epd.start_full_update();
 
-                let deferred = self.busy_wait_with_background(app_mgr).await;
+                let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
+                sleep_requested = sleep;
 
                 self.epd.finish_full_update();
                 self.partial_refreshes = 0;
@@ -314,6 +369,8 @@ impl super::Kernel {
                 }
             }
         } // 'render
+
+        sleep_requested
     }
 
     // collect input and run background work while EPD is busy refreshing
@@ -332,11 +389,16 @@ impl super::Kernel {
     //
     // first non-None transition wins; hold reset prevents the held
     // button from re-firing LongPress/Repeat for the waveform
+    //
+    // returns (deferred_transition, sleep_requested) so the caller
+    // can enter sleep after the EPD finishes if power-long-press
+    // arrived during the waveform
     async fn busy_wait_with_background<A: AppLayer>(
         &mut self,
         app_mgr: &mut A,
-    ) -> Option<Transition<A::Id>> {
+    ) -> (Option<Transition<A::Id>>, bool) {
         let mut deferred: Option<Transition<A::Id>> = None;
+        let mut sleep_requested = false;
 
         loop {
             if !self.epd.is_busy() {
@@ -364,14 +426,27 @@ impl super::Kernel {
             if let Some(hw_event) = ev {
                 let _ = tasks::IDLE_SLEEP_DUE.try_take();
 
+                // power long-press triggers sleep after EPD finishes
+                if hw_event == Event::LongPress(Button::Power) {
+                    info!("busy_wait: LongPress(Power) during waveform, will sleep after");
+                    sleep_requested = true;
+                    continue;
+                }
+
                 let suppressed_before = app_mgr.suppress_deferred_input();
                 if !suppressed_before {
                     let t = app_mgr.dispatch_event(hw_event, &mut *self.bm_cache);
+                    let power = is_power_event(hw_event);
+
                     if t != Transition::None && deferred.is_none() {
                         deferred = Some(t);
-                        tasks::request_hold_reset();
+                        if !power {
+                            tasks::request_hold_reset();
+                        }
                     } else if app_mgr.suppress_deferred_input() != suppressed_before {
-                        tasks::request_hold_reset();
+                        if !power {
+                            tasks::request_hold_reset();
+                        }
                     }
                 }
             }
@@ -379,12 +454,34 @@ impl super::Kernel {
             self.poll_housekeeping_waveform(app_mgr);
         }
 
-        deferred
+        (deferred, sleep_requested)
+    }
+
+    // save session to RTC memory and enter deep sleep; call this
+    // instead of enter_sleep directly to ensure session state is persisted
+    async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str) {
+        use super::rtc_session;
+
+        // collect session state from app layer
+        let mut session = rtc_session::RtcSession::zeroed();
+        app_mgr.collect_session(&mut session);
+
+        // increment wake count for debugging
+        session.increment_wake_count();
+
+        // save to RTC memory (will be valid on next wake)
+        rtc_session::save(&session);
+        info!("session: saved to RTC memory");
+
+        self.enter_sleep(reason).await;
     }
 
     // flush bookmarks, render sleep screen, enter MCU deep sleep;
     // on real hardware this never returns (wake = full MCU reset)
-    pub async fn enter_sleep(&mut self, reason: &str) {
+    //
+    // uses a custom sleep config that keeps RTC FAST memory powered
+    // so session state survives the sleep cycle (~1-2µA extra)
+    async fn enter_sleep(&mut self, reason: &str) {
         use embedded_graphics::mono_font::MonoTextStyle;
         use embedded_graphics::mono_font::ascii::FONT_9X18;
         use embedded_graphics::pixelcolor::BinaryColor;
@@ -392,7 +489,7 @@ impl super::Kernel {
         use embedded_graphics::text::Text;
         use esp_hal::gpio::RtcPinWithResistors;
         use esp_hal::rtc_cntl::Rtc;
-        use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, WakeupLevel};
+        use esp_hal::rtc_cntl::sleep::{RtcSleepConfig, RtcioWakeupSource, WakeupLevel};
 
         info!("{}: entering sleep...", reason);
 
@@ -423,10 +520,16 @@ impl super::Kernel {
             &mut [(&mut gpio3, WakeupLevel::Low)];
         let rtcio = RtcioWakeupSource::new(wakeup_pins);
 
-        info!("mcu: entering deep sleep (power button to wake)");
-        rtc.sleep_deep(&[&rtcio]);
+        // custom sleep config: keep RTC FAST memory powered for session
+        // persistence. this adds ~1-2µA to deep sleep current but enables
+        // instant wake restoration without SD card I/O.
+        let mut sleep_config = RtcSleepConfig::deep();
+        sleep_config.set_rtc_fastmem_pd_en(false); // keep RTC FAST powered
 
-        // deep sleep resets the MCU; backstop if sleep_deep returns
+        info!("mcu: entering deep sleep (power button to wake, RTC FAST retained)");
+        rtc.sleep(&sleep_config, &[&rtcio]);
+
+        // deep sleep resets the MCU; backstop if sleep returns
         #[allow(unreachable_code)]
         loop {
             core::hint::spin_loop();

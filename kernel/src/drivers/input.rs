@@ -139,6 +139,7 @@ impl InputDriver {
                 if !self.long_press_fired && held >= Duration::from_millis(timing::LONG_PRESS_MS) {
                     self.long_press_fired = true;
                     self.last_repeat = now;
+                    log::info!("input: LongPress({:?}) after {}ms", btn, held.as_millis());
                     return Some(Event::LongPress(btn));
                 }
 
@@ -155,7 +156,8 @@ impl InputDriver {
     }
 
     fn read_raw(&mut self) -> Option<Button> {
-        if crate::board::power_button_is_low() {
+        let power_low = crate::board::power_button_is_low();
+        if power_low {
             return Some(Button::Power);
         }
 

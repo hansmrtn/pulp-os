@@ -108,7 +108,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let sd_ok = sd.probe_ok();
     if sd_ok {
         console.push("sd: fat32 mounted");
-        let _ = storage::ensure_pulp_dir_async(&sd).await;
+        if let Err(e) = storage::ensure_pulp_dir_async(&sd).await {
+            console.push("sd: pulp dir failed");
+            log::warn!("ensure_pulp_dir: {:?}", e);
+        }
     }
 
     let mut input = InputDriver::new(board.input);
@@ -141,10 +144,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     kernel.boot(&mut app_mgr).await;
 
-    spawner.spawn(tasks::input_task(input)).unwrap();
-    spawner.spawn(tasks::housekeeping_task()).unwrap();
-    spawner.spawn(tasks::idle_timeout_task()).unwrap();
-    spawner.spawn(work_queue::worker_task()).unwrap();
+    spawner.spawn(tasks::input_task(input)).expect("spawn input_task");
+    spawner.spawn(tasks::housekeeping_task()).expect("spawn housekeeping_task");
+    spawner.spawn(tasks::idle_timeout_task()).expect("spawn idle_timeout_task");
+    spawner.spawn(work_queue::worker_task()).expect("spawn worker_task");
     info!("kernel ready.");
 
     kernel.run(&mut app_mgr).await

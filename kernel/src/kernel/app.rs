@@ -209,11 +209,7 @@ impl AppContext {
             Redraw::None => false,
             Redraw::Full => true,
             Redraw::Partial(_) => {
-                self.immediate
-                    || self
-                        .coalesce_until
-                        .map(|t| Instant::now() >= t)
-                        .unwrap_or(true)
+                self.immediate || self.coalesce_until.map_or(true, |t| Instant::now() >= t)
             }
         }
     }
@@ -350,8 +346,37 @@ impl<Id: AppIdType> Launcher<Id> {
         }
     }
 
+    #[inline]
     pub fn active(&self) -> Id {
         self.stack[self.depth - 1]
+    }
+
+    #[inline]
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    #[inline]
+    pub fn stack_at(&self, index: usize) -> Id {
+        self.stack[index]
+    }
+
+    /// Check if an app ID is anywhere in the stack
+    pub fn contains(&self, id: Id) -> bool {
+        self.stack[..self.depth].iter().any(|&i| i == id)
+    }
+
+    /// Restore stack from saved session data
+    ///
+    /// The `convert` function maps u8 values to Id.
+    pub fn restore_stack<F>(&mut self, depth: usize, stack: &[u8], convert: F)
+    where
+        F: Fn(u8) -> Id,
+    {
+        self.depth = depth.min(MAX_STACK_DEPTH).max(1);
+        for i in 0..self.depth {
+            self.stack[i] = convert(stack[i]);
+        }
     }
 
     pub fn apply(&mut self, transition: Transition<Id>) -> Option<NavEvent<Id>> {
@@ -447,6 +472,14 @@ pub trait AppLayer {
     fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>);
     fn load_initial_state(&mut self, k: &mut KernelHandle<'_>);
     fn enter_initial(&mut self, k: &mut KernelHandle<'_>);
+
+    // session persistence: save/restore active app across sleep/wake
+    // using RTC FAST memory (survives deep sleep, zeroed on power-on)
+    //
+    // collect_session writes app state to the provided RtcSession struct
+    // apply_session restores app state from RtcSession, returns true if successful
+    fn collect_session(&self, session: &mut super::rtc_session::RtcSession);
+    fn apply_session(&mut self, session: &super::rtc_session::RtcSession, k: &mut KernelHandle<'_>) -> bool;
 
     // true when the active app wants to take over the main loop
     // (e.g. wifi upload mode bypasses the normal event dispatch)

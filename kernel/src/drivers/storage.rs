@@ -469,12 +469,9 @@ pub async fn ensure_pulp_dir_async(sd: &SdStorage) -> crate::error::Result<()> {
     let mut guard = borrow(sd)?;
     let inner = &mut *guard;
 
-    match inner.mgr.open_dir(inner.root, PULP_DIR).await {
-        Ok(dir) => {
-            let _ = inner.mgr.close_dir(dir);
-            return Ok(());
-        }
-        Err(_) => {}
+    if let Ok(dir) = inner.mgr.open_dir(inner.root, PULP_DIR).await {
+        let _ = inner.mgr.close_dir(dir);
+        return Ok(());
     }
     match inner.mgr.make_dir_in_dir(inner.root, PULP_DIR).await {
         Ok(()) => Ok(()),

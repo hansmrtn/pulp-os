@@ -1,8 +1,6 @@
 // paginated file browser for SD card root directory
 // background title scanner resolves EPUB titles from OPF metadata
 
-extern crate alloc;
-
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
@@ -19,9 +17,8 @@ use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::ui::{
-    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W,
-    LARGE_MARGIN, LIST_ROW_GAP, LIST_ROW_H, Region, SECTION_GAP, STATUS_W, STATUS_X,
-    TITLE_Y_OFFSET,
+    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W, LARGE_MARGIN,
+    Region, SECTION_GAP, TITLE_Y_OFFSET,
 };
 use smol_epub::epub::{self, EpubMeta, EpubSpine};
 use smol_epub::zip::ZipIndex;
@@ -33,12 +30,14 @@ const LIST_W: u16 = FULL_CONTENT_W;
 
 const TITLE_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET;
 
+const STATUS_W: u16 = 144;
+const STATUS_X: u16 = SCREEN_W - LARGE_MARGIN - STATUS_W;
 const FILES_STATUS_Y: u16 = TITLE_Y;
 const FILES_STATUS_H: u16 = 28;
 const STATUS_REGION: Region = Region::new(STATUS_X, FILES_STATUS_Y, STATUS_W, FILES_STATUS_H);
 
-const ROW_H: u16 = LIST_ROW_H;
-const ROW_GAP: u16 = LIST_ROW_GAP;
+const ROW_H: u16 = 52;
+const ROW_GAP: u16 = 4;
 
 const HEADER_LIST_GAP: u16 = SECTION_GAP;
 
@@ -88,6 +87,36 @@ impl FilesApp {
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
         self.list_y = TITLE_Y + self.ui_fonts.heading.line_height + HEADER_LIST_GAP;
+    }
+
+    // Session state accessors for RTC persistence
+    #[inline]
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    #[inline]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    #[inline]
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Restore files state from RTC session data
+    pub fn restore_state(&mut self, scroll: usize, selected: usize, total: usize) {
+        self.scroll = scroll;
+        self.selected = selected;
+        self.total = total;
+        self.needs_load = true; // trigger page reload
+        log::info!(
+            "files: restore_state scroll={} selected={} total={}",
+            scroll,
+            selected,
+            total
+        );
     }
 
     fn selected_entry(&self) -> Option<&DirEntry> {

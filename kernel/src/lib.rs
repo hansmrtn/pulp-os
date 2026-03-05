@@ -13,6 +13,7 @@ pub mod drivers;
 pub mod error;
 pub mod kernel;
 pub mod ui;
+pub mod util;
 
 // re-export core error types at crate root
 pub use error::{Error, ErrorKind, Result, ResultExt};

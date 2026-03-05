@@ -2,9 +2,7 @@ mod epubs;
 mod images;
 mod paging;
 
-extern crate alloc;
-
-use paging::decode_utf8_char;
+pub use pulp_kernel::util::decode_utf8_char;
 
 use crate::apps::PendingSetting;
 use crate::fonts::bitmap::{self, BitmapFont};
@@ -29,10 +27,7 @@ use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
-use crate::ui::{
-    Alignment, CONTENT_TOP, HEADER_W, LOADING_H, POSITION_OVERLAY_H, POSITION_OVERLAY_W,
-    PROGRESS_H, Region, STANDARD_MARGIN, StackFmt, TITLE_Y_OFFSET,
-};
+use crate::ui::{Alignment, CONTENT_TOP, HEADER_W, Region, StackFmt, TITLE_Y_OFFSET};
 use smol_epub::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
@@ -41,7 +36,7 @@ use smol_epub::html_strip::{
 };
 use smol_epub::zip::{self, ZipIndex};
 
-pub(super) const MARGIN: u16 = STANDARD_MARGIN;
+pub(super) const MARGIN: u16 = 8;
 
 pub(super) const HEADER_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET - 2; // slightly tighter
 pub(super) const HEADER_H: u16 = 16;
@@ -84,10 +79,12 @@ pub(super) const CHAPTER_CACHE_MAX: usize = 98304;
 // images > this size are decoded on main loop via streaming SD reads
 pub(super) const PRECACHE_IMG_MAX: u32 = 30 * 1024;
 
-pub(super) const READER_PROGRESS_H: u16 = PROGRESS_H;
+pub(super) const READER_PROGRESS_H: u16 = 2;
 pub(super) const PROGRESS_Y: u16 = SCREEN_H - READER_PROGRESS_H - 1;
 pub(super) const PROGRESS_W: u16 = SCREEN_W - 2 * MARGIN;
 
+const POSITION_OVERLAY_W: u16 = 280;
+const POSITION_OVERLAY_H: u16 = 40;
 pub(super) const POSITION_OVERLAY: Region = Region::new(
     (SCREEN_W - POSITION_OVERLAY_W) / 2,
     (SCREEN_H - POSITION_OVERLAY_H) / 2,
@@ -96,6 +93,7 @@ pub(super) const POSITION_OVERLAY: Region = Region::new(
 );
 
 const LOADING_W: u16 = SCREEN_W - 2 * MARGIN - 16;
+const LOADING_H: u16 = 24;
 pub(super) const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, LOADING_W, LOADING_H);
 
 pub const QA_FONT_SIZE: u8 = 1;
@@ -105,6 +103,9 @@ pub(super) const QA_TOC: u8 = 5;
 
 pub(super) const QA_MAX: usize = 4;
 
+// reader state machine:
+// NeedBookmark -> NeedInit -> NeedOpf -> NeedToc -> NeedCache -> NeedIndex -> NeedPage -> Ready
+// Ready <-> ShowToc (toc overlay); any state -> Error on failure
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum State {
     NeedBookmark,
@@ -394,6 +395,14 @@ impl ReaderApp {
         ctx.set_loading(LOADING_REGION, lbuf.as_str(), pct);
     }
 
+    // transition to error state with consistent handling
+    fn enter_error(&mut self, ctx: &mut AppContext, e: Error) {
+        self.error = Some(e);
+        self.state = State::Error;
+        ctx.clear_loading();
+        ctx.mark_dirty(PAGE_REGION);
+    }
+
     // run one step of image work queue polling while suspended;
     // chapter caching is async and only runs during active background,
     // so this only handles the sync image recv states
@@ -480,6 +489,76 @@ impl ReaderApp {
         let mut buf = [0u8; 32];
         buf[..self.filename_len].copy_from_slice(&self.filename[..self.filename_len]);
         (buf, self.filename_len)
+    }
+
+    // Session state accessors for RTC persistence
+    #[inline]
+    pub fn filename_len(&self) -> usize {
+        self.filename_len
+    }
+
+    #[inline]
+    pub fn filename_bytes(&self) -> &[u8] {
+        &self.filename[..self.filename_len]
+    }
+
+    #[inline]
+    pub fn is_epub(&self) -> bool {
+        self.is_epub
+    }
+
+    #[inline]
+    pub fn chapter(&self) -> u16 {
+        self.epub.chapter
+    }
+
+    #[inline]
+    pub fn page(&self) -> usize {
+        self.pg.page
+    }
+
+    #[inline]
+    pub fn byte_offset(&self) -> u32 {
+        if self.pg.page < self.pg.total_pages {
+            self.pg.offsets[self.pg.page]
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub fn font_size_idx(&self) -> u8 {
+        self.book_font_size_idx
+    }
+
+    /// Restore reader state from RTC session data
+    pub fn restore_state(
+        &mut self,
+        filename: &[u8],
+        is_epub: bool,
+        chapter: u16,
+        _page: usize,
+        byte_offset: u32,
+        font_size: u8,
+    ) {
+        let len = filename.len().min(32);
+        self.filename[..len].copy_from_slice(&filename[..len]);
+        self.filename_len = len;
+        self.is_epub = is_epub;
+        self.epub.chapter = chapter;
+        self.restore_offset = if byte_offset > 0 {
+            Some(byte_offset)
+        } else {
+            None
+        };
+        self.book_font_size_idx = font_size;
+
+        log::info!(
+            "reader: restore_state file={} ch={} off={}",
+            self.name(),
+            chapter,
+            byte_offset
+        );
     }
 
     pub fn save_position(&self, bm: &mut bookmarks::BookmarkCache) {
@@ -741,24 +820,23 @@ impl App<AppId> for ReaderApp {
                     }
                     Err(e) => {
                         log::info!("reader: epub init (zip) failed: {}", e);
-                        self.error = Some(e);
-                        self.state = State::Error;
-                        ctx.clear_loading();
-                        ctx.mark_dirty(PAGE_REGION);
+                        self.enter_error(ctx, e);
                     }
                 },
 
                 State::NeedOpf => match self.epub_init_opf(k) {
                     Ok(()) => {
+                        // clamp restored chapter to valid spine range
+                        let spine_len = self.epub.spine.len();
+                        if spine_len > 0 && self.epub.chapter as usize >= spine_len {
+                            self.epub.chapter = (spine_len - 1) as u16;
+                        }
                         self.state = State::NeedToc;
                         ctx.set_loading(LOADING_REGION, "Loading", 40);
                     }
                     Err(e) => {
                         log::info!("reader: epub init (opf) failed: {}", e);
-                        self.error = Some(e);
-                        self.state = State::Error;
-                        ctx.clear_loading();
-                        ctx.mark_dirty(PAGE_REGION);
+                        self.enter_error(ctx, e);
                     }
                 },
 
@@ -830,19 +908,13 @@ impl App<AppId> for ReaderApp {
                             }
                             Err(e) => {
                                 log::info!("reader: cache ch{} failed: {}", ch, e);
-                                self.error = Some(e);
-                                self.state = State::Error;
-                                ctx.clear_loading();
-                                ctx.mark_dirty(PAGE_REGION);
+                                self.enter_error(ctx, e);
                             }
                         }
                     }
                     Err(e) => {
                         log::info!("reader: cache check failed: {}", e);
-                        self.error = Some(e);
-                        self.state = State::Error;
-                        ctx.clear_loading();
-                        ctx.mark_dirty(PAGE_REGION);
+                        self.enter_error(ctx, e);
                     }
                 },
 
@@ -860,10 +932,7 @@ impl App<AppId> for ReaderApp {
                             .epub_cache_chapter_async(k, self.epub.chapter as usize)
                             .await
                         {
-                            self.error = Some(e);
-                            self.state = State::Error;
-                            ctx.clear_loading();
-                            ctx.mark_dirty(PAGE_REGION);
+                            self.enter_error(ctx, e);
                             break;
                         }
                     }
@@ -885,12 +954,7 @@ impl App<AppId> for ReaderApp {
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
                             }
-                            Err(e) => {
-                                self.error = Some(e);
-                                self.state = State::Error;
-                                ctx.clear_loading();
-                                ctx.mark_dirty(PAGE_REGION);
-                            }
+                            Err(e) => self.enter_error(ctx, e),
                         }
                     } else {
                         self.state = State::NeedPage;
@@ -905,10 +969,7 @@ impl App<AppId> for ReaderApp {
                             match self.load_and_prefetch(k) {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    self.error = Some(e);
-                                    self.state = State::Error;
-                                    ctx.clear_loading();
-                                    ctx.mark_dirty(PAGE_REGION);
+                                    self.enter_error(ctx, e);
                                     break;
                                 }
                             }
@@ -936,10 +997,7 @@ impl App<AppId> for ReaderApp {
                             }
                             Err(e) => {
                                 log::info!("reader: load failed: {}", e);
-                                self.error = Some(e);
-                                self.state = State::Error;
-                                ctx.clear_loading();
-                                ctx.mark_dirty(PAGE_REGION);
+                                self.enter_error(ctx, e);
                             }
                         }
                     }
@@ -1458,7 +1516,7 @@ impl App<AppId> for ReaderApp {
             if filled_w > 0 {
                 Rectangle::new(
                     Point::new(MARGIN as i32, PROGRESS_Y as i32),
-                    Size::new(filled_w, PROGRESS_H as u32),
+                    Size::new(filled_w, READER_PROGRESS_H as u32),
                 )
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
                 .draw(strip)

@@ -170,6 +170,173 @@ impl AppManager {
         self.home.on_enter(&mut self.launcher.ctx, k);
     }
 
+    // collect session state to RTC memory struct before sleep
+    pub fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {
+        use crate::kernel::rtc_session::MAX_NAV_STACK;
+
+        // save navigation stack
+        session.nav_depth = self.launcher.depth() as u8;
+        for i in 0..MAX_NAV_STACK {
+            session.nav_stack[i] = if i < self.launcher.depth() {
+                self.launcher.stack_at(i) as u8
+            } else {
+                0
+            };
+        }
+
+        // save reader state
+        session.reader_filename_len = self.reader.filename_len() as u8;
+        let len = session.reader_filename_len as usize;
+        session.reader_filename[..len].copy_from_slice(self.reader.filename_bytes());
+        session.reader_is_epub = self.reader.is_epub() as u8;
+        session.reader_chapter = self.reader.chapter();
+        session.reader_page = self.reader.page() as u16;
+        session.reader_byte_offset = self.reader.byte_offset();
+        session.reader_font_size = self.reader.font_size_idx();
+
+        // save files state
+        session.files_scroll = self.files.scroll() as u16;
+        session.files_selected = self.files.selected() as u8;
+        session.files_total = self.files.total() as u16;
+
+        // save home state
+        session.home_state = self.home.state_id();
+        session.home_selected = self.home.selected() as u8;
+        session.home_bm_selected = self.home.bm_selected() as u8;
+        session.home_bm_scroll = self.home.bm_scroll() as u8;
+
+        // save settings cache
+        let ss = self.settings.system_settings();
+        session.settings_sleep_timeout = ss.sleep_timeout;
+        session.settings_ghost_clear = ss.ghost_clear_every;
+        session.settings_book_font = ss.book_font_size_idx;
+        session.settings_ui_font = ss.ui_font_size_idx;
+        session.settings_valid = 1;
+
+        log::info!(
+            "session: collected nav_depth={} active={:?}",
+            session.nav_depth,
+            self.launcher.active()
+        );
+    }
+
+    // restore session from RTC memory; returns true if successful
+    pub fn apply_session(
+        &mut self,
+        session: &crate::kernel::rtc_session::RtcSession,
+        k: &mut KernelHandle<'_>,
+    ) -> bool {
+        // validate session data
+        if session.nav_depth == 0 || session.nav_depth > 4 {
+            log::warn!("session: invalid nav_depth {}", session.nav_depth);
+            return false;
+        }
+
+        // restore navigation stack
+        self.launcher.restore_stack(
+            session.nav_depth as usize,
+            &session.nav_stack,
+            |id| match id {
+                0 => AppId::Home,
+                1 => AppId::Files,
+                2 => AppId::Reader,
+                3 => AppId::Settings,
+                _ => AppId::Home,
+            },
+        );
+
+        log::info!(
+            "session: restored nav stack depth={} active={:?}",
+            session.nav_depth,
+            self.launcher.active()
+        );
+
+        // restore home state (always in stack)
+        self.home.restore_state(
+            session.home_state,
+            session.home_selected as usize,
+            session.home_bm_selected as usize,
+            session.home_bm_scroll as usize,
+        );
+
+        // restore files state if in stack
+        if self.launcher.contains(AppId::Files) {
+            self.files.restore_state(
+                session.files_scroll as usize,
+                session.files_selected as usize,
+                session.files_total as usize,
+            );
+        }
+
+        // restore reader state if active or in stack
+        if self.launcher.active() == AppId::Reader || self.launcher.contains(AppId::Reader) {
+            let filename = &session.reader_filename[..session.reader_filename_len as usize];
+            self.reader.restore_state(
+                filename,
+                session.reader_is_epub != 0,
+                session.reader_chapter,
+                session.reader_page as usize,
+                session.reader_byte_offset,
+                session.reader_font_size,
+            );
+        }
+
+        // propagate fonts before entering apps
+        self.propagate_fonts();
+
+        // enter apps in stack order (bottom to top)
+        // Home is always at bottom
+        self.home.on_enter(&mut self.launcher.ctx, k);
+
+        // for apps above Home, call on_suspend for suspended ones, on_enter for active
+        let depth = self.launcher.depth();
+        for i in 1..depth {
+            let app_id = self.launcher.stack_at(i);
+            let is_active = i == depth - 1;
+
+            match app_id {
+                AppId::Files => {
+                    if is_active {
+                        self.files.on_enter(&mut self.launcher.ctx, k);
+                    } else {
+                        // Files was pushed then another app pushed on top
+                        self.files.on_enter(&mut self.launcher.ctx, k);
+                        self.files.on_suspend();
+                    }
+                }
+                AppId::Reader => {
+                    if is_active {
+                        // set message for reader to know filename
+                        let filename =
+                            &session.reader_filename[..session.reader_filename_len as usize];
+                        self.launcher.ctx.set_message(filename);
+                        self.reader.on_enter(&mut self.launcher.ctx, k);
+                    }
+                }
+                AppId::Settings => {
+                    if is_active {
+                        self.settings.on_enter(&mut self.launcher.ctx, k);
+                    }
+                }
+                _ => {}
+            }
+
+            // suspend apps that aren't the top
+            if !is_active {
+                match app_id {
+                    AppId::Home => self.home.on_suspend(),
+                    AppId::Files => {} // already handled above
+                    _ => {}
+                }
+            }
+        }
+
+        // mark full redraw needed
+        self.launcher.ctx.request_full_redraw();
+
+        true
+    }
+
     // power-button long-press must be intercepted by the scheduler
     // before calling this method
     pub fn dispatch_event(&mut self, hw_event: Event, bm_cache: &mut BookmarkCache) -> Transition {
@@ -465,6 +632,18 @@ impl AppLayer for AppManager {
 
     fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
         AppManager::enter_initial(self, k);
+    }
+
+    fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {
+        AppManager::collect_session(self, session);
+    }
+
+    fn apply_session(
+        &mut self,
+        session: &crate::kernel::rtc_session::RtcSession,
+        k: &mut KernelHandle<'_>,
+    ) -> bool {
+        AppManager::apply_session(self, session, k)
     }
 
     fn needs_special_mode(&self) -> bool {

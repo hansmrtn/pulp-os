@@ -28,6 +28,8 @@ const BM_MARGIN: u16 = 8;
 const BM_HEADER_GAP: u16 = 4;
 const BM_BOTTOM: u16 = SCREEN_H - BUTTON_BAR_H;
 
+const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
+
 fn compute_item_regions(heading_line_h: u16) -> [Region; MAX_ITEMS] {
     let item_y = CONTENT_TOP + 8 + heading_line_h + TITLE_ITEM_GAP;
     [
@@ -39,7 +41,7 @@ fn compute_item_regions(heading_line_h: u16) -> [Region; MAX_ITEMS] {
     ]
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum HomeState {
     Menu,
     ShowBookmarks,
@@ -98,6 +100,55 @@ impl HomeApp {
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
         self.item_regions = compute_item_regions(self.ui_fonts.heading.line_height);
+    }
+
+    // Session state accessors for RTC persistence
+    #[inline]
+    pub fn state_id(&self) -> u8 {
+        match self.state {
+            HomeState::Menu => 0,
+            HomeState::ShowBookmarks => 1,
+        }
+    }
+
+    #[inline]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    #[inline]
+    pub fn bm_selected(&self) -> usize {
+        self.bm_selected
+    }
+
+    #[inline]
+    pub fn bm_scroll(&self) -> usize {
+        self.bm_scroll
+    }
+
+    /// Restore home state from RTC session data
+    pub fn restore_state(
+        &mut self,
+        state_id: u8,
+        selected: usize,
+        bm_selected: usize,
+        bm_scroll: usize,
+    ) {
+        self.state = match state_id {
+            1 => HomeState::ShowBookmarks,
+            _ => HomeState::Menu,
+        };
+        self.selected = selected;
+        self.bm_selected = bm_selected;
+        self.bm_scroll = bm_scroll;
+        if self.state == HomeState::ShowBookmarks {
+            self.needs_load_bookmarks = true;
+        }
+        log::info!(
+            "home: restore_state state={:?} selected={}",
+            self.state,
+            selected
+        );
     }
 
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
@@ -197,24 +248,14 @@ impl App<AppId> for HomeApp {
         ctx.clear_message();
         self.state = HomeState::Menu;
         self.selected = 0;
-        ctx.mark_dirty(Region::new(
-            0,
-            CONTENT_TOP,
-            SCREEN_W,
-            SCREEN_H - CONTENT_TOP,
-        ));
+        ctx.mark_dirty(CONTENT_REGION);
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.state = HomeState::Menu;
         self.selected = 0;
         self.needs_load_recent = true;
-        ctx.mark_dirty(Region::new(
-            0,
-            CONTENT_TOP,
-            SCREEN_W,
-            SCREEN_H - CONTENT_TOP,
-        ));
+        ctx.mark_dirty(CONTENT_REGION);
     }
 
     async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {

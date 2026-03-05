@@ -23,7 +23,7 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::config::WifiConfig;
 use crate::kernel::tasks;
 use crate::ui::{
-    Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, FOOTER_Y, LARGE_MARGIN, Region, stack_fmt,
+    Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, LARGE_MARGIN, Region, stack_fmt,
 };
 
 const HEADING_X: u16 = LARGE_MARGIN;
@@ -32,6 +32,7 @@ const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;
 const BODY_X: u16 = 24;
 const BODY_W: u16 = SCREEN_W - BODY_X * 2;
 const BODY_LINE_GAP: u16 = 10;
+const FOOTER_Y: u16 = SCREEN_H - 60;
 
 const HTTP_200_HTML: &[u8] =
     b"HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";

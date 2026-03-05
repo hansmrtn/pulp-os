@@ -13,6 +13,9 @@ use embedded_graphics_core::pixelcolor::BinaryColor;
 use crate::drivers::strip::StripBuffer;
 use crate::ui::{Alignment, Region};
 
+// re-export UTF-8 iterator from kernel util for convenience
+pub use pulp_kernel::util::Utf8Iter;
+
 pub const FIRST_CHAR: u8 = 0x20;
 pub const LAST_CHAR: u8 = 0x7E;
 pub const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize;
@@ -66,7 +69,7 @@ pub struct ResolvedGlyph<'a> {
 impl BitmapFont {
     // look up a character, return glyph metrics
     // ascii: direct array index; extended: binary search
-    // unknown chars fall back to space glyph (index 0)
+    // unknown chars fall back to '?' glyph
     #[inline]
     pub fn glyph(&self, ch: char) -> &BitmapGlyph {
         self.resolve(ch).glyph
@@ -243,69 +246,4 @@ fn blit_glyph(
     );
 }
 
-// minimal utf-8 byte-slice iterator
-// decodes &[u8] one char at a time; invalid sequences replaced with U+FFFD
-// (which renders as '?' via the font fallback)
-pub struct Utf8Iter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Utf8Iter<'a> {
-    #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-}
-
-impl Iterator for Utf8Iter<'_> {
-    type Item = char;
-
-    fn next(&mut self) -> Option<char> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
-
-        let b0 = self.data[self.pos];
-
-        // single-byte ascii
-        if b0 < 0x80 {
-            self.pos += 1;
-            return Some(b0 as char);
-        }
-
-        // determine expected sequence length from lead byte
-        let (mut cp, expected) = if b0 < 0xC0 {
-            // stray continuation byte
-            self.pos += 1;
-            return Some('\u{FFFD}');
-        } else if b0 < 0xE0 {
-            ((b0 as u32) & 0x1F, 2)
-        } else if b0 < 0xF0 {
-            ((b0 as u32) & 0x0F, 3)
-        } else if b0 < 0xF8 {
-            ((b0 as u32) & 0x07, 4)
-        } else {
-            self.pos += 1;
-            return Some('\u{FFFD}');
-        };
-
-        if self.pos + expected > self.data.len() {
-            self.pos = self.data.len();
-            return Some('\u{FFFD}');
-        }
-
-        // decode continuation bytes
-        for i in 1..expected {
-            let cont = self.data[self.pos + i];
-            if cont & 0xC0 != 0x80 {
-                self.pos += i;
-                return Some('\u{FFFD}');
-            }
-            cp = (cp << 6) | (cont as u32 & 0x3F);
-        }
-
-        self.pos += expected;
-        Some(char::from_u32(cp).unwrap_or('\u{FFFD}'))
-    }
-}
+// UTF-8 iteration is provided by pulp_kernel::util::Utf8Iter (re-exported above)

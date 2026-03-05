@@ -6,23 +6,21 @@
 // (small images); both epub_find_and_dispatch_image (background scan)
 // and dispatch_one_image_in_chapter (nearby prefetch) call through it
 
-extern crate alloc;
-
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use smol_epub::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub;
 use smol_epub::html_strip::{IMG_REF, MARKER};
 use smol_epub::zip::{self, ZipIndex};
+use smol_epub::DecodedImage;
 
 use crate::error::{Error, ErrorKind};
-use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
+use crate::kernel::KernelHandle;
 
 use super::{
-    IMAGE_DISPLAY_H, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp, TEXT_AREA_H, TEXT_W,
+    ReaderApp, IMAGE_DISPLAY_H, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, TEXT_AREA_H, TEXT_W,
 };
 
 // result of scanning a chapter for the next uncached image
@@ -300,7 +298,10 @@ impl ReaderApp {
         ch: usize,
         start_offset: usize,
     ) -> crate::error::Result<ScanResult> {
-        if ch >= cache::MAX_CACHE_CHAPTERS || !self.epub.ch_cached[ch] {
+        if ch >= self.epub.spine.len()
+            || ch >= cache::MAX_CACHE_CHAPTERS
+            || !self.epub.ch_cached[ch]
+        {
             return Ok(ScanResult::NoneFound);
         }
         let ch_size = self.epub.chapter_sizes[ch] as usize;

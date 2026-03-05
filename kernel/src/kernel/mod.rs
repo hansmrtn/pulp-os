@@ -12,6 +12,7 @@ pub mod config;
 pub mod console;
 pub mod dir_cache;
 pub mod handle;
+pub mod rtc_session;
 pub mod scheduler;
 pub mod tasks;
 pub mod timing;

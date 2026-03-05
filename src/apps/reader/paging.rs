@@ -10,8 +10,8 @@ use crate::fonts;
 use crate::kernel::KernelHandle;
 
 use super::{
-    IMAGE_DISPLAY_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
-    ReaderApp, State, TEXT_W,
+    decode_utf8_char, LineSpan, ReaderApp, State, IMAGE_DISPLAY_H, INDENT_PX, LINES_PER_PAGE,
+    MAX_PAGES, NO_PREFETCH, PAGE_BUF, TEXT_W,
 };
 
 impl ReaderApp {
@@ -352,31 +352,8 @@ impl ReaderApp {
     }
 }
 
-// decode one utf-8 character starting at buf[pos]
-// returns (char, byte_length); malformed input yields ('\u{FFFD}', consumed)
-pub(super) fn decode_utf8_char(buf: &[u8], pos: usize) -> (char, usize) {
-    let b0 = buf[pos];
-    let (mut cp, expected) = if b0 < 0xE0 {
-        ((b0 as u32) & 0x1F, 2)
-    } else if b0 < 0xF0 {
-        ((b0 as u32) & 0x0F, 3)
-    } else {
-        ((b0 as u32) & 0x07, 4)
-    };
-    let len = buf.len();
-    if pos + expected > len {
-        return ('\u{FFFD}', len - pos);
-    }
-    for i in 1..expected {
-        let cont = buf[pos + i];
-        if cont & 0xC0 != 0x80 {
-            return ('\u{FFFD}', i);
-        }
-        cp = (cp << 6) | (cont as u32 & 0x3F);
-    }
-    let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
-    (ch, expected)
-}
+// UTF-8 decoding is provided by pulp_kernel::util::decode_utf8_char
+// (re-exported via super::decode_utf8_char)
 
 pub(super) fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {
     if end > start && buf[end - 1] == b'\r' {
@@ -402,11 +379,11 @@ pub(super) fn wrap_proportional(
 ) -> (usize, usize) {
     let max_l = max_lines.min(lines.len());
     let base_max_w = max_width_px;
-    let mut lc: usize = 0;
-    let mut ls: usize = 0;
-    let mut px: u32 = 0;
-    let mut sp: usize = 0;
-    let mut sp_px: u32 = 0;
+    let mut line_count: usize = 0;
+    let mut line_start: usize = 0;
+    let mut cursor_x: u32 = 0;
+    let mut last_space: usize = 0;
+    let mut cursor_at_space: u32 = 0;
 
     let mut bold = false;
     let mut italic = false;
@@ -429,15 +406,15 @@ pub(super) fn wrap_proportional(
 
     macro_rules! emit {
         ($start:expr, $end:expr) => {
-            if lc < max_l {
+            if line_count < max_l {
                 let e = trim_trailing_cr(buf, $start, $end);
-                lines[lc] = LineSpan {
+                lines[line_count] = LineSpan {
                     start: ($start) as u16,
                     len: (e - ($start)) as u16,
                     flags: LineSpan::pack_flags(bold, italic, heading),
                     indent,
                 };
-                lc += 1;
+                line_count += 1;
             }
         };
     }
@@ -451,46 +428,46 @@ pub(super) fn wrap_proportional(
                 let path_len = buf[i + 2] as usize;
                 let path_start = i + 3;
                 if path_start + path_len <= n && path_len > 0 {
-                    if ls < i {
-                        emit!(ls, i);
-                        if lc >= max_l {
-                            return (i, lc);
+                    if line_start < i {
+                        emit!(line_start, i);
+                        if line_count >= max_l {
+                            return (i, line_count);
                         }
                     }
 
                     let line_h = fonts.line_height(fonts::Style::Regular);
                     let img_lines = (IMAGE_DISPLAY_H / line_h).max(1) as usize;
 
-                    if lc < max_l {
-                        lines[lc] = LineSpan {
+                    if line_count < max_l {
+                        lines[line_count] = LineSpan {
                             start: path_start as u16,
                             len: path_len as u16,
                             flags: LineSpan::FLAG_IMAGE,
                             indent: 0,
                         };
-                        lc += 1;
+                        line_count += 1;
                     }
 
                     for _ in 1..img_lines {
-                        if lc >= max_l {
+                        if line_count >= max_l {
                             break;
                         }
-                        lines[lc] = LineSpan {
+                        lines[line_count] = LineSpan {
                             start: 0,
                             len: 0,
                             flags: LineSpan::FLAG_IMAGE,
                             indent: 0,
                         };
-                        lc += 1;
+                        line_count += 1;
                     }
 
                     i = path_start + path_len;
-                    ls = i;
-                    px = 0;
-                    sp = ls;
-                    sp_px = 0;
-                    if lc >= max_l {
-                        return (ls, lc);
+                    line_start = i;
+                    cursor_x = 0;
+                    last_space = line_start;
+                    cursor_at_space = 0;
+                    if line_count >= max_l {
+                        return (line_start, line_count);
                     }
                     continue;
                 }
@@ -523,13 +500,13 @@ pub(super) fn wrap_proportional(
         }
 
         if b == b'\n' {
-            emit!(ls, i);
-            ls = i + 1;
-            px = 0;
-            sp = ls;
-            sp_px = 0;
-            if lc >= max_l {
-                return (ls, lc);
+            emit!(line_start, i);
+            line_start = i + 1;
+            cursor_x = 0;
+            last_space = line_start;
+            cursor_at_space = 0;
+            if line_count >= max_l {
+                return (line_start, line_count);
             }
             i += 1;
             continue;
@@ -542,8 +519,8 @@ pub(super) fn wrap_proportional(
 
             // soft hyphen (U+00AD): zero-width break opportunity
             if ch == '\u{00AD}' {
-                sp = i + seq_len;
-                sp_px = px;
+                last_space = i + seq_len;
+                cursor_at_space = cursor_x;
                 i += seq_len;
                 continue;
             }
@@ -551,17 +528,17 @@ pub(super) fn wrap_proportional(
             // NBSP and regular spaces: word-break opportunity
             if is_wrap_space(ch) {
                 let sty = current_style(bold, italic, heading);
-                px += fonts.advance(' ', sty) as u32;
-                sp = i + seq_len;
-                sp_px = px;
-                if px > max_w {
-                    emit!(ls, i);
-                    ls = i + seq_len;
-                    px = 0;
-                    sp = ls;
-                    sp_px = 0;
-                    if lc >= max_l {
-                        return (ls, lc);
+                cursor_x += fonts.advance(' ', sty) as u32;
+                last_space = i + seq_len;
+                cursor_at_space = cursor_x;
+                if cursor_x > max_w {
+                    emit!(line_start, i);
+                    line_start = i + seq_len;
+                    cursor_x = 0;
+                    last_space = line_start;
+                    cursor_at_space = 0;
+                    if line_count >= max_l {
+                        return (line_start, line_count);
                     }
                 }
                 i += seq_len;
@@ -570,21 +547,21 @@ pub(super) fn wrap_proportional(
 
             let sty = current_style(bold, italic, heading);
             let adv = fonts.advance(ch, sty) as u32;
-            px += adv;
-            if px > max_w {
-                if sp > ls {
-                    emit!(ls, sp);
-                    px -= sp_px;
-                    ls = sp;
+            cursor_x += adv;
+            if cursor_x > max_w {
+                if last_space > line_start {
+                    emit!(line_start, last_space);
+                    cursor_x -= cursor_at_space;
+                    line_start = last_space;
                 } else {
-                    emit!(ls, i);
-                    ls = i;
-                    px = adv;
+                    emit!(line_start, i);
+                    line_start = i;
+                    cursor_x = adv;
                 }
-                sp = ls;
-                sp_px = 0;
-                if lc >= max_l {
-                    return (ls, lc);
+                last_space = line_start;
+                cursor_at_space = 0;
+                if line_count >= max_l {
+                    return (line_start, line_count);
                 }
             }
             i += seq_len;
@@ -600,56 +577,56 @@ pub(super) fn wrap_proportional(
         let adv = fonts.advance_byte(b, sty) as u32;
 
         if b == b' ' {
-            px += adv;
-            sp = i + 1;
-            sp_px = px;
-            if px > max_w {
-                emit!(ls, i);
-                ls = i + 1;
-                px = 0;
-                sp = ls;
-                sp_px = 0;
-                if lc >= max_l {
-                    return (ls, lc);
+            cursor_x += adv;
+            last_space = i + 1;
+            cursor_at_space = cursor_x;
+            if cursor_x > max_w {
+                emit!(line_start, i);
+                line_start = i + 1;
+                cursor_x = 0;
+                last_space = line_start;
+                cursor_at_space = 0;
+                if line_count >= max_l {
+                    return (line_start, line_count);
                 }
             }
             i += 1;
             continue;
         }
 
-        px += adv;
-        if px > max_w {
-            if sp > ls {
-                emit!(ls, sp);
-                px -= sp_px;
-                ls = sp;
+        cursor_x += adv;
+        if cursor_x > max_w {
+            if last_space > line_start {
+                emit!(line_start, last_space);
+                cursor_x -= cursor_at_space;
+                line_start = last_space;
             } else {
-                emit!(ls, i);
-                ls = i;
-                px = adv;
+                emit!(line_start, i);
+                line_start = i;
+                cursor_x = adv;
             }
-            sp = ls;
-            sp_px = 0;
-            if lc >= max_l {
-                return (ls, lc);
+            last_space = line_start;
+            cursor_at_space = 0;
+            if line_count >= max_l {
+                return (line_start, line_count);
             }
         }
 
         i += 1;
     }
 
-    if ls < n && lc < max_l {
-        let e = trim_trailing_cr(buf, ls, n);
-        if e > ls {
-            lines[lc] = LineSpan {
-                start: ls as u16,
-                len: (e - ls) as u16,
+    if line_start < n && line_count < max_l {
+        let e = trim_trailing_cr(buf, line_start, n);
+        if e > line_start {
+            lines[line_count] = LineSpan {
+                start: line_start as u16,
+                len: (e - line_start) as u16,
                 flags: LineSpan::pack_flags(bold, italic, heading),
                 indent,
             };
-            lc += 1;
+            line_count += 1;
         }
     }
 
-    (n, lc)
+    (n, line_count)
 }

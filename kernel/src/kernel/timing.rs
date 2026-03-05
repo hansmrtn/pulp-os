@@ -1,8 +1,8 @@
 // timing constants for the kernel scheduler and tasks
 //
-// timing values that control polling intervals, debouncing, 
+// timing values that control polling intervals, debouncing,
 // coalescing, and housekeeping. some of these may
-// become runtime-configurable settings in the future, idk
+// may become runtime-configurable in the future
 
 // main scheduler tick interval (ms)
 // controls how often the event loop wakes to check for work
@@ -36,8 +36,8 @@ pub const SD_CHECK_INTERVAL_SECS: u64 = 30;
 // bookmark flush interval (seconds)
 pub const BOOKMARK_FLUSH_INTERVAL_SECS: u64 = 30;
 
-// dookmark flush stagger delay (seconds)
-// dffset from SD check to avoid simultaneous SD operations
+// bookmark flush stagger delay (seconds)
+// offset from sd check to avoid simultaneous sd operations
 pub const BOOKMARK_FLUSH_STAGGER_SECS: u64 = 2;
 
 // initial housekeeping delay (seconds)

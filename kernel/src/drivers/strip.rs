@@ -196,6 +196,7 @@ impl StripBuffer {
         gy: i32,
         black: bool,
     ) {
+        // window bounds (wx, wy = origin; wx2, wy2 = extent; rb = row bytes)
         let wx = self.win_x as i32;
         let wy = self.win_y as i32;
         let wx2 = wx + self.win_w as i32;

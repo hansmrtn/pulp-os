@@ -13,14 +13,12 @@ use crate::kernel::config::{
     SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig, parse_settings_txt, write_settings_txt,
 };
 use crate::ui::{
-    Alignment, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, MENU_ROW_GAP, MENU_ROW_H,
-    Region, SECTION_GAP, StackFmt, TITLE_Y, wrap_next, wrap_prev,
+    Alignment, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region, SECTION_GAP,
+    StackFmt, TITLE_Y, wrap_next, wrap_prev,
 };
 
-// ── Settings layout constants ───────────────────────────────────
-
-const ROW_H: u16 = MENU_ROW_H;
-const ROW_GAP: u16 = MENU_ROW_GAP;
+const ROW_H: u16 = 40;
+const ROW_GAP: u16 = 6;
 const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
 
 const LABEL_X: u16 = LARGE_MARGIN;

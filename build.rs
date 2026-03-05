@@ -4,6 +4,12 @@ fn main() {
     generate_bitmap_fonts();
 }
 
+fn hint(msg: &str) {
+    eprintln!();
+    eprintln!("hint: {msg}");
+    eprintln!();
+}
+
 fn linker_be_nice() {
     let args: Vec<String> = std::env::args().collect();
     // --error-handling-script passes two args: kind and symbol
@@ -13,32 +19,16 @@ fn linker_be_nice() {
 
         match kind.as_str() {
             "undefined-symbol" => match what.as_str() {
-                what if what.starts_with("_defmt_") => {
-                    eprintln!();
-                    eprintln!(
-                        "hint: `defmt` not found - make sure `defmt.x` is added as a linker script and you have included `use defmt_rtt as _;`"
-                    );
-                    eprintln!();
-                }
-                "_stack_start" => {
-                    eprintln!();
-                    eprintln!("hint: is the linker script `linkall.x` missing?");
-                    eprintln!();
-                }
-                what if what.starts_with("esp_rtos_") => {
-                    eprintln!();
-                    eprintln!(
-                        "hint: `esp-radio` has no scheduler enabled. make sure you have initialized `esp-rtos` or provided an external scheduler."
-                    );
-                    eprintln!();
-                }
-                "embedded_test_linker_file_not_added_to_rustflags" => {
-                    eprintln!();
-                    eprintln!(
-                        "hint: `embedded-test` not found - make sure `embedded-test.x` is added as a linker script for tests"
-                    );
-                    eprintln!();
-                }
+                what if what.starts_with("_defmt_") => hint(
+                    "`defmt` not found - make sure `defmt.x` is added as a linker script and you have included `use defmt_rtt as _;`"
+                ),
+                "_stack_start" => hint("is the linker script `linkall.x` missing?"),
+                what if what.starts_with("esp_rtos_") => hint(
+                    "`esp-radio` has no scheduler enabled. make sure you have initialized `esp-rtos` or provided an external scheduler."
+                ),
+                "embedded_test_linker_file_not_added_to_rustflags" => hint(
+                    "`embedded-test` not found - make sure `embedded-test.x` is added as a linker script for tests"
+                ),
                 "free"
                 | "malloc"
                 | "calloc"
@@ -46,13 +36,9 @@ fn linker_be_nice() {
                 | "malloc_internal"
                 | "realloc_internal"
                 | "calloc_internal"
-                | "free_internal" => {
-                    eprintln!();
-                    eprintln!(
-                        "hint: did you forget the `esp-alloc` dependency or didn't enable the `compat` feature on it?"
-                    );
-                    eprintln!();
-                }
+                | "free_internal" => hint(
+                    "did you forget the `esp-alloc` dependency or didn't enable the `compat` feature on it?"
+                ),
                 _ => (),
             },
             _ => {
