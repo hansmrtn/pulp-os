@@ -18,20 +18,29 @@ use crate::drivers::strip::StripBuffer;
 use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::kernel::KernelHandle;
-use crate::ui::{Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, Region};
+use crate::ui::{
+    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W,
+    LARGE_MARGIN, LIST_ROW_GAP, LIST_ROW_H, Region, SECTION_GAP, STATUS_W, STATUS_X,
+    TITLE_Y_OFFSET,
+};
 use smol_epub::epub::{self, EpubMeta, EpubSpine};
 use smol_epub::zip::ZipIndex;
 
 const PAGE_SIZE: usize = 7;
 
-const LIST_X: u16 = 16;
-const LIST_W: u16 = 448;
+const LIST_X: u16 = LARGE_MARGIN;
+const LIST_W: u16 = FULL_CONTENT_W;
 
-const STATUS_REGION: Region = Region::new(320, CONTENT_TOP + 8, 144, 28);
+const TITLE_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET;
 
-const ROW_H: u16 = 52;
-const ROW_GAP: u16 = 4; // gap between rows (border-to-border)
-const HEADER_LIST_GAP: u16 = 8; // gap between heading bottom and first row
+const FILES_STATUS_Y: u16 = TITLE_Y;
+const FILES_STATUS_H: u16 = 28;
+const STATUS_REGION: Region = Region::new(STATUS_X, FILES_STATUS_Y, STATUS_W, FILES_STATUS_H);
+
+const ROW_H: u16 = LIST_ROW_H;
+const ROW_GAP: u16 = LIST_ROW_GAP;
+
+const HEADER_LIST_GAP: u16 = SECTION_GAP;
 
 impl Default for FilesApp {
     fn default() -> Self {
@@ -69,7 +78,7 @@ impl FilesApp {
             stale_cache: false,
             error: None,
             ui_fonts: uf,
-            list_y: CONTENT_TOP + 8 + uf.heading.line_height + HEADER_LIST_GAP,
+            list_y: TITLE_Y + uf.heading.line_height + HEADER_LIST_GAP,
             title_scan_idx: 0,
             title_scanning: false,
             title_reload: false,
@@ -78,7 +87,7 @@ impl FilesApp {
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
-        self.list_y = CONTENT_TOP + 8 + self.ui_fonts.heading.line_height + HEADER_LIST_GAP;
+        self.list_y = TITLE_Y + self.ui_fonts.heading.line_height + HEADER_LIST_GAP;
     }
 
     fn selected_entry(&self) -> Option<&DirEntry> {
@@ -308,8 +317,8 @@ impl App<AppId> for FilesApp {
     fn draw(&self, strip: &mut StripBuffer) {
         let header_region = Region::new(
             LIST_X,
-            CONTENT_TOP + 8,
-            300,
+            TITLE_Y,
+            HEADER_W,
             self.ui_fonts.heading.line_height,
         );
         BitmapLabel::new(header_region, "Files", self.ui_fonts.heading)

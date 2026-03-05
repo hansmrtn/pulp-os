@@ -22,16 +22,16 @@ use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::config::WifiConfig;
 use crate::kernel::tasks;
-use crate::ui::{Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, Region, stack_fmt};
+use crate::ui::{
+    Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, FOOTER_Y, LARGE_MARGIN, Region, stack_fmt,
+};
 
-const HEADING_X: u16 = 16;
+const HEADING_X: u16 = LARGE_MARGIN;
 const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;
 
 const BODY_X: u16 = 24;
 const BODY_W: u16 = SCREEN_W - BODY_X * 2;
 const BODY_LINE_GAP: u16 = 10;
-
-const FOOTER_Y: u16 = SCREEN_H - 60;
 
 const HTTP_200_HTML: &[u8] =
     b"HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
@@ -58,6 +58,23 @@ const MDNS_RESPONSE_LEN: usize = 38;
 
 const MAX_BOUNDARY_LEN: usize = 120;
 const WORK_BUF_SIZE: usize = 2048;
+
+// TCP buffer sizes 
+
+const TCP_RX_BUF_SIZE: usize = 2048;
+const TCP_TX_BUF_SIZE: usize = 1536;
+
+const HTTP_HEADER_BUF_SIZE: usize = 1024;
+
+const DIR_LIST_MAX: usize = 64;
+
+// HTTP timing 
+const HTTP_TIMEOUT_SECS: u64 = 30;
+const ACCEPT_RETRY_MS: u64 = 200;
+
+const SOCKET_CLOSE_DELAY_MS: u64 = 50;
+
+const MDNS_BIND_RETRY_MS: u64 = 100;
 
 enum ServerEvent {
     Nothing,
@@ -276,8 +293,8 @@ pub async fn run_upload_mode(
     )
     .await;
 
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 1536];
+    let mut rx_buf = [0u8; TCP_RX_BUF_SIZE];
+    let mut tx_buf = [0u8; TCP_TX_BUF_SIZE];
 
     loop {
         let inner_result = match select(
@@ -333,7 +350,7 @@ async fn serve_one_request(
 where
 {
     let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
-    socket.set_timeout(Some(Duration::from_secs(30)));
+    socket.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
 
     if socket
         .accept(IpListenEndpoint {
@@ -343,11 +360,11 @@ where
         .await
         .is_err()
     {
-        Timer::after(Duration::from_millis(200)).await;
+        Timer::after(Duration::from_millis(ACCEPT_RETRY_MS)).await;
         return ServerEvent::Nothing;
     }
 
-    let mut hdr = [0u8; 1024];
+    let mut hdr = [0u8; HTTP_HEADER_BUF_SIZE];
     let mut hdr_len = 0usize;
 
     loop {
@@ -409,7 +426,7 @@ where
     if is_get && path == b"/files" {
         let _ = socket.write_all(HTTP_200_JSON).await;
 
-        let mut entries = [storage::DirEntry::EMPTY; 64];
+        let mut entries = [storage::DirEntry::EMPTY; DIR_LIST_MAX];
         let count = match storage::list_root_files(sd, &mut entries) {
             Ok(n) => n,
             Err(_) => {
@@ -821,9 +838,9 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
 }
 
 async fn close_socket(socket: &mut TcpSocket<'_>) {
-    Timer::after(Duration::from_millis(50)).await;
+    Timer::after(Duration::from_millis(SOCKET_CLOSE_DELAY_MS)).await;
     socket.close();
-    Timer::after(Duration::from_millis(50)).await;
+    Timer::after(Duration::from_millis(SOCKET_CLOSE_DELAY_MS)).await;
     socket.abort();
 }
 
@@ -845,7 +862,7 @@ async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
     let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
 
     if socket.bind(MDNS_PORT).is_err() {
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(MDNS_BIND_RETRY_MS)).await;
         return;
     }
 

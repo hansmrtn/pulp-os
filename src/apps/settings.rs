@@ -9,22 +9,28 @@ use crate::fonts;
 use crate::fonts::max_size_idx;
 use crate::kernel::KernelHandle;
 use crate::kernel::config::{
-    self, SystemSettings, WifiConfig, parse_settings_txt, write_settings_txt,
+    self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR,
+    SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig, parse_settings_txt, write_settings_txt,
 };
-use crate::ui::{Alignment, BitmapLabel, CONTENT_TOP, Region, StackFmt, wrap_next, wrap_prev};
+use crate::ui::{
+    Alignment, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, MENU_ROW_GAP, MENU_ROW_H,
+    Region, SECTION_GAP, StackFmt, TITLE_Y, wrap_next, wrap_prev,
+};
 
-const ROW_H: u16 = 40;
-const ROW_GAP: u16 = 6;
+// ── Settings layout constants ───────────────────────────────────
+
+const ROW_H: u16 = MENU_ROW_H;
+const ROW_GAP: u16 = MENU_ROW_GAP;
 const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
 
-const LABEL_X: u16 = 16;
+const LABEL_X: u16 = LARGE_MARGIN;
 const LABEL_W: u16 = 160;
 const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
-const VALUE_W: u16 = 296;
+const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP; // fills remaining width
 
 const NUM_ITEMS: usize = 4;
-const HEADING_ITEMS_GAP: u16 = 8;
+const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 impl Default for SettingsApp {
     fn default() -> Self {
@@ -52,13 +58,13 @@ impl SettingsApp {
             loaded: false,
             save_needed: false,
             ui_fonts: uf,
-            items_top: CONTENT_TOP + 4 + uf.heading.line_height + HEADING_ITEMS_GAP,
+            items_top: TITLE_Y + uf.heading.line_height + HEADING_ITEMS_GAP,
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
-        self.items_top = CONTENT_TOP + 4 + self.ui_fonts.heading.line_height + HEADING_ITEMS_GAP;
+        self.items_top = TITLE_Y + self.ui_fonts.heading.line_height + HEADING_ITEMS_GAP;
     }
 
     pub fn system_settings(&self) -> &SystemSettings {
@@ -166,14 +172,17 @@ impl SettingsApp {
         match self.selected {
             0 => {
                 self.settings.sleep_timeout = match self.settings.sleep_timeout {
-                    0 => 5,
-                    t if t >= 120 => 120,
-                    t => t + 5,
+                    0 => SLEEP_TIMEOUT_STEP,
+                    t if t >= MAX_SLEEP_TIMEOUT => MAX_SLEEP_TIMEOUT,
+                    t => t + SLEEP_TIMEOUT_STEP,
                 };
             }
             1 => {
-                self.settings.ghost_clear_every =
-                    self.settings.ghost_clear_every.saturating_add(5).min(100);
+                self.settings.ghost_clear_every = self
+                    .settings
+                    .ghost_clear_every
+                    .saturating_add(GHOST_CLEAR_STEP)
+                    .min(MAX_GHOST_CLEAR);
             }
             2 => {
                 if self.settings.book_font_size_idx < max_size_idx() {
@@ -194,13 +203,16 @@ impl SettingsApp {
         match self.selected {
             0 => {
                 self.settings.sleep_timeout = match self.settings.sleep_timeout {
-                    0..=5 => 0,
-                    t => t - 5,
+                    t if t <= SLEEP_TIMEOUT_STEP => 0,
+                    t => t - SLEEP_TIMEOUT_STEP,
                 };
             }
             1 => {
-                self.settings.ghost_clear_every =
-                    self.settings.ghost_clear_every.saturating_sub(5).max(5);
+                self.settings.ghost_clear_every = self
+                    .settings
+                    .ghost_clear_every
+                    .saturating_sub(GHOST_CLEAR_STEP)
+                    .max(MIN_GHOST_CLEAR);
             }
             2 => {
                 if self.settings.book_font_size_idx > 0 {
@@ -316,7 +328,8 @@ impl App<AppId> for SettingsApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        let title_region = Region::new(16, CONTENT_TOP + 4, 448, self.ui_fonts.heading.line_height);
+        let title_region =
+            Region::new(LARGE_MARGIN, TITLE_Y, FULL_CONTENT_W, self.ui_fonts.heading.line_height);
         BitmapLabel::new(title_region, "Settings", self.ui_fonts.heading)
             .alignment(Alignment::CenterLeft)
             .draw(strip)

@@ -14,6 +14,7 @@ pub mod dir_cache;
 pub mod handle;
 pub mod scheduler;
 pub mod tasks;
+pub mod timing;
 pub mod wake;
 pub mod work_queue;
 

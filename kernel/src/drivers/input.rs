@@ -1,27 +1,22 @@
 // debounced input from ADC ladders and power button
 // one button at a time (ladder hw limitation)
-// 15 ms debounce, 1 s long press, 150 ms repeat
-// ADC reads oversampled 4x to reject noise (~40 us per channel)
+// ADC reads oversampled to reject noise (~40 us per channel)
 
 use esp_hal::time::{Duration, Instant};
 
+use crate::board::button::{decode_ladder, Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
 use crate::board::InputHw;
-use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
+use crate::kernel::timing;
 
 macro_rules! read_averaged {
     ($adc:expr, $pin:expr) => {{
         let mut sum: u32 = 0;
-        for _ in 0..ADC_OVERSAMPLE {
+        for _ in 0..timing::ADC_OVERSAMPLE {
             sum += nb::block!($adc.read_oneshot($pin)).unwrap() as u32;
         }
-        (sum / ADC_OVERSAMPLE) as u16
+        (sum / timing::ADC_OVERSAMPLE) as u16
     }};
 }
-
-const DEBOUNCE_MS: u64 = 15;
-const LONG_PRESS_MS: u64 = 1000;
-const REPEAT_MS: u64 = 150;
-const ADC_OVERSAMPLE: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -115,7 +110,8 @@ impl InputDriver {
             self.candidate_since = now;
         }
 
-        let debounced = if now - self.candidate_since >= Duration::from_millis(DEBOUNCE_MS) {
+        let debounced = if now - self.candidate_since >= Duration::from_millis(timing::DEBOUNCE_MS)
+        {
             self.candidate
         } else {
             self.stable
@@ -140,14 +136,14 @@ impl InputDriver {
             if !self.hold_consumed {
                 let held = now - self.press_since;
 
-                if !self.long_press_fired && held >= Duration::from_millis(LONG_PRESS_MS) {
+                if !self.long_press_fired && held >= Duration::from_millis(timing::LONG_PRESS_MS) {
                     self.long_press_fired = true;
                     self.last_repeat = now;
                     return Some(Event::LongPress(btn));
                 }
 
                 if self.long_press_fired
-                    && (now - self.last_repeat) >= Duration::from_millis(REPEAT_MS)
+                    && (now - self.last_repeat) >= Duration::from_millis(timing::REPEAT_MS)
                 {
                     self.last_repeat = now;
                     return Some(Event::Repeat(btn));

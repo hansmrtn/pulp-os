@@ -5,6 +5,30 @@
 
 pub const SETTINGS_FILE: &str = "SETTINGS.TXT";
 
+// default sleep timeout in minutes
+pub const DEFAULT_SLEEP_TIMEOUT: u16 = 10;
+
+// maximum sleep timeout in minutes
+pub const MAX_SLEEP_TIMEOUT: u16 = 120;
+
+// increment step for sleep timeout adjustment
+pub const SLEEP_TIMEOUT_STEP: u16 = 5;
+
+// default ghost clear interval
+pub const DEFAULT_GHOST_CLEAR: u8 = 10;
+
+// minimum ghost clear interval
+pub const MIN_GHOST_CLEAR: u8 = 5;
+
+// maximum ghost clear interval
+pub const MAX_GHOST_CLEAR: u8 = 100;
+
+// increment step for ghost clear adjustment
+pub const GHOST_CLEAR_STEP: u8 = 5;
+
+// default font size index (0=XSmall, 1=Small, 2=Medium, 3=Large, 4=XLarge)
+pub const DEFAULT_FONT_SIZE_IDX: u8 = 2;
+
 #[derive(Clone, Copy)]
 pub struct SystemSettings {
     pub sleep_timeout: u16,     // minutes idle before sleep; 0 = never
@@ -22,10 +46,10 @@ impl Default for SystemSettings {
 impl SystemSettings {
     pub const fn defaults() -> Self {
         Self {
-            sleep_timeout: 10,
-            ghost_clear_every: 10,
-            book_font_size_idx: 2,
-            ui_font_size_idx: 2,
+            sleep_timeout: DEFAULT_SLEEP_TIMEOUT,
+            ghost_clear_every: DEFAULT_GHOST_CLEAR,
+            book_font_size_idx: DEFAULT_FONT_SIZE_IDX,
+            ui_font_size_idx: DEFAULT_FONT_SIZE_IDX,
         }
     }
 
@@ -34,13 +58,15 @@ impl SystemSettings {
     }
 
     pub fn sanitize_with_max_font(&mut self, max_font: u8) {
-        self.sleep_timeout = self.sleep_timeout.min(120);
-        self.ghost_clear_every = self.ghost_clear_every.clamp(5, 100);
+        self.sleep_timeout = self.sleep_timeout.min(MAX_SLEEP_TIMEOUT);
+        self.ghost_clear_every = self
+            .ghost_clear_every
+            .clamp(MIN_GHOST_CLEAR, MAX_GHOST_CLEAR);
         self.book_font_size_idx = self.book_font_size_idx.min(max_font);
         self.ui_font_size_idx = self.ui_font_size_idx.min(max_font);
     }
 
-    // reasonable default; distros override via sanitize_with_max_font
+    // reasonable default - override via sanitize_with_max_font
     const DEFAULT_MAX_FONT_IDX: u8 = 4;
 }
 

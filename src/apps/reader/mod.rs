@@ -29,7 +29,10 @@ use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
-use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt};
+use crate::ui::{
+    Alignment, CONTENT_TOP, HEADER_W, LOADING_H, POSITION_OVERLAY_H, POSITION_OVERLAY_W,
+    PROGRESS_H, Region, STANDARD_MARGIN, StackFmt, TITLE_Y_OFFSET,
+};
 use smol_epub::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
@@ -38,40 +41,53 @@ use smol_epub::html_strip::{
 };
 use smol_epub::zip::{self, ZipIndex};
 
-pub(super) const MARGIN: u16 = 8;
-pub(super) const HEADER_Y: u16 = CONTENT_TOP + 2;
+pub(super) const MARGIN: u16 = STANDARD_MARGIN;
+
+pub(super) const HEADER_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET - 2; // slightly tighter
 pub(super) const HEADER_H: u16 = 16;
+
 pub(super) const TEXT_Y: u16 = HEADER_Y + HEADER_H + 2;
+
 pub(super) const LINE_H: u16 = 20;
+
 pub(super) const CHARS_PER_LINE: usize = 51;
+
 pub(super) const LINES_PER_PAGE: usize = 37;
+
 pub(super) const PAGE_BUF: usize = 8192;
+
 pub(super) const MAX_PAGES: usize = 1024;
 
-pub(super) const HEADER_REGION: Region = Region::new(MARGIN, HEADER_Y, 300, HEADER_H);
-pub(super) const STATUS_REGION: Region = Region::new(308, HEADER_Y, 164, HEADER_H);
+pub(super) const HEADER_REGION: Region = Region::new(MARGIN, HEADER_Y, HEADER_W, HEADER_H);
+
+const STATUS_X: u16 = MARGIN + HEADER_W + 8;
+const STATUS_W: u16 = SCREEN_W - STATUS_X - MARGIN;
+pub(super) const STATUS_REGION: Region = Region::new(STATUS_X, HEADER_Y, STATUS_W, HEADER_H);
 
 pub(super) const PAGE_REGION: Region = Region::new(0, HEADER_Y, SCREEN_W, SCREEN_H - HEADER_Y);
 
 pub(super) const NO_PREFETCH: usize = usize::MAX;
 
 pub(super) const TEXT_W: u32 = (SCREEN_W - 2 * MARGIN) as u32;
-pub(super) const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - BUTTON_BAR_H;
+
+pub(super) const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - 4;
+
 pub(super) const EOCD_TAIL: usize = 512;
+
 pub(super) const INDENT_PX: u32 = 24;
+
 pub(super) const IMAGE_DISPLAY_H: u16 = 200;
+
 pub(super) const CHAPTER_CACHE_MAX: usize = 98304;
 
-// images <= this size are dispatched to the async worker for decoding;
-// images > this size are decoded on the main loop via streaming SD reads
+// images <= this size are dispatched to async worker for decoding;
+// images > this size are decoded on main loop via streaming SD reads
 pub(super) const PRECACHE_IMG_MAX: u32 = 30 * 1024;
 
-pub(super) const PROGRESS_H: u16 = 2;
-pub(super) const PROGRESS_Y: u16 = SCREEN_H - PROGRESS_H - 1;
+pub(super) const READER_PROGRESS_H: u16 = PROGRESS_H;
+pub(super) const PROGRESS_Y: u16 = SCREEN_H - READER_PROGRESS_H - 1;
 pub(super) const PROGRESS_W: u16 = SCREEN_W - 2 * MARGIN;
 
-pub(super) const POSITION_OVERLAY_W: u16 = 280;
-pub(super) const POSITION_OVERLAY_H: u16 = 40;
 pub(super) const POSITION_OVERLAY: Region = Region::new(
     (SCREEN_W - POSITION_OVERLAY_W) / 2,
     (SCREEN_H - POSITION_OVERLAY_H) / 2,
@@ -79,7 +95,8 @@ pub(super) const POSITION_OVERLAY: Region = Region::new(
     POSITION_OVERLAY_H,
 );
 
-pub(super) const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, 464, 24);
+const LOADING_W: u16 = SCREEN_W - 2 * MARGIN - 16;
+pub(super) const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, LOADING_W, LOADING_H);
 
 pub const QA_FONT_SIZE: u8 = 1;
 pub(super) const QA_PREV_CHAPTER: u8 = 3;

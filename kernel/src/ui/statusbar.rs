@@ -2,12 +2,11 @@
 // system stats are emitted via log::info! in the scheduler
 
 pub const BAR_HEIGHT: u16 = 4;
-pub const CONTENT_TOP: u16 = BAR_HEIGHT;
 
 const STACK_PAINT_WORD: u32 = 0xDEAD_BEEF;
 
-// paint the unused stack with a sentinel word so stack_high_water_mark
-// can later measure peak usage; call very early in boot
+const STACK_GUARD_SKIP: usize = 256;
+
 pub fn paint_stack() {
     #[cfg(target_arch = "riscv32")]
     {
@@ -21,10 +20,8 @@ pub fn paint_stack() {
         }
         let bottom = (&raw const _stack_end_cpu0) as usize;
 
-        let guard_skip = 256;
-        let paint_bottom = bottom + guard_skip;
-
-        let paint_top = sp.saturating_sub(256);
+        let paint_bottom = bottom + STACK_GUARD_SKIP;
+        let paint_top = sp.saturating_sub(STACK_GUARD_SKIP);
 
         if paint_top <= paint_bottom {
             return;
@@ -73,8 +70,7 @@ pub fn stack_high_water_mark() -> usize {
         let bottom = (&raw const _stack_end_cpu0) as usize;
         let top = (&raw const _stack_start_cpu0) as usize;
 
-        let guard_skip = 256;
-        let scan_bottom = bottom + guard_skip;
+        let scan_bottom = bottom + STACK_GUARD_SKIP;
 
         let start = (scan_bottom + 3) & !3;
 

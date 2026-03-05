@@ -8,6 +8,8 @@ use embassy_time::{Duration, Ticker, Timer};
 use crate::drivers::battery;
 use crate::drivers::input::{Event, InputDriver};
 
+use super::timing;
+
 pub const INPUT_CHANNEL_CAP: usize = 8;
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, Event, INPUT_CHANNEL_CAP> =
     Channel::new();
@@ -22,11 +24,9 @@ pub fn request_hold_reset() {
 
 pub static BATTERY_MV: Signal<CriticalSectionRawMutex, u16> = Signal::new();
 
-const BATTERY_INTERVAL_TICKS: u32 = 3000; // 3000 x 10 ms = 30 s
-
 #[embassy_executor::task]
 pub async fn input_task(mut input: InputDriver) -> ! {
-    let mut ticker = Ticker::every(Duration::from_millis(10));
+    let mut ticker = Ticker::every(Duration::from_millis(timing::INPUT_TICK_MS));
     let mut battery_counter: u32 = 0;
 
     let raw = input.read_battery_mv();
@@ -45,7 +45,7 @@ pub async fn input_task(mut input: InputDriver) -> ! {
         }
 
         battery_counter += 1;
-        if battery_counter >= BATTERY_INTERVAL_TICKS {
+        if battery_counter >= timing::BATTERY_INTERVAL_TICKS {
             battery_counter = 0;
             let raw = input.read_battery_mv();
             BATTERY_MV.signal(battery::adc_to_battery_mv(raw));
@@ -59,13 +59,13 @@ pub static BOOKMARK_FLUSH_DUE: Signal<CriticalSectionRawMutex, ()> = Signal::new
 
 #[embassy_executor::task]
 pub async fn housekeeping_task() -> ! {
-    Timer::after(Duration::from_secs(5)).await;
+    Timer::after(Duration::from_secs(timing::HOUSEKEEPING_INITIAL_DELAY_SECS)).await;
 
-    let mut status_ticker = Ticker::every(Duration::from_secs(5));
-    let mut sd_ticker = Ticker::every(Duration::from_secs(30));
+    let mut status_ticker = Ticker::every(Duration::from_secs(timing::STATUS_INTERVAL_SECS));
+    let mut sd_ticker = Ticker::every(Duration::from_secs(timing::SD_CHECK_INTERVAL_SECS));
 
-    Timer::after(Duration::from_secs(2)).await; // stagger behind SD
-    let mut bm_ticker = Ticker::every(Duration::from_secs(30));
+    Timer::after(Duration::from_secs(timing::BOOKMARK_FLUSH_STAGGER_SECS)).await;
+    let mut bm_ticker = Ticker::every(Duration::from_secs(timing::BOOKMARK_FLUSH_INTERVAL_SECS));
 
     loop {
         use embassy_futures::select::{Either3, select3};

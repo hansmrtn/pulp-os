@@ -27,7 +27,7 @@ use crate::kernel::tasks;
 
 use crate::ui::{free_stack_bytes, stack_high_water_mark};
 
-const TICK_MS: u64 = 10;
+use super::timing;
 
 impl super::Kernel {
     // render boot console to EPD; call before boot() to show
@@ -71,7 +71,7 @@ impl super::Kernel {
     //   2. EPD busy pin wait inside render()
     // everything between them is synchronous function calls
     pub async fn run<A: AppLayer>(&mut self, app_mgr: &mut A) -> ! {
-        let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
+        let mut work_ticker = Ticker::every(Duration::from_millis(timing::TICK_MS));
 
         loop {
             if app_mgr.needs_special_mode() {
@@ -349,7 +349,7 @@ impl super::Kernel {
                 match select(
                     app_mgr.run_background(&mut handle),
                     with_timeout(
-                        Duration::from_millis(TICK_MS),
+                        Duration::from_millis(timing::TICK_MS),
                         tasks::INPUT_EVENTS.receive(),
                     ),
                 )

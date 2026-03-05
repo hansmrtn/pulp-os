@@ -186,14 +186,16 @@ impl AppContext {
         self.coalesce_until = None;
     }
 
-    // mark dirty with 50ms coalescing window; use only for background
+    // mark dirty with coalescing window; use only for background
     // batch updates (title scanner) where many rapid dirty marks
     // should coalesce into a single refresh
     #[inline]
     pub fn mark_dirty_coalesced(&mut self, region: Region) {
+        use super::timing;
         self.request_partial_redraw(region);
         if !self.immediate && self.coalesce_until.is_none() {
-            self.coalesce_until = Some(Instant::now() + embassy_time::Duration::from_millis(50));
+            self.coalesce_until =
+                Some(Instant::now() + embassy_time::Duration::from_millis(timing::COALESCE_WINDOW_MS));
         }
     }
 

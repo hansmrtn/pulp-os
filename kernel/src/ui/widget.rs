@@ -1,7 +1,7 @@
 // region geometry, alignment helpers, progress bar, loading indicator
 
 use embedded_graphics::{
-    mono_font::MonoTextStyle, mono_font::ascii::FONT_9X18, pixelcolor::BinaryColor, prelude::*,
+    mono_font::ascii::FONT_9X18, mono_font::MonoTextStyle, pixelcolor::BinaryColor, prelude::*,
     primitives::PrimitiveStyle, primitives::Rectangle, text::Text,
 };
 
@@ -106,7 +106,11 @@ pub fn wrap_next(current: usize, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
-    if current + 1 >= count { 0 } else { current + 1 }
+    if current + 1 >= count {
+        0
+    } else {
+        current + 1
+    }
 }
 
 #[inline]
@@ -114,7 +118,11 @@ pub fn wrap_prev(current: usize, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
-    if current == 0 { count - 1 } else { current - 1 }
+    if current == 0 {
+        count - 1
+    } else {
+        current - 1
+    }
 }
 
 // horizontal progress bar for 1-bit e-paper
