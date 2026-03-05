@@ -10,6 +10,27 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
 pub use smol_epub::cache::fnv1a_icase;
 
+// little-endian helpers for binary record encoding
+#[inline]
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+#[inline]
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+#[inline]
+fn write_u16_le(buf: &mut [u8], off: usize, val: u16) {
+    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+#[inline]
+fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
 pub const RECORD_LEN: usize = 48;
@@ -46,40 +67,31 @@ impl BookmarkSlot {
         if rec.len() < RECORD_LEN {
             return Self::EMPTY;
         }
-        let name_hash = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-        let byte_offset = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-        let chapter = u16::from_le_bytes([rec[8], rec[9]]);
-        let flags = u16::from_le_bytes([rec[10], rec[11]]);
-        let generation = u16::from_le_bytes([rec[12], rec[13]]);
         let name_len = rec[14].min(FILENAME_CAP as u8);
-
         let mut filename = [0u8; FILENAME_CAP];
-        let n = name_len as usize;
-        filename[..n].copy_from_slice(&rec[16..16 + n]);
+        filename[..name_len as usize].copy_from_slice(&rec[16..16 + name_len as usize]);
 
         Self {
-            name_hash,
-            byte_offset,
-            chapter,
-            valid: flags & 1 != 0,
-            generation,
+            name_hash: read_u32_le(rec, 0),
+            byte_offset: read_u32_le(rec, 4),
+            chapter: read_u16_le(rec, 8),
+            valid: read_u16_le(rec, 10) & 1 != 0,
+            generation: read_u16_le(rec, 12),
             name_len,
             filename,
         }
     }
 
     fn encode(&self) -> [u8; RECORD_LEN] {
-        let flags: u16 = if self.valid { 1 } else { 0 };
         let mut rec = [0u8; RECORD_LEN];
-        rec[0..4].copy_from_slice(&self.name_hash.to_le_bytes());
-        rec[4..8].copy_from_slice(&self.byte_offset.to_le_bytes());
-        rec[8..10].copy_from_slice(&self.chapter.to_le_bytes());
-        rec[10..12].copy_from_slice(&flags.to_le_bytes());
-        rec[12..14].copy_from_slice(&self.generation.to_le_bytes());
+        write_u32_le(&mut rec, 0, self.name_hash);
+        write_u32_le(&mut rec, 4, self.byte_offset);
+        write_u16_le(&mut rec, 8, self.chapter);
+        write_u16_le(&mut rec, 10, if self.valid { 1 } else { 0 });
+        write_u16_le(&mut rec, 12, self.generation);
         rec[14] = self.name_len;
-        rec[15] = 0;
-        let n = self.name_len as usize;
-        rec[16..16 + n].copy_from_slice(&self.filename[..n]);
+        rec[16..16 + self.name_len as usize]
+            .copy_from_slice(&self.filename[..self.name_len as usize]);
         rec
     }
 

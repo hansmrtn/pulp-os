@@ -77,46 +77,13 @@ const _: () = assert!(core::mem::size_of::<RtcSession>() <= 256);
 
 impl RtcSession {
     // create zeroed session (invalid until populated)
+    //
+    // Safety: RtcSession is #[repr(C)] with only primitive types and
+    // fixed-size arrays of primitives - all valid when zero-initialized
     pub const fn zeroed() -> Self {
-        Self {
-            magic: 0,
-            wake_count: 0,
-            flags: 0,
-            _header_pad: 0,
-
-            nav_depth: 0,
-            nav_stack: [0; MAX_NAV_STACK],
-            _nav_pad: [0; 3],
-
-            reader_filename: [0; MAX_FILENAME_LEN],
-            reader_filename_len: 0,
-            reader_is_epub: 0,
-            reader_chapter: 0,
-            reader_page: 0,
-            reader_byte_offset: 0,
-            reader_font_size: 0,
-            _reader_pad: [0; 5],
-
-            files_scroll: 0,
-            files_selected: 0,
-            files_total: 0,
-            _files_pad: [0; 3],
-
-            home_state: 0,
-            home_selected: 0,
-            home_bm_selected: 0,
-            home_bm_scroll: 0,
-            _home_pad: [0; 4],
-
-            settings_sleep_timeout: 0,
-            settings_ghost_clear: 0,
-            settings_book_font: 0,
-            settings_ui_font: 0,
-            settings_valid: 0,
-            _settings_pad: [0; 10],
-
-            _reserved: [0; 24],
-        }
+        // SAFETY: All fields are primitives or arrays of primitives,
+        // and zero is a valid value for each (magic=0 means invalid session)
+        unsafe { core::mem::zeroed() }
     }
 
     #[inline]
