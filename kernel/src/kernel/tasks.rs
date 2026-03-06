@@ -26,14 +26,20 @@ pub static BATTERY_MV: Signal<CriticalSectionRawMutex, u16> = Signal::new();
 
 #[embassy_executor::task]
 pub async fn input_task(mut input: InputDriver) -> ! {
-    let mut ticker = Ticker::every(Duration::from_millis(timing::INPUT_TICK_MS));
     let mut battery_counter: u32 = 0;
+    let mut idle_ticks: u32 = 0;
 
     let raw = input.read_battery_mv();
     BATTERY_MV.signal(battery::adc_to_battery_mv(raw));
 
     loop {
-        ticker.next().await;
+        // adaptive polling: fast rate during active input, slow when idle
+        let tick_ms = if idle_ticks >= timing::INPUT_IDLE_TICKS {
+            timing::INPUT_TICK_SLOW_MS
+        } else {
+            timing::INPUT_TICK_FAST_MS
+        };
+        Timer::after(Duration::from_millis(tick_ms)).await;
 
         if RESET_HOLD.try_take().is_some() {
             input.reset_hold_state();
@@ -42,6 +48,9 @@ pub async fn input_task(mut input: InputDriver) -> ! {
         if let Some(ev) = input.poll() {
             let _ = INPUT_EVENTS.try_send(ev);
             IDLE_RESET.signal(());
+            idle_ticks = 0; // reset to fast polling on any event
+        } else {
+            idle_ticks = idle_ticks.saturating_add(1);
         }
 
         battery_counter += 1;

@@ -331,6 +331,12 @@ impl ReaderApp {
             return;
         }
 
+        // fast path: skip all setup and SD I/O when the page buffer
+        // contains no image markers (the common case for text pages)
+        if !self.pg.buf[..buf_len].contains(&MARKER) {
+            return;
+        }
+
         let ch_zip_idx = self.epub.spine.items[self.epub.chapter as usize] as usize;
         let ch_path = self.epub.zip.entry_name(ch_zip_idx);
         let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -427,6 +433,9 @@ impl ReaderApp {
         }
 
         self.pg.prefetch_page = NO_PREFETCH;
+        if self.pg.prefetch.len() < PAGE_BUF {
+            self.pg.prefetch.resize(PAGE_BUF, 0);
+        }
 
         let dir_buf = self.epub.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);

@@ -8,9 +8,12 @@
 // controls how often the event loop wakes to check for work
 pub const TICK_MS: u64 = 10;
 
-// input task poll interval (ms)
-// ADC button sampling rate; should probably(?) match or equal TICK_MS
-pub const INPUT_TICK_MS: u64 = 10;
+// input task poll intervals (ms)
+// fast rate used during active input; slow rate when idle to save power
+pub const INPUT_TICK_FAST_MS: u64 = 10;
+pub const INPUT_TICK_SLOW_MS: u64 = 50;
+// number of ticks at fast rate after the last event before switching to slow
+pub const INPUT_IDLE_TICKS: u32 = 100; // 100 * 10ms = 1 second
 
 // button debounce window (ms)
 // raw input must be stable for this duration before registering

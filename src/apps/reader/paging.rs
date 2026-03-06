@@ -6,6 +6,7 @@ use smol_epub::html_strip::{
 };
 
 use crate::fonts;
+use crate::fonts::bitmap::FIRST_CHAR;
 use crate::kernel::KernelHandle;
 
 use super::{
@@ -24,7 +25,7 @@ impl ReaderApp {
                 n,
                 &fs,
                 &mut self.pg.lines,
-                self.max_lines,
+                self.max_lines as usize,
                 self.text_w,
                 heights,
             );
@@ -38,7 +39,7 @@ impl ReaderApp {
     pub(super) fn wrap_monospace(&mut self, n: usize) -> usize {
         use super::CHARS_PER_LINE;
 
-        let max = self.max_lines;
+        let max = self.max_lines as usize;
         self.pg.line_count = 0;
         let mut col: usize = 0;
         let mut line_start: usize = 0;
@@ -127,8 +128,9 @@ impl ReaderApp {
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
         if self.pg.prefetch_page == self.pg.page {
-            core::mem::swap(&mut self.pg.buf, &mut self.pg.prefetch);
-            self.pg.buf_len = self.pg.prefetch_len;
+            let pf_len = self.pg.prefetch_len;
+            self.pg.buf[..pf_len].copy_from_slice(&self.pg.prefetch[..pf_len]);
+            self.pg.buf_len = pf_len;
             self.pg.prefetch_page = NO_PREFETCH;
             self.pg.prefetch_len = 0;
         } else if self.is_epub && self.epub.chapters_cached {
@@ -162,7 +164,7 @@ impl ReaderApp {
         let next_offset = self.pg.offsets[self.pg.page] + consumed as u32;
 
         if self.pg.page + 1 >= self.pg.total_pages && !self.pg.fully_indexed {
-            if self.pg.line_count >= self.max_lines && next_offset < self.file_size {
+            if self.pg.line_count >= self.max_lines as usize && next_offset < self.file_size {
                 if self.pg.total_pages < MAX_PAGES {
                     self.pg.offsets[self.pg.total_pages] = next_offset;
                     self.pg.total_pages += 1;
@@ -175,6 +177,9 @@ impl ReaderApp {
         }
 
         if self.pg.page + 1 < self.pg.total_pages {
+            if self.pg.prefetch.len() < PAGE_BUF {
+                self.pg.prefetch.resize(PAGE_BUF, 0);
+            }
             let pf_offset = self.pg.offsets[self.pg.page + 1];
             let pf_result = if self.is_epub && self.epub.chapters_cached {
                 let cf_str = self.epub.cache_file_str();
@@ -222,7 +227,7 @@ impl ReaderApp {
             let consumed = self.wrap_lines_counted(n);
             let next_offset = offset + consumed;
 
-            if self.pg.line_count >= self.max_lines && next_offset < total {
+            if self.pg.line_count >= self.max_lines as usize && next_offset < total {
                 self.pg.offsets[self.pg.total_pages] = next_offset as u32;
                 self.pg.total_pages += 1;
                 offset = next_offset;
@@ -583,10 +588,13 @@ pub(super) fn wrap_proportional(
             continue;
         }
 
+        // --- ASCII fast path: batch space and word runs ---
         let sty = current_style(bold, italic, heading);
-        let adv = fonts.advance_byte(b, sty) as u32;
+        let font = fonts.font(sty);
+        let glyphs = font.glyphs;
 
         if b == b' ' {
+            let adv = glyphs[(b' ' - FIRST_CHAR) as usize].advance as u32;
             cursor_x += adv;
             last_space = i + 1;
             cursor_at_space = cursor_x;
@@ -604,24 +612,59 @@ pub(super) fn wrap_proportional(
             continue;
         }
 
-        cursor_x += adv;
-        if cursor_x > max_w {
-            if last_space > line_start {
-                emit!(line_start, last_space);
-                cursor_x -= cursor_at_space;
-                line_start = last_space;
-            } else {
-                emit!(line_start, i);
-                line_start = i;
-                cursor_x = adv;
+        // Printable non-space ASCII (0x21..=0x7E): batch-scan the word run.
+        // Find end of contiguous printable non-space ASCII bytes, sum advances.
+        let word_start = i;
+        let remaining = max_w.saturating_sub(cursor_x);
+        let mut run_adv: u32 = 0;
+        let mut j = i;
+        while j < n {
+            let c = buf[j];
+            // stop at space, control chars, MARKER, high-bit bytes
+            if c <= b' ' || c > 0x7E {
+                break;
             }
-            last_space = line_start;
-            cursor_at_space = 0;
-            if line_count >= max_l {
-                return (line_start, line_count);
+            let a = glyphs[(c - FIRST_CHAR) as usize].advance as u32;
+            if run_adv + a > remaining && j > word_start {
+                // would overflow; stop batch here so we handle break properly
+                break;
             }
+            run_adv += a;
+            j += 1;
         }
 
+        if j > i {
+            // consumed j - i bytes as a batch
+            cursor_x += run_adv;
+            i = j;
+            if cursor_x > max_w {
+                // overflow: break at last space or at word start
+                if last_space > line_start {
+                    emit!(line_start, last_space);
+                    cursor_x -= cursor_at_space;
+                    line_start = last_space;
+                } else {
+                    emit!(line_start, word_start);
+                    line_start = word_start;
+                    // recompute cursor_x from line_start..i
+                    cursor_x = 0;
+                    for k in line_start..i {
+                        let c = buf[k];
+                        if c >= FIRST_CHAR && c <= 0x7E {
+                            cursor_x += glyphs[(c - FIRST_CHAR) as usize].advance as u32;
+                        }
+                    }
+                }
+                last_space = line_start;
+                cursor_at_space = 0;
+                if line_count >= max_l {
+                    return (line_start, line_count);
+                }
+            }
+            continue;
+        }
+
+        // single non-printable byte that wasn't caught above; skip
         i += 1;
     }
 

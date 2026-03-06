@@ -316,8 +316,12 @@ impl super::Kernel {
                         let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
                         sleep_requested = sleep;
 
-                        if app_mgr.has_redraw() {
-                            // content changed mid-DU; leave RED stale
+                        // skip phase 3 when content changed mid-DU or
+                        // a deferred transition is queued (the screen
+                        // will be redrawn immediately after); the next
+                        // partial will use inv_red to compensate for
+                        // the desynchronised RED RAM
+                        if app_mgr.has_redraw() || deferred.is_some() {
                             app_mgr.ctx_mut().mark_dirty(r);
                             self.red_stale = true;
                             self.partial_refreshes += 1;

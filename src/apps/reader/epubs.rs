@@ -399,14 +399,14 @@ impl ReaderApp {
         if tlen > 0 {
             let n = tlen.min(self.title.len());
             self.title[..n].copy_from_slice(&self.epub.meta.title[..n]);
-            self.title_len = n;
+            self.title_len = n as u8;
 
             if let Err(e) = k.save_title(name, self.epub.meta.title_str()) {
                 log::warn!("epub: failed to save title mapping: {}", e);
             }
         }
 
-        self.epub.toc.clear();
+        self.epub.toc = None;
 
         Ok(())
     }
@@ -462,7 +462,7 @@ impl ReaderApp {
                 if ch >= spine_len {
                     let _ = self.epub.finish_cache(
                         k,
-                        &self.title[..self.title_len],
+                        &self.title[..self.title_len as usize],
                         &self.filename[..self.filename_len],
                     );
                     self.epub.img_cache_ch = self.epub.chapter;

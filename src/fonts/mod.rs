@@ -161,7 +161,7 @@ impl FontSet {
     }
 
     #[inline]
-    fn font(&self, style: Style) -> &'static BitmapFont {
+    pub fn font(&self, style: Style) -> &'static BitmapFont {
         match style {
             Style::Regular => self.regular,
             Style::Bold => self.bold,

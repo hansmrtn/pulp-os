@@ -3,14 +3,14 @@
 // widgets draw to logical coords, clipped here
 
 use embedded_graphics_core::{
-    Pixel,
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
     pixelcolor::BinaryColor,
     primitives::Rectangle,
+    Pixel,
 };
 
-use super::ssd1677::{HEIGHT, Rotation, WIDTH};
+use super::ssd1677::{Rotation, HEIGHT, WIDTH};
 use crate::ui::Region;
 
 pub const STRIP_ROWS: u16 = 40;
@@ -224,22 +224,31 @@ impl StripBuffer {
         debug_assert!(gy + y0 as i32 >= wx, "blit_1bpp_270: buf_x underflow");
         let base_buf_y = base_buf_y_i as usize;
 
-        for y in y0..y1 {
-            let row = offset + y * stride;
-            let buf_x = (gy + y as i32 - wx) as usize;
-            let byte_col = buf_x / 8;
-            let mask = 1u8 << (7 - (buf_x & 7));
+        // loop order: x-outer (strip rows, sequential memory), y-inner
+        // (strip columns, nearby bytes in same row). this is the opposite
+        // of the source row-major order but gives much better cache locality
+        // for the destination strip buffer writes.
+        for x in x0..x1 {
+            let src_byte_idx = x / 8;
+            let src_bit = 1u8 << (7 - (x & 7));
+            let dst_row_base = (base_buf_y - x) * rb;
 
             if black {
-                for x in x0..x1 {
-                    if bitmaps[row + x / 8] & (1 << (7 - (x & 7))) != 0 {
-                        self.buf[byte_col + (base_buf_y - x) * rb] &= !mask;
+                for y in y0..y1 {
+                    if bitmaps[offset + y * stride + src_byte_idx] & src_bit != 0 {
+                        let buf_x = (gy + y as i32 - wx) as usize;
+                        let byte_col = buf_x / 8;
+                        let inv_mask = !(1u8 << (7 - (buf_x & 7)));
+                        self.buf[dst_row_base + byte_col] &= inv_mask;
                     }
                 }
             } else {
-                for x in x0..x1 {
-                    if bitmaps[row + x / 8] & (1 << (7 - (x & 7))) != 0 {
-                        self.buf[byte_col + (base_buf_y - x) * rb] |= mask;
+                for y in y0..y1 {
+                    if bitmaps[offset + y * stride + src_byte_idx] & src_bit != 0 {
+                        let buf_x = (gy + y as i32 - wx) as usize;
+                        let byte_col = buf_x / 8;
+                        let mask = 1u8 << (7 - (buf_x & 7));
+                        self.buf[dst_row_base + byte_col] |= mask;
                     }
                 }
             }

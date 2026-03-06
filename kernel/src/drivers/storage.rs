@@ -16,7 +16,7 @@ use crate::error::{Error, ErrorKind};
 
 pub const PULP_DIR: &str = "_PULP";
 pub const TITLES_FILE: &str = "TITLES.BIN";
-pub const TITLE_CAP: usize = 96;
+pub const TITLE_CAP: usize = 64;
 
 // backward-compatible alias
 pub type StorageError = Error;

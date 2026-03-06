@@ -7,6 +7,7 @@ pub use pulp_kernel::util::decode_utf8_char;
 use crate::apps::PendingSetting;
 use crate::fonts::bitmap::{self, BitmapFont};
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -53,7 +54,7 @@ pub(super) const LINES_PER_PAGE: usize = 37;
 
 pub(super) const PAGE_BUF: usize = 8192;
 
-pub(super) const MAX_PAGES: usize = 1024;
+pub(super) const MAX_PAGES: usize = 512;
 
 pub(super) const HEADER_REGION: Region = Region::new(MARGIN, HEADER_Y, HEADER_W, HEADER_H);
 
@@ -207,7 +208,7 @@ pub(super) struct PageState {
     pub(super) lines: [LineSpan; LINES_PER_PAGE],
     pub(super) line_count: usize,
 
-    pub(super) prefetch: [u8; PAGE_BUF],
+    pub(super) prefetch: Vec<u8>,
     pub(super) prefetch_len: usize,
     pub(super) prefetch_page: usize,
 }
@@ -223,7 +224,7 @@ impl PageState {
             buf_len: 0,
             lines: [LineSpan::EMPTY; LINES_PER_PAGE],
             line_count: 0,
-            prefetch: [0u8; PAGE_BUF],
+            prefetch: Vec::new(),
             prefetch_len: 0,
             prefetch_page: NO_PREFETCH,
         }
@@ -257,7 +258,7 @@ pub(super) struct EpubState {
     pub(super) img_found_count: u16,
     pub(super) img_cached_count: u16,
 
-    pub(super) toc: EpubToc,
+    pub(super) toc: Option<Box<EpubToc>>,
     pub(super) toc_source: Option<TocSource>,
     pub(super) toc_selected: usize,
     pub(super) toc_scroll: usize,
@@ -291,7 +292,7 @@ impl EpubState {
             skip_large_img: false,
             img_found_count: 0,
             img_cached_count: 0,
-            toc: EpubToc::new(),
+            toc: None,
             toc_source: None,
             toc_selected: 0,
             toc_scroll: 0,
@@ -327,8 +328,8 @@ impl Default for ReaderApp {
 pub struct ReaderApp {
     pub(super) filename: [u8; 32],
     pub(super) filename_len: usize,
-    pub(super) title: [u8; 96],
-    pub(super) title_len: usize,
+    pub(super) title: [u8; 64],
+    pub(super) title_len: u8,
     pub(super) file_size: u32,
 
     pub(super) pg: PageState,
@@ -349,7 +350,7 @@ pub struct ReaderApp {
     pub(super) fonts: Option<fonts::FontSet>,
     pub(super) font_line_h: u16,
     pub(super) font_ascent: u16,
-    pub(super) max_lines: usize,
+    pub(super) max_lines: u8,
 
     // reading theme: runtime layout derived from READING_THEMES
     pub(super) text_margin: u16, // horizontal margin for text content (from theme)
@@ -369,7 +370,7 @@ pub struct ReaderApp {
 
     pub(super) chrome_font: Option<&'static BitmapFont>,
     pub(super) qa_buf: [QuickAction; QA_MAX],
-    pub(super) qa_count: usize,
+    pub(super) qa_count: u8,
 }
 
 impl ReaderApp {
@@ -377,7 +378,7 @@ impl ReaderApp {
         Self {
             filename: [0u8; 32],
             filename_len: 0,
-            title: [0u8; 96],
+            title: [0u8; 64],
             title_len: 0,
             file_size: 0,
 
@@ -399,7 +400,7 @@ impl ReaderApp {
             fonts: None,
             font_line_h: LINE_H,
             font_ascent: LINE_H,
-            max_lines: LINES_PER_PAGE,
+            max_lines: LINES_PER_PAGE as u8,
 
             text_margin: MARGIN,
             text_y: TEXT_Y,
@@ -558,19 +559,19 @@ impl ReaderApp {
             n += 1;
         }
 
-        if self.is_epub && !self.epub.toc.is_empty() {
+        if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
             self.qa_buf[n] = QuickAction::trigger(QA_TOC, "Contents", "Open");
             n += 1;
         }
 
-        self.qa_count = n;
+        self.qa_count = n as u8;
     }
 
     fn apply_font_metrics(&mut self) {
         self.fonts = None;
         self.font_line_h = LINE_H;
         self.font_ascent = LINE_H;
-        self.max_lines = LINES_PER_PAGE;
+        self.max_lines = LINES_PER_PAGE as u8;
 
         let theme = crate::kernel::config::reading_theme(self.reading_theme_idx);
         let spacing_pct = theme.line_spacing_pct;
@@ -581,7 +582,7 @@ impl ReaderApp {
             // apply line spacing: scale native line height by theme percentage
             self.font_line_h = ((native_h as u32 * spacing_pct as u32) / 100).max(1) as u16;
             self.font_ascent = fs.ascent(fonts::Style::Regular);
-            self.max_lines = ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE);
+            self.max_lines = ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE) as u8;
             log::info!(
                 "font: size_idx={} line_h={} (native {} x {}%) ascent={} max_lines={} margin={}",
                 self.book_font_size_idx,
@@ -708,7 +709,7 @@ impl ReaderApp {
 
     fn display_name(&self) -> &str {
         if self.title_len > 0 {
-            core::str::from_utf8(&self.title[..self.title_len]).unwrap_or(self.name())
+            core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or(self.name())
         } else {
             self.name()
         }
@@ -824,7 +825,7 @@ impl App<AppId> for ReaderApp {
 
         let n = self.filename_len.min(self.title.len());
         self.title[..n].copy_from_slice(&self.filename[..n]);
-        self.title_len = n;
+        self.title_len = n as u8;
 
         // Bump to a new work-queue generation and drain stale work
         // from any previous book (covers the case where on_enter is
@@ -876,7 +877,7 @@ impl App<AppId> for ReaderApp {
         self.page_img = None;
 
         if self.is_epub {
-            self.epub.toc.clear();
+            self.epub.toc = None;
             self.epub.toc_source = None;
         }
     }
@@ -983,15 +984,17 @@ impl App<AppId> for ReaderApp {
 
                         match extract_zip_entry(k, name, &self.epub.zip, toc_idx) {
                             Ok(toc_data) => {
+                                let mut toc = Box::new(EpubToc::new());
                                 epub::parse_toc(
                                     source,
                                     &toc_data,
                                     toc_dir,
                                     &self.epub.spine,
                                     &self.epub.zip,
-                                    &mut self.epub.toc,
+                                    &mut toc,
                                 );
-                                log::info!("epub: TOC has {} entries", self.epub.toc.len());
+                                log::info!("epub: TOC has {} entries", toc.len());
+                                self.epub.toc = Some(toc);
                             }
                             Err(_e) => {
                                 log::warn!("epub: failed to read TOC");
@@ -1176,7 +1179,7 @@ impl App<AppId> for ReaderApp {
                     return Transition::None;
                 }
                 ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
-                    let len = self.epub.toc.len();
+                    let len = self.epub.toc.as_ref().map_or(0, |t| t.len());
                     if len > 0 {
                         if self.epub.toc_selected + 1 < len {
                             self.epub.toc_selected += 1;
@@ -1193,7 +1196,7 @@ impl App<AppId> for ReaderApp {
                     return Transition::None;
                 }
                 ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
-                    let len = self.epub.toc.len();
+                    let len = self.epub.toc.as_ref().map_or(0, |t| t.len());
                     if len > 0 {
                         if self.epub.toc_selected > 0 {
                             self.epub.toc_selected -= 1;
@@ -1212,7 +1215,7 @@ impl App<AppId> for ReaderApp {
                     return Transition::None;
                 }
                 ActionEvent::Press(Action::Select) | ActionEvent::Press(Action::NextJump) => {
-                    let entry = &self.epub.toc.entries[self.epub.toc_selected];
+                    let entry = &self.epub.toc.as_ref().unwrap().entries[self.epub.toc_selected];
                     if entry.spine_idx != 0xFFFF {
                         log::info!(
                             "toc: jumping to \"{}\" -> spine {}",
@@ -1322,7 +1325,7 @@ impl App<AppId> for ReaderApp {
     }
 
     fn quick_actions(&self) -> &[QuickAction] {
-        &self.qa_buf[..self.qa_count]
+        &self.qa_buf[..self.qa_count as usize]
     }
 
     fn on_quick_trigger(&mut self, id: u8, ctx: &mut AppContext) {
@@ -1342,12 +1345,13 @@ impl App<AppId> for ReaderApp {
                 }
             }
             QA_TOC => {
-                if self.is_epub && !self.epub.toc.is_empty() {
-                    log::info!("toc: opening ({} entries)", self.epub.toc.len());
+        if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
+                    let toc = self.epub.toc.as_ref().unwrap();
+                    log::info!("toc: opening ({} entries)", toc.len());
                     self.epub.toc_selected = 0;
                     self.epub.toc_scroll = 0;
-                    for i in 0..self.epub.toc.len() {
-                        if self.epub.toc.entries[i].spine_idx == self.epub.chapter {
+                    for i in 0..toc.len() {
+                        if toc.entries[i].spine_idx == self.epub.chapter {
                             self.epub.toc_selected = i;
                             let vis = (self.text_area_h / self.font_line_h) as usize;
                             if self.epub.toc_selected >= vis {
@@ -1494,7 +1498,8 @@ impl App<AppId> for ReaderApp {
         }
 
         if self.state == State::ShowToc {
-            let toc_len = self.epub.toc.len();
+            let toc_ref = self.epub.toc.as_ref().unwrap();
+            let toc_len = toc_ref.len();
             let tx = self.text_margin as i32;
             let ty = self.text_y as i32;
             if self.fonts.is_some() {
@@ -1505,7 +1510,7 @@ impl App<AppId> for ReaderApp {
                 let visible = vis_max.min(toc_len.saturating_sub(self.epub.toc_scroll));
                 for i in 0..visible {
                     let idx = self.epub.toc_scroll + i;
-                    let entry = &self.epub.toc.entries[idx];
+                    let entry = &toc_ref.entries[idx];
                     let y_top = ty + i as i32 * line_h;
                     let baseline = y_top + ascent;
                     let selected = idx == self.epub.toc_selected;
@@ -1538,7 +1543,7 @@ impl App<AppId> for ReaderApp {
                 let visible = vis_max.min(toc_len.saturating_sub(self.epub.toc_scroll));
                 for i in 0..visible {
                     let idx = self.epub.toc_scroll + i;
-                    let entry = &self.epub.toc.entries[idx];
+                    let entry = &toc_ref.entries[idx];
                     let y = ty + i as i32 * LINE_H as i32 + LINE_H as i32;
                     let marker = if idx == self.epub.toc_selected {
                         "> "

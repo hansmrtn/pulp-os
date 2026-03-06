@@ -14,7 +14,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
-use super::strip::{STRIP_BUF_SIZE, STRIP_COUNT, StripBuffer};
+use super::strip::{STRIP_COUNT, StripBuffer};
 
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
@@ -222,14 +222,12 @@ where
                 }
             }
 
-            let data_len = strip.data().len();
-            let mut replay = [0xFFu8; STRIP_BUF_SIZE];
-            replay[..data_len].copy_from_slice(strip.data());
-
+            // send the same rendered strip to both RAMs directly;
+            // no replay copy needed since send_data only reads the buffer
             for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
                 self.set_partial_ram_area(px, y, pw, rows);
                 self.send_command(ram_cmd);
-                self.send_data(&replay[..data_len]);
+                self.send_data(strip.data());
             }
 
             y += rows;

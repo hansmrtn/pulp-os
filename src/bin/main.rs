@@ -3,6 +3,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
@@ -45,7 +47,8 @@ static QUICK_MENU: ConstStaticCell<QuickMenu> = ConstStaticCell::new(QuickMenu::
 static BUMPS: ConstStaticCell<ButtonFeedback> = ConstStaticCell::new(ButtonFeedback::new());
 static DIR_CACHE: ConstStaticCell<DirCache> = ConstStaticCell::new(DirCache::new());
 static BM_CACHE: ConstStaticCell<BookmarkCache> = ConstStaticCell::new(BookmarkCache::new());
-static CONSOLE: ConstStaticCell<BootConsole> = ConstStaticCell::new(BootConsole::new());
+// BootConsole is heap-allocated during boot and dropped after display,
+// reclaiming ~3 KB that would otherwise sit unused in .bss forever.
 
 static HOME: StaticCell<HomeApp> = StaticCell::new();
 static FILES: StaticCell<FilesApp> = StaticCell::new();
@@ -62,7 +65,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     // reclaim ~64 KB from 2nd-stage bootloader; net heap ~172 KB
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64_000);
 
-    let console = CONSOLE.take();
+    let mut console = alloc::boxed::Box::new(BootConsole::new());
     console.push("pulp-os 0.1.0");
     console.push("esp32c3 rv32imc 160mhz");
     console.push("heap: 172K (108K + 64K reclaimed)");
@@ -140,7 +143,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     );
 
     console.push("kernel: constructed");
-    kernel.show_boot_console(console).await;
+    kernel.show_boot_console(&console).await;
+    drop(console); // reclaim ~3 KB of heap
 
     kernel.boot(&mut app_mgr).await;
 
