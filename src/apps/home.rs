@@ -546,25 +546,13 @@ impl HomeApp {
 
 // humanize an all-uppercase SFN bookmark filename into the title field
 fn humanize_bm_entry(entry: &mut BmListEntry) {
-    let nlen = entry.name_len as usize;
-    if nlen == 0 || entry.title_len > 0 {
+    if entry.name_len == 0 || entry.title_len > 0 {
         return;
     }
-    let src = &entry.filename[..nlen];
-    let all_upper = src.iter().all(|&b| !b.is_ascii_lowercase());
-    if !all_upper {
-        return;
+    if let Some(n) = crate::drivers::storage::humanize_upper(
+        &entry.filename[..entry.name_len as usize],
+        &mut entry.title,
+    ) {
+        entry.title_len = n;
     }
-    let n = nlen.min(entry.title.len());
-    let dot_pos = src.iter().position(|&b| b == b'.').unwrap_or(n);
-    for i in 0..n {
-        entry.title[i] = if i == 0 {
-            src[i]
-        } else if i > dot_pos {
-            src[i].to_ascii_lowercase()
-        } else {
-            src[i].to_ascii_lowercase()
-        };
-    }
-    entry.title_len = n as u8;
 }

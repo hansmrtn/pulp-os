@@ -25,9 +25,10 @@ use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::{SystemSettings, WifiConfig};
 use crate::ui::Region;
 
-// monomorphized dispatch from AppId to concrete app type
-macro_rules! with_app {
-    ($id:expr, $mgr:expr, |$app:ident| $body:expr) => {
+// monomorphized dispatch from AppId to concrete app type;
+// two arms: `mut` for &mut *, `ref` for &*
+macro_rules! dispatch_app {
+    ($id:expr, $mgr:expr, mut, |$app:ident| $body:expr) => {
         match $id {
             AppId::Home => {
                 let $app = &mut *$mgr.home;
@@ -46,15 +47,11 @@ macro_rules! with_app {
                 $body
             }
             AppId::Upload => {
-                unreachable!("Upload mode is handled outside the app dispatch loop");
+                unreachable!("Upload handled outside dispatch");
             }
         }
     };
-}
-
-// shared-ref variant for read-only dispatch (draw, quick_actions)
-macro_rules! with_app_ref {
-    ($id:expr, $mgr:expr, |$app:ident| $body:expr) => {
+    ($id:expr, $mgr:expr, ref, |$app:ident| $body:expr) => {
         match $id {
             AppId::Home => {
                 let $app = &*$mgr.home;
@@ -73,9 +70,21 @@ macro_rules! with_app_ref {
                 $body
             }
             AppId::Upload => {
-                unreachable!("Upload mode is handled outside the app dispatch loop");
+                unreachable!("Upload handled outside dispatch");
             }
         }
+    };
+}
+
+macro_rules! with_app {
+    ($id:expr, $mgr:expr, |$app:ident| $body:expr) => {
+        dispatch_app!($id, $mgr, mut, |$app| $body)
+    };
+}
+
+macro_rules! with_app_ref {
+    ($id:expr, $mgr:expr, |$app:ident| $body:expr) => {
+        dispatch_app!($id, $mgr, ref, |$app| $body)
     };
 }
 

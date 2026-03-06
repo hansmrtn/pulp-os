@@ -103,16 +103,6 @@ impl BitmapFont {
         }
     }
 
-    // true if this font has a real glyph for ch (not just '?' fallback)
-    #[inline]
-    pub fn has_glyph(&self, ch: char) -> bool {
-        let code = ch as u32;
-        if code >= FIRST_CHAR as u32 && code <= LAST_CHAR as u32 {
-            return true;
-        }
-        self.ext_codepoints.binary_search(&code).is_ok()
-    }
-
     // horizontal advance for a single character
     #[inline]
     pub fn advance(&self, ch: char) -> u8 {
@@ -170,31 +160,6 @@ impl BitmapFont {
     ) -> i32 {
         let mut x = cx;
         for ch in text.chars() {
-            x += self.draw_char_fg(strip, ch, fg, x, baseline) as i32;
-        }
-        x
-    }
-
-    // draw a &[u8] (decoded as utf-8) at (cx, baseline) in black, return final x
-    pub fn draw_bytes(&self, strip: &mut StripBuffer, text: &[u8], cx: i32, baseline: i32) -> i32 {
-        let mut x = cx;
-        for ch in Utf8Iter::new(text) {
-            x += self.draw_char(strip, ch, x, baseline) as i32;
-        }
-        x
-    }
-
-    // draw a &[u8] with given foreground, return final x
-    pub fn draw_bytes_fg(
-        &self,
-        strip: &mut StripBuffer,
-        text: &[u8],
-        fg: BinaryColor,
-        cx: i32,
-        baseline: i32,
-    ) -> i32 {
-        let mut x = cx;
-        for ch in Utf8Iter::new(text) {
             x += self.draw_char_fg(strip, ch, fg, x, baseline) as i32;
         }
         x

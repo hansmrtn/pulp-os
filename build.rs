@@ -406,61 +406,37 @@ fn generate_bitmap_fonts() {
         }
     }
 
-    // bold
-    if let Some(ref path) = bold {
-        let data = fs::read(path).unwrap();
-        let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
-            .expect("failed to parse bold TTF");
-        eprintln!(
-            "cargo:warning=font: rasterising {} body {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px",
-            path.file_name().unwrap().to_string_lossy(),
-            BODY_PX[0].0,
-            BODY_PX[1].0,
-            BODY_PX[2].0,
-            BODY_PX[3].0,
-            BODY_PX[4].0,
-        );
-        for (px, suffix) in &BODY_PX {
-            emit_font(
-                &mut out,
-                &font,
-                &format!("BOLD_BODY_{suffix}"),
-                *px,
-                &ext_codepoints,
+    // bold & italic: body sizes only
+    for (path, prefix, label) in [
+        (&bold, "BOLD_BODY", "bold"),
+        (&italic, "ITALIC_BODY", "italic"),
+    ] {
+        if let Some(path) = path {
+            let data = fs::read(path).unwrap();
+            let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
+                .unwrap_or_else(|_| panic!("failed to parse {} TTF", label));
+            eprintln!(
+                "cargo:warning=font: rasterising {} body {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px",
+                path.file_name().unwrap().to_string_lossy(),
+                BODY_PX[0].0,
+                BODY_PX[1].0,
+                BODY_PX[2].0,
+                BODY_PX[3].0,
+                BODY_PX[4].0,
             );
-        }
-    } else {
-        for (_px, suffix) in &BODY_PX {
-            emit_stub(&mut out, &format!("BOLD_BODY_{suffix}"));
-        }
-    }
-
-    // italic
-    if let Some(ref path) = italic {
-        let data = fs::read(path).unwrap();
-        let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
-            .expect("failed to parse italic TTF");
-        eprintln!(
-            "cargo:warning=font: rasterising {} body {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px",
-            path.file_name().unwrap().to_string_lossy(),
-            BODY_PX[0].0,
-            BODY_PX[1].0,
-            BODY_PX[2].0,
-            BODY_PX[3].0,
-            BODY_PX[4].0,
-        );
-        for (px, suffix) in &BODY_PX {
-            emit_font(
-                &mut out,
-                &font,
-                &format!("ITALIC_BODY_{suffix}"),
-                *px,
-                &ext_codepoints,
-            );
-        }
-    } else {
-        for (_px, suffix) in &BODY_PX {
-            emit_stub(&mut out, &format!("ITALIC_BODY_{suffix}"));
+            for (px, suffix) in &BODY_PX {
+                emit_font(
+                    &mut out,
+                    &font,
+                    &format!("{prefix}_{suffix}"),
+                    *px,
+                    &ext_codepoints,
+                );
+            }
+        } else {
+            for (_px, suffix) in &BODY_PX {
+                emit_stub(&mut out, &format!("{prefix}_{suffix}"));
+            }
         }
     }
 }
@@ -535,29 +511,25 @@ fn emit_font(
         ascii_glyphs.push(g);
     }
 
-    // emit ASCII glyph table
-    writeln!(out, "static {name}_GLYPHS: [BitmapGlyph; GLYPH_COUNT] = [").unwrap();
-    let mut offset: u16 = 0;
-    for (i, g) in ascii_glyphs.iter().enumerate() {
-        let ch = (FIRST_CHAR + i as u8) as char;
-        writeln!(
-            out,
-            "    BitmapGlyph {{ advance: {:>2}, offset_x: {:>3}, offset_y: {:>4}, width: {:>2}, height: {:>2}, bitmap_offset: {:>5} }}, // {:?}",
-            g.advance, g.offset_x, g.offset_y, g.width, g.height, offset, ch
-        ).unwrap();
-        offset += g.bits.len() as u16;
-    }
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
-
-    // emit ASCII bitmap data
-    writeln!(out, "static {name}_BITMAPS: [u8; {ascii_bits_total}] = [").unwrap();
-    emit_bitmap_bytes(out, &ascii_glyphs);
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
+    // emit ASCII glyph table + bitmaps
+    let ascii_labels: Vec<String> = (FIRST_CHAR..=LAST_CHAR)
+        .map(|c| format!("{:?}", c as char))
+        .collect();
+    emit_glyph_table(
+        out,
+        &format!("{name}_GLYPHS"),
+        "GLYPH_COUNT",
+        &ascii_glyphs,
+        &ascii_labels,
+    );
+    emit_glyph_bitmaps(
+        out,
+        &format!("{name}_BITMAPS"),
+        ascii_bits_total,
+        &ascii_glyphs,
+    );
 
     // extended unicode glyphs (sorted by codepoint)
-
     let mut ext_glyphs: Vec<RasterGlyph> = Vec::with_capacity(ext_codepoints.len());
     let mut ext_bits_total: usize = 0;
 
@@ -567,7 +539,6 @@ fn emit_font(
             ext_bits_total += g.bits.len();
             ext_glyphs.push(g);
         } else {
-            // invalid codepoint, push a zero-width space placeholder
             ext_glyphs.push(RasterGlyph {
                 advance: 0,
                 offset_x: 0,
@@ -601,33 +572,28 @@ fn emit_font(
     writeln!(out, "];").unwrap();
     writeln!(out).unwrap();
 
-    // emit extended glyph table
-    writeln!(
+    // emit extended glyph table + bitmaps
+    let ext_labels: Vec<String> = ext_codepoints
+        .iter()
+        .map(|&cp| {
+            char::from_u32(cp)
+                .map(|c| format!("{:?}", c))
+                .unwrap_or_else(|| format!("U+{cp:04X}"))
+        })
+        .collect();
+    emit_glyph_table(
         out,
-        "static {name}_EXT_GLYPHS: [BitmapGlyph; {ext_count}] = ["
-    )
-    .unwrap();
-    let mut offset: u16 = 0;
-    for (i, g) in ext_glyphs.iter().enumerate() {
-        let cp = ext_codepoints[i];
-        let ch_display = char::from_u32(cp)
-            .map(|c| format!("{:?}", c))
-            .unwrap_or_else(|| format!("U+{cp:04X}"));
-        writeln!(
-            out,
-            "    BitmapGlyph {{ advance: {:>2}, offset_x: {:>3}, offset_y: {:>4}, width: {:>2}, height: {:>2}, bitmap_offset: {:>5} }}, // {}",
-            g.advance, g.offset_x, g.offset_y, g.width, g.height, offset, ch_display
-        ).unwrap();
-        offset += g.bits.len() as u16;
-    }
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
-
-    // emit extended bitmap data
-    writeln!(out, "static {name}_EXT_BITMAPS: [u8; {ext_bits_total}] = [").unwrap();
-    emit_bitmap_bytes(out, &ext_glyphs);
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
+        &format!("{name}_EXT_GLYPHS"),
+        &ext_count.to_string(),
+        &ext_glyphs,
+        &ext_labels,
+    );
+    emit_glyph_bitmaps(
+        out,
+        &format!("{name}_EXT_BITMAPS"),
+        ext_bits_total,
+        &ext_glyphs,
+    );
 
     // BitmapFont struct
 
@@ -640,6 +606,35 @@ fn emit_font(
     writeln!(out, "    line_height: {line_height},").unwrap();
     writeln!(out, "    ascent: {ascent},").unwrap();
     writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn emit_glyph_table(
+    out: &mut fs::File,
+    table_name: &str,
+    count_expr: &str,
+    glyphs: &[RasterGlyph],
+    labels: &[String],
+) {
+    writeln!(out, "static {table_name}: [BitmapGlyph; {count_expr}] = [").unwrap();
+    let mut offset: u16 = 0;
+    for (i, g) in glyphs.iter().enumerate() {
+        let label = labels.get(i).map(|s| s.as_str()).unwrap_or("");
+        writeln!(
+            out,
+            "    BitmapGlyph {{ advance: {:>2}, offset_x: {:>3}, offset_y: {:>4}, width: {:>2}, height: {:>2}, bitmap_offset: {:>5} }}, // {}",
+            g.advance, g.offset_x, g.offset_y, g.width, g.height, offset, label
+        ).unwrap();
+        offset += g.bits.len() as u16;
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn emit_glyph_bitmaps(out: &mut fs::File, array_name: &str, total: usize, glyphs: &[RasterGlyph]) {
+    writeln!(out, "static {array_name}: [u8; {total}] = [").unwrap();
+    emit_bitmap_bytes(out, glyphs);
+    writeln!(out, "];").unwrap();
     writeln!(out).unwrap();
 }
 

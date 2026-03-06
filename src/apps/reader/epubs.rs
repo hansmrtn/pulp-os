@@ -342,16 +342,15 @@ impl EpubState {
 
 impl ReaderApp {
     pub(super) fn epub_init_opf(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let name = self.name_copy();
 
         let mut opf_path_buf = [0u8; epub::OPF_PATH_CAP];
         let opf_path_len = if let Some(container_idx) = self.epub.zip.find("META-INF/container.xml")
         {
-            let container_data = super::extract_zip_entry(k, name, &self.epub.zip, container_idx)
-                .map_err(|_| {
-                Error::new(ErrorKind::ReadFailed, "epub_init_opf: container read")
-            })?;
+            let container_data =
+                super::extract_zip_entry(k, name.as_str(), &self.epub.zip, container_idx).map_err(
+                    |_| Error::new(ErrorKind::ReadFailed, "epub_init_opf: container read"),
+                )?;
             let len = epub::parse_container(&container_data, &mut opf_path_buf).map_err(|_| {
                 Error::new(ErrorKind::ParseFailed, "epub_init_opf: container parse")
             })?;
@@ -374,7 +373,7 @@ impl ReaderApp {
             .find(opf_path)
             .or_else(|| self.epub.zip.find_icase(opf_path))
             .ok_or(Error::new(ErrorKind::NotFound, "epub_init_opf: OPF entry"))?;
-        let opf_data = super::extract_zip_entry(k, name, &self.epub.zip, opf_idx)
+        let opf_data = super::extract_zip_entry(k, name.as_str(), &self.epub.zip, opf_idx)
             .map_err(|_| Error::new(ErrorKind::ReadFailed, "epub_init_opf: OPF read"))?;
 
         let opf_dir = opf_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -404,7 +403,7 @@ impl ReaderApp {
             self.title[..n].copy_from_slice(&self.epub.meta.title[..n]);
             self.title_len = n as u8;
 
-            if let Err(e) = k.save_title(name, self.epub.meta.title_str()) {
+            if let Err(e) = k.save_title(name.as_str(), self.epub.meta.title_str()) {
                 log::warn!("epub: failed to save title mapping: {}", e);
             }
         }
@@ -446,8 +445,7 @@ impl ReaderApp {
                 // before continuing the sequential scan; forward/backward
                 // nav stays instant
                 let reading_ch = self.epub.chapter as usize;
-                let (nb, nl) = self.name_copy();
-                let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                let name = self.name_copy();
                 for &adj in &[reading_ch + 1, reading_ch.saturating_sub(1)] {
                     if adj < spine_len && adj != reading_ch && !self.epub.ch_cached[adj] {
                         log::info!(
@@ -455,7 +453,7 @@ impl ReaderApp {
                             adj,
                             reading_ch,
                         );
-                        if let Err(e) = self.epub.cache_chapter_async(k, adj, &name).await {
+                        if let Err(e) = self.epub.cache_chapter_async(k, adj, name.as_str()).await {
                             log::warn!("epub: priority ch{} failed: {}", adj, e);
                         }
                     }
@@ -478,7 +476,7 @@ impl ReaderApp {
                     return;
                 }
 
-                match self.epub.cache_chapter_async(k, ch, &name).await {
+                match self.epub.cache_chapter_async(k, ch, name.as_str()).await {
                     Ok(()) => {
                         self.epub.cache_chapter += 1;
                         // try nearby image dispatch before next chapter
@@ -494,26 +492,7 @@ impl ReaderApp {
                 }
             }
 
-            BgCacheState::WaitNearbyImage => {
-                match self.epub_recv_image_result(k) {
-                    Ok(Some(_)) => {
-                        if self.try_dispatch_nearby_image(k) {
-                            // stay in WaitNearbyImage
-                        } else {
-                            self.epub.bg_cache = BgCacheState::CacheChapter;
-                        }
-                    }
-                    Ok(None) if work_queue::is_idle() => {
-                        log::warn!("bg: worker idle with no result, recovering");
-                        self.epub.bg_cache = BgCacheState::CacheChapter;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!("bg: nearby image error: {}, continuing", e);
-                        self.epub.bg_cache = BgCacheState::CacheChapter;
-                    }
-                }
-            }
+            BgCacheState::WaitNearbyImage => self.poll_image_wait(k, true),
             BgCacheState::CacheImage => {
                 match self.epub_find_and_dispatch_image(k) {
                     Ok(true) => {
@@ -530,18 +509,7 @@ impl ReaderApp {
                     }
                 }
             }
-            BgCacheState::WaitImage => match self.epub_recv_image_result(k) {
-                Ok(Some(_)) => self.epub.bg_cache = BgCacheState::CacheImage,
-                Ok(None) if work_queue::is_idle() => {
-                    log::warn!("bg: worker idle with no result, recovering");
-                    self.epub.bg_cache = BgCacheState::CacheImage;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("bg: image recv error: {}", e);
-                    self.epub.bg_cache = BgCacheState::CacheImage;
-                }
-            },
+            BgCacheState::WaitImage => self.poll_image_wait(k, false),
             BgCacheState::Idle => {}
         }
     }

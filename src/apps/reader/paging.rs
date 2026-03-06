@@ -98,8 +98,7 @@ impl ReaderApp {
         self.pg.fully_indexed = false;
         self.pg.buf_len = 0;
         self.pg.line_count = 0;
-        self.pg.prefetch_page = NO_PREFETCH;
-        self.pg.prefetch_len = 0;
+        self.pg.clear_prefetch();
         self.page_img = None;
         self.fullscreen_img = false;
     }
@@ -116,23 +115,20 @@ impl ReaderApp {
                 self.pg.buf[..n].copy_from_slice(&self.epub.ch_cache[start..end]);
             }
             self.pg.buf_len = n;
-            self.pg.prefetch_page = NO_PREFETCH;
-            self.pg.prefetch_len = 0;
+            self.pg.clear_prefetch();
             self.prescan_image_heights(k, n);
             self.wrap_lines_counted(n);
             self.decode_page_images(k);
             return Ok(());
         }
 
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let name = self.name_copy();
 
         if self.pg.prefetch_page == self.pg.page {
             let pf_len = self.pg.prefetch_len;
             self.pg.buf[..pf_len].copy_from_slice(&self.pg.prefetch[..pf_len]);
             self.pg.buf_len = pf_len;
-            self.pg.prefetch_page = NO_PREFETCH;
-            self.pg.prefetch_len = 0;
+            self.pg.clear_prefetch();
         } else if self.is_epub && self.epub.chapters_cached {
             let cf_str = self.epub.cache_file_str();
             let ch = self.epub.chapter as usize;
@@ -144,10 +140,10 @@ impl ReaderApp {
             )?;
             self.pg.buf_len = n;
         } else if self.file_size == 0 {
-            let (size, n) = k.read_file_start(name, &mut self.pg.buf)?;
+            let (size, n) = k.read_file_start(name.as_str(), &mut self.pg.buf)?;
             self.file_size = size;
             self.pg.buf_len = n;
-            log::info!("reader: opened {} ({} bytes)", name, size);
+            log::info!("reader: opened {} ({} bytes)", name.as_str(), size);
 
             if size == 0 {
                 self.pg.fully_indexed = true;
@@ -155,7 +151,11 @@ impl ReaderApp {
                 return Ok(());
             }
         } else {
-            let n = k.read_chunk(name, self.pg.offsets[self.pg.page], &mut self.pg.buf)?;
+            let n = k.read_chunk(
+                name.as_str(),
+                self.pg.offsets[self.pg.page],
+                &mut self.pg.buf,
+            )?;
             self.pg.buf_len = n;
         }
 
@@ -187,7 +187,7 @@ impl ReaderApp {
                 let ch_base = self.epub.chapter_table[ch].0;
                 k.read_cache_chunk(cf_str, ch_base + pf_offset, &mut self.pg.prefetch)
             } else {
-                k.read_chunk(name, pf_offset, &mut self.pg.prefetch)
+                k.read_chunk(name.as_str(), pf_offset, &mut self.pg.prefetch)
             };
             match pf_result {
                 Ok(n) => {
@@ -195,13 +195,11 @@ impl ReaderApp {
                     self.pg.prefetch_page = self.pg.page + 1;
                 }
                 Err(_) => {
-                    self.pg.prefetch_page = NO_PREFETCH;
-                    self.pg.prefetch_len = 0;
+                    self.pg.clear_prefetch();
                 }
             }
         } else {
-            self.pg.prefetch_page = NO_PREFETCH;
-            self.pg.prefetch_len = 0;
+            self.pg.clear_prefetch();
         }
 
         self.decode_page_images(k);
@@ -400,15 +398,7 @@ pub(super) fn wrap_proportional(
 
     #[inline]
     fn current_style(bold: bool, italic: bool, heading: bool) -> fonts::Style {
-        if heading {
-            fonts::Style::Heading
-        } else if bold {
-            fonts::Style::Bold
-        } else if italic {
-            fonts::Style::Italic
-        } else {
-            fonts::Style::Regular
-        }
+        LineSpan::style_from_flags(LineSpan::pack_flags(bold, italic, heading))
     }
 
     macro_rules! emit {

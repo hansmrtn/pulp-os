@@ -14,20 +14,6 @@ use crate::drivers::strip::StripBuffer;
 use crate::ui::Region;
 
 #[inline]
-pub fn draw_selection(strip: &mut StripBuffer, region: Region, selected: bool) -> BinaryColor {
-    if selected {
-        region
-            .to_rect()
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .unwrap();
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
-    }
-}
-
-#[inline]
 pub fn draw_selection_if_visible(
     strip: &mut StripBuffer,
     region: Region,
@@ -41,15 +27,6 @@ pub fn draw_selection_if_visible(
             .unwrap();
         BinaryColor::Off
     } else if selected {
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
-    }
-}
-
-#[inline]
-pub const fn selection_fg(selected: bool) -> BinaryColor {
-    if selected {
         BinaryColor::Off
     } else {
         BinaryColor::On

@@ -7,7 +7,7 @@
 // and dispatch_one_image_in_chapter (nearby prefetch) call through it
 
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::ops::ControlFlow;
 
 use crate::kernel::work_queue::DecodedImage;
 use smol_epub::cache;
@@ -40,6 +40,33 @@ enum ScanResult {
     DecodedInline { resume_offset: u32 },
     // no uncached images found from the given offset
     NoneFound,
+}
+
+// decode with OOM retry: if the first attempt fails and ch_cache is non-empty,
+// release it and retry once
+fn decode_with_oom_retry(
+    k: &mut KernelHandle<'_>,
+    epub_name: &str,
+    entry: &smol_epub::zip::ZipEntry,
+    is_jpeg: bool,
+    max_w: u16,
+    max_h: u16,
+    ch_cache: &mut Vec<u8>,
+) -> crate::error::Result<DecodedImage> {
+    let result = decode_image_streaming(k, epub_name, entry, is_jpeg, max_w, max_h);
+    match result {
+        Ok(img) => Ok(img),
+        Err(e) if !ch_cache.is_empty() => {
+            log::info!(
+                "decode: failed ({}), releasing {} KB ch_cache and retrying",
+                e,
+                ch_cache.len() / 1024,
+            );
+            *ch_cache = Vec::new();
+            decode_image_streaming(k, epub_name, entry, is_jpeg, max_w, max_h)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 impl ReaderApp {
@@ -94,9 +121,7 @@ impl ReaderApp {
 
         log::info!("reader: decoding image: {}", src_str);
 
-        let ch_zip_idx = self.epub.spine.items[self.epub.chapter as usize] as usize;
-        let ch_path = self.epub.zip.entry_name(ch_zip_idx);
-        let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let ch_dir = self.epub.chapter_dir(self.epub.chapter as usize);
 
         let mut path_buf = [0u8; 512];
         let path_len = epub::resolve_path(ch_dir, src_str, &mut path_buf);
@@ -170,134 +195,25 @@ impl ReaderApp {
         };
 
         let entry = *self.epub.zip.entry(zip_idx);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let epub_name = self.name_copy();
 
-        let data_offset = {
-            let mut hdr = [0u8; 30];
-            if k.read_chunk(epub_name, entry.local_offset, &mut hdr)
-                .is_err()
-            {
-                log::warn!("reader: failed to read ZIP local header");
-                return;
-            }
-            match ZipIndex::local_header_data_skip(&hdr) {
-                Ok(skip) => entry.local_offset + skip,
-                Err(e) => {
-                    log::warn!("reader: {}", e);
-                    return;
-                }
-            }
-        };
-
-        let ext_jpeg = full_path.ends_with(".jpg")
-            || full_path.ends_with(".jpeg")
-            || full_path.ends_with(".JPG")
-            || full_path.ends_with(".JPEG");
-        let ext_png = full_path.ends_with(".png") || full_path.ends_with(".PNG");
-
-        let (is_jpeg, is_png) = if ext_jpeg || ext_png {
-            (ext_jpeg, ext_png)
-        } else if entry.method == zip::METHOD_STORED {
-            let mut magic = [0u8; 8];
-            let n = k
-                .read_chunk(epub_name, data_offset, &mut magic)
-                .unwrap_or(0);
-            (
-                n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
-                n >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
-            )
-        } else {
-            (false, false)
-        };
-
+        let is_jpeg = is_image_ext_jpeg(full_path);
+        let is_png = is_image_ext_png(full_path);
         if !is_jpeg && !is_png {
             log::warn!("reader: unsupported image format: {}", full_path);
             return;
         }
 
-        // decode at the context-appropriate budget: inline images use
-        // the capped height so they scale proportionally; fullscreen
-        // images use the full text area
-        let img_max_h = img_budget_h;
-
         let img_max_w = self.text_w as u16;
-        let do_decode = |k_ref: &mut KernelHandle<'_>| -> Result<DecodedImage, &'static str> {
-            let k_cell = RefCell::new(k_ref);
-            let read_err = |e: Error| -> &'static str { e.into() };
-            let raw = if is_jpeg && entry.method == zip::METHOD_STORED {
-                smol_epub::jpeg::decode_jpeg_sd(
-                    |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
-                            .map_err(read_err)
-                    },
-                    data_offset,
-                    entry.uncomp_size,
-                    img_max_w,
-                    img_max_h,
-                )
-            } else if is_jpeg {
-                smol_epub::jpeg::decode_jpeg_deflate_sd(
-                    |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
-                            .map_err(read_err)
-                    },
-                    data_offset,
-                    entry.comp_size,
-                    entry.uncomp_size,
-                    img_max_w,
-                    img_max_h,
-                )
-            } else if entry.method == zip::METHOD_STORED {
-                smol_epub::png::decode_png_sd(
-                    |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
-                            .map_err(read_err)
-                    },
-                    data_offset,
-                    entry.uncomp_size,
-                    img_max_w,
-                    img_max_h,
-                )
-            } else {
-                smol_epub::png::decode_png_deflate_sd(
-                    |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
-                            .map_err(read_err)
-                    },
-                    data_offset,
-                    entry.comp_size,
-                    img_max_w,
-                    img_max_h,
-                )
-            };
-            raw.map(from_smol_image)
-        };
-
-        let result = do_decode(k);
-
-        // OOM fallback: release chapter cache and retry
-        let result = match result {
-            Ok(img) => Ok(img),
-            Err(e) if !self.epub.ch_cache.is_empty() => {
-                log::info!(
-                    "reader: decode failed ({}), releasing {} KB chapter cache and retrying",
-                    e,
-                    self.epub.ch_cache.len() / 1024,
-                );
-                self.epub.ch_cache = Vec::new();
-                do_decode(k)
-            }
-            Err(e) => Err(e),
-        };
+        let result = decode_with_oom_retry(
+            k,
+            epub_name.as_str(),
+            &entry,
+            is_jpeg,
+            img_max_w,
+            img_budget_h,
+            &mut self.epub.ch_cache,
+        );
 
         match result {
             Ok(img) => {
@@ -337,14 +253,11 @@ impl ReaderApp {
             return;
         }
 
-        let ch_zip_idx = self.epub.spine.items[self.epub.chapter as usize] as usize;
-        let ch_path = self.epub.zip.entry_name(ch_zip_idx);
-        let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let ch_dir = self.epub.chapter_dir(self.epub.chapter as usize);
 
         let dir = self.epub.cache_dir_str();
 
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let epub_name = self.name_copy();
 
         let text_w = self.text_w;
         let text_area_h = self.text_area_h;
@@ -400,7 +313,14 @@ impl ReaderApp {
                 h
             } else {
                 // try 2: peek source dimensions from the ZIP entry
-                peek_source_dimensions(k, epub_name, &self.epub.zip, full_path, text_w, text_area_h)
+                peek_source_dimensions(
+                    k,
+                    epub_name.as_str(),
+                    &self.epub.zip,
+                    full_path,
+                    text_w,
+                    text_area_h,
+                )
             };
 
             // cap to the inline budget; fullscreen images bypass line
@@ -411,10 +331,165 @@ impl ReaderApp {
         }
     }
 
+    // process one IMG_REF marker found during scan_chapter_for_image.
+    // resolves the image path, checks cache, and either skips, decodes
+    // inline, or dispatches to the background worker.
+    //
+    // returns Continue(()) to keep scanning, or Break(ScanResult) to
+    // return from the outer scan immediately.
+    fn process_image_marker(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        ch: usize,
+        dir: &str,
+        epub_name: &str,
+        src_bytes: &[u8],
+        chunk_offset: usize,
+        marker_pos: usize,
+        marker_end: usize,
+    ) -> ControlFlow<ScanResult> {
+        let src_str = match core::str::from_utf8(src_bytes) {
+            Ok(s) if !s.is_empty() => s,
+            _ => return ControlFlow::Continue(()),
+        };
+
+        let mut path_buf = [0u8; 512];
+        let plen = epub::resolve_path(self.epub.chapter_dir(ch), src_str, &mut path_buf);
+        let full_path = match core::str::from_utf8(&path_buf[..plen]) {
+            Ok(s) => s,
+            Err(_) => return ControlFlow::Continue(()),
+        };
+
+        let path_hash = cache::fnv1a(full_path.as_bytes());
+        let img_name = img_cache_name(path_hash);
+        let img_file = img_cache_str(&img_name);
+        let resume = (chunk_offset + marker_end) as u32;
+
+        // already cached or skip-marked
+        if k.file_size_app_subdir(dir, img_file).is_ok() {
+            self.epub.mark_img_cached();
+            return ControlFlow::Continue(());
+        }
+
+        let is_jpeg = is_image_ext_jpeg(full_path);
+        let is_png = is_image_ext_png(full_path);
+
+        if !is_jpeg && !is_png {
+            log::info!("precache: skip unsupported: {}", full_path);
+            let _ = k.write_app_subdir(dir, img_file, &[]);
+            self.epub.mark_img_cached();
+            return ControlFlow::Continue(());
+        }
+
+        let zip_idx = match self
+            .epub
+            .zip
+            .find(full_path)
+            .or_else(|| self.epub.zip.find_icase(full_path))
+        {
+            Some(idx) => idx,
+            None => {
+                log::warn!("precache: {} not in ZIP", full_path);
+                self.epub.mark_img_cached();
+                return ControlFlow::Continue(());
+            }
+        };
+
+        let entry = *self.epub.zip.entry(zip_idx);
+
+        // large images: decode via streaming SD reads on main loop.
+        // if a previous streaming decode failed (OOM), skip all
+        // remaining large images so the device stays responsive
+        if entry.uncomp_size > PRECACHE_IMG_MAX {
+            if self.epub.skip_large_img {
+                let _ = k.write_app_subdir(dir, img_file, &[]);
+                self.epub.mark_img_cached();
+                return ControlFlow::Continue(());
+            }
+
+            log::info!(
+                "precache: streaming {} ({} bytes)",
+                full_path,
+                entry.uncomp_size,
+            );
+            let img_w = self.text_w as u16;
+            let img_h = self.text_area_h;
+            let result = decode_with_oom_retry(
+                k,
+                epub_name,
+                &entry,
+                is_jpeg,
+                img_w,
+                img_h,
+                &mut self.epub.ch_cache,
+            );
+
+            match result {
+                Ok(img) => {
+                    log::info!(
+                        "precache: decoded {}x{} ({}B)",
+                        img.width,
+                        img.height,
+                        img.data.len(),
+                    );
+                    let _ = save_cached_image(k, dir, img_file, &img);
+                }
+                Err(e) => {
+                    log::warn!("precache: streaming failed: {}", e);
+                    let _ = k.write_app_subdir(dir, img_file, &[]);
+                    self.epub.skip_large_img = true;
+                }
+            }
+            self.epub.mark_img_cached();
+            return ControlFlow::Break(ScanResult::DecodedInline {
+                resume_offset: resume,
+            });
+        }
+
+        // wait for worker to have capacity before the
+        // expensive extraction (deflate + alloc)
+        if !work_queue::is_idle() || !work_queue::can_submit() {
+            return ControlFlow::Break(ScanResult::Dispatched {
+                resume_offset: (chunk_offset + marker_pos) as u32,
+            });
+        }
+
+        // small images: extract to memory for worker dispatch
+        let data = match super::extract_zip_entry(k, epub_name, &self.epub.zip, zip_idx) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("precache: extract failed: {}", e);
+                let _ = k.write_app_subdir(dir, img_file, &[]);
+                self.epub.mark_img_cached();
+                return ControlFlow::Continue(());
+            }
+        };
+
+        log::info!("precache: dispatch {} ({} bytes)", full_path, data.len());
+
+        let task = work_queue::WorkTask::DecodeImage {
+            path_hash,
+            data,
+            is_jpeg,
+            max_w: self.text_w as u16,
+            max_h: self.text_area_h,
+        };
+        if work_queue::submit(self.epub.work_gen, task) {
+            self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
+            return ControlFlow::Break(ScanResult::Dispatched {
+                resume_offset: resume,
+            });
+        }
+        // rare race: channel filled between can_submit() and submit()
+        log::info!("precache: queue race, will retry {}", full_path);
+        ControlFlow::Break(ScanResult::Dispatched {
+            resume_offset: (chunk_offset + marker_pos) as u32,
+        })
+    }
+
     // scan one chapter from start_offset for the first uncached image.
     // reads chapter data in chunks via self.prefetch, finds IMG_REF
-    // markers, resolves paths against the ZIP, checks the SD cache,
-    // and either decodes inline (large) or dispatches to worker (small).
+    // markers, and delegates each to process_image_marker.
     fn scan_chapter_for_image(
         &mut self,
         k: &mut KernelHandle<'_>,
@@ -439,8 +514,7 @@ impl ReaderApp {
 
         let dir_buf = self.epub.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let epub_name = self.name_copy();
 
         let cf = self.epub.cache_file;
         let cf_str = cache::cache_filename_str(&cf);
@@ -475,177 +549,23 @@ impl ReaderApp {
                 let mut src_buf = [0u8; 128];
                 let src_n = path_len.min(src_buf.len());
                 src_buf[..src_n].copy_from_slice(&self.pg.prefetch[path_start..path_start + src_n]);
-                let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
-                    Ok(s) if !s.is_empty() => s,
-                    _ => {
+
+                match self.process_image_marker(
+                    k,
+                    ch,
+                    dir,
+                    epub_name.as_str(),
+                    &src_buf[..src_n],
+                    offset,
+                    i,
+                    path_start + path_len,
+                ) {
+                    ControlFlow::Break(result) => return Ok(result),
+                    ControlFlow::Continue(()) => {
                         i = path_start + path_len;
                         continue;
                     }
-                };
-
-                let mut path_buf = [0u8; 512];
-                let plen = {
-                    let ch_zip_idx = self.epub.spine.items[ch] as usize;
-                    let ch_path = self.epub.zip.entry_name(ch_zip_idx);
-                    let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                    epub::resolve_path(ch_dir, src_str, &mut path_buf)
-                };
-                let full_path = match core::str::from_utf8(&path_buf[..plen]) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                let path_hash = cache::fnv1a(full_path.as_bytes());
-                let img_name = img_cache_name(path_hash);
-                let img_file = img_cache_str(&img_name);
-                let resume = (offset + path_start + path_len) as u32;
-
-                // already cached or skip-marked
-                if k.file_size_app_subdir(dir, img_file).is_ok() {
-                    self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                    self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                    i = path_start + path_len;
-                    continue;
                 }
-
-                let is_jpeg = is_image_ext_jpeg(full_path);
-                let is_png = is_image_ext_png(full_path);
-
-                if !is_jpeg && !is_png {
-                    log::info!("precache: skip unsupported: {}", full_path);
-                    let _ = k.write_app_subdir(dir, img_file, &[]);
-                    self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                    self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                    i = path_start + path_len;
-                    continue;
-                }
-
-                let zip_idx = match self
-                    .epub
-                    .zip
-                    .find(full_path)
-                    .or_else(|| self.epub.zip.find_icase(full_path))
-                {
-                    Some(idx) => idx,
-                    None => {
-                        log::warn!("precache: {} not in ZIP", full_path);
-                        self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                        self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                let entry = *self.epub.zip.entry(zip_idx);
-
-                // large images: decode via streaming SD reads on main loop.
-                // if a previous streaming decode failed (OOM), skip all
-                // remaining large images so the device stays responsive
-                if entry.uncomp_size > PRECACHE_IMG_MAX {
-                    if self.epub.skip_large_img {
-                        let _ = k.write_app_subdir(dir, img_file, &[]);
-                        self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                        self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                        i = path_start + path_len;
-                        continue;
-                    }
-
-                    log::info!(
-                        "precache: streaming {} ({} bytes)",
-                        full_path,
-                        entry.uncomp_size,
-                    );
-                    let img_w = self.text_w as u16;
-                    let img_h = self.text_area_h;
-                    let result =
-                        decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h);
-
-                    // OOM fallback: release chapter cache and retry
-                    let result = match result {
-                        Ok(img) => Ok(img),
-                        Err(e) if !self.epub.ch_cache.is_empty() => {
-                            log::info!(
-                                "precache: streaming failed ({}), releasing {} KB ch_cache and retrying",
-                                e,
-                                self.epub.ch_cache.len() / 1024,
-                            );
-                            self.epub.ch_cache = Vec::new();
-                            decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h)
-                        }
-                        Err(e) => Err(e),
-                    };
-
-                    match result {
-                        Ok(img) => {
-                            log::info!(
-                                "precache: decoded {}x{} ({}B)",
-                                img.width,
-                                img.height,
-                                img.data.len(),
-                            );
-                            let _ = save_cached_image(k, dir, img_file, &img);
-                        }
-                        Err(e) => {
-                            log::warn!("precache: streaming failed: {}", e);
-                            let _ = k.write_app_subdir(dir, img_file, &[]);
-                            // stop trying large images this session
-                            self.epub.skip_large_img = true;
-                        }
-                    }
-                    self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                    self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                    return Ok(ScanResult::DecodedInline {
-                        resume_offset: resume,
-                    });
-                }
-
-                // wait for worker to have capacity before the
-                // expensive extraction (deflate + alloc).  check both
-                // idle state and channel room to avoid extracting data
-                // that can't be submitted.
-                if !work_queue::is_idle() || !work_queue::can_submit() {
-                    return Ok(ScanResult::Dispatched {
-                        resume_offset: (offset + i) as u32,
-                    });
-                }
-
-                // small images: extract to memory for worker dispatch
-                let data = match super::extract_zip_entry(k, epub_name, &self.epub.zip, zip_idx) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::warn!("precache: extract failed: {}", e);
-                        let _ = k.write_app_subdir(dir, img_file, &[]);
-                        self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                        self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                log::info!("precache: dispatch {} ({} bytes)", full_path, data.len(),);
-
-                let task = work_queue::WorkTask::DecodeImage {
-                    path_hash,
-                    data,
-                    is_jpeg,
-                    max_w: self.text_w as u16,
-                    max_h: self.text_area_h,
-                };
-                if work_queue::submit(self.epub.work_gen, task) {
-                    self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
-                    return Ok(ScanResult::Dispatched {
-                        resume_offset: resume,
-                    });
-                }
-                // rare race: channel filled between can_submit() and
-                // submit().  retry on next poll instead of skipping.
-                log::info!("precache: queue race, will retry {}", full_path);
-                return Ok(ScanResult::Dispatched {
-                    resume_offset: (offset + i) as u32,
-                });
             }
 
             // advance with overlap so markers at chunk boundaries are not missed
@@ -796,6 +716,13 @@ fn path_ext_eq(path: &str, ext: &[u8]) -> bool {
     p.len() >= need
         && p[p.len() - need] == b'.'
         && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext)
+}
+
+fn detect_image_format_magic(magic: &[u8], n: usize) -> (bool, bool) {
+    (
+        n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
+        n >= 8 && magic.len() >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
+    )
 }
 
 pub(super) fn is_image_ext_jpeg(path: &str) -> bool {
@@ -978,10 +905,7 @@ fn peek_source_dimensions(
         let n = k
             .read_chunk(epub_name, data_offset, &mut magic)
             .unwrap_or(0);
-        (
-            n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
-            n >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
-        )
+        detect_image_format_magic(&magic, n)
     };
 
     let read_err = |_: crate::error::Error| -> &'static str { "read failed" };

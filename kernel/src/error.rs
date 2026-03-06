@@ -188,8 +188,15 @@ impl PartialEq for Error {
 
 impl Eq for Error {}
 
-// wrap &'static str (smol-epub returns) into Error; well-known
-// strings map to the appropriate kind, rest becomes Other
+// Map &'static str error strings from smol-epub into typed ErrorKind.
+//
+// smol-epub (and the upload module) return &'static str errors across
+// the crate boundary.  Each known string is matched to an ErrorKind;
+// unrecognised strings fall through to ErrorKind::Other silently.
+//
+// IMPORTANT: if smol-epub changes or adds error messages, update this
+// match to keep the mapping correct.  Run `rg 'Err\("' ../smol-epub`
+// to audit the current set.
 impl From<&'static str> for Error {
     #[inline]
     fn from(msg: &'static str) -> Self {

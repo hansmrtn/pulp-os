@@ -99,7 +99,7 @@ fn action_label(action: Action) -> &'static str {
         Action::PrevJump => "<<",
         Action::Select => "OK",
         Action::Back => "Back",
-        Action::Menu => "",
+        Action::Menu => "Menu",
     }
 }
 

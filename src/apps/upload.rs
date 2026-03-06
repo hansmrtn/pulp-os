@@ -85,6 +85,30 @@ enum ServerEvent {
     DeleteFailed,
 }
 
+async fn show_error_and_exit(
+    epd: &mut Epd,
+    strip: &mut StripBuffer,
+    delay: &mut Delay,
+    heading: &'static BitmapFont,
+    body: &'static BitmapFont,
+    lines: &[&str],
+    bumps: &ButtonFeedback,
+) {
+    render_screen(
+        epd,
+        strip,
+        delay,
+        heading,
+        body,
+        lines,
+        Some("Press BACK to exit"),
+        bumps,
+        false,
+    )
+    .await;
+    drain_until_back().await;
+}
+
 pub async fn run_upload_mode(
     wifi: esp_hal::peripherals::WIFI<'static>,
     epd: &mut Epd,
@@ -99,7 +123,7 @@ pub async fn run_upload_mode(
     let body = fonts::chrome_font();
 
     if !wifi_cfg.has_credentials() {
-        render_screen(
+        show_error_and_exit(
             epd,
             strip,
             delay,
@@ -110,12 +134,9 @@ pub async fn run_upload_mode(
                 "Set wifi_ssid in",
                 "_PULP/SETTINGS.TXT",
             ],
-            Some("Press BACK to exit"),
             bumps,
-            false,
         )
         .await;
-        drain_until_back().await;
         return;
     }
 
@@ -135,19 +156,16 @@ pub async fn run_upload_mode(
         Ok(r) => r,
         Err(e) => {
             info!("upload: radio init failed: {:?}", e);
-            render_screen(
+            show_error_and_exit(
                 epd,
                 strip,
                 delay,
                 heading,
                 body,
                 &["Radio init failed!"],
-                Some("Press BACK to exit"),
                 bumps,
-                false,
             )
             .await;
-            drain_until_back().await;
             return;
         }
     };
@@ -156,19 +174,16 @@ pub async fn run_upload_mode(
         Ok(pair) => pair,
         Err(e) => {
             info!("upload: wifi::new failed: {:?}", e);
-            render_screen(
+            show_error_and_exit(
                 epd,
                 strip,
                 delay,
                 heading,
                 body,
                 &["WiFi init failed!"],
-                Some("Press BACK to exit"),
                 bumps,
-                false,
             )
             .await;
-            drain_until_back().await;
             return;
         }
     };
@@ -179,37 +194,31 @@ pub async fn run_upload_mode(
 
     if let Err(e) = wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
         info!("upload: set_config failed: {:?}", e);
-        render_screen(
+        show_error_and_exit(
             epd,
             strip,
             delay,
             heading,
             body,
             &["WiFi config error!"],
-            Some("Press BACK to exit"),
             bumps,
-            false,
         )
         .await;
-        drain_until_back().await;
         return;
     }
 
     if let Err(e) = wifi_ctrl.start_async().await {
         info!("upload: start failed: {:?}", e);
-        render_screen(
+        show_error_and_exit(
             epd,
             strip,
             delay,
             heading,
             body,
             &["WiFi start failed!"],
-            Some("Press BACK to exit"),
             bumps,
-            false,
         )
         .await;
-        drain_until_back().await;
         return;
     }
 
@@ -217,19 +226,16 @@ pub async fn run_upload_mode(
 
     if let Err(e) = wifi_ctrl.connect_async().await {
         info!("upload: connect failed: {:?}", e);
-        render_screen(
+        show_error_and_exit(
             epd,
             strip,
             delay,
             heading,
             body,
             &["Connection failed!"],
-            Some("Press BACK to exit"),
             bumps,
-            false,
         )
         .await;
-        drain_until_back().await;
         return;
     }
 
@@ -342,14 +348,19 @@ pub async fn run_upload_mode(
     info!("upload: exiting, tearing down WiFi");
 }
 
+async fn send_and_close(socket: &mut TcpSocket<'_>, header: &[u8], body: &[u8]) {
+    let _ = socket.write_all(header).await;
+    let _ = socket.write_all(body).await;
+    let _ = socket.flush().await;
+    close_socket(socket).await;
+}
+
 async fn serve_one_request(
     stack: embassy_net::Stack<'_>,
     rx_buf: &mut [u8],
     tx_buf: &mut [u8],
     sd: &SdStorage,
-) -> ServerEvent
-where
-{
+) -> ServerEvent {
     let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
     socket.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
 
@@ -394,13 +405,8 @@ where
         }
     }
 
-    let headers_end = match find_subsequence(&hdr[..hdr_len], b"\r\n\r\n") {
-        Some(p) => p,
-        None => {
-            close_socket(&mut socket).await;
-            return ServerEvent::Nothing;
-        }
-    };
+    // the loop above only breaks when \r\n\r\n is found, so unwrap is safe
+    let headers_end = find_subsequence(&hdr[..hdr_len], b"\r\n\r\n").unwrap();
     let body_offset = headers_end + 4;
     let initial_body = &hdr[body_offset..hdr_len];
     let headers = &hdr[..headers_end];
@@ -417,147 +423,138 @@ where
     let path = extract_path(request_line);
 
     if is_get && path == b"/" {
-        let _ = socket.write_all(HTTP_200_HTML).await;
-        let _ = socket.write_all(UPLOAD_PAGE).await;
-        let _ = socket.flush().await;
-        close_socket(&mut socket).await;
+        send_and_close(&mut socket, HTTP_200_HTML, UPLOAD_PAGE).await;
         return ServerEvent::Nothing;
     }
 
     if is_get && path == b"/files" {
-        let _ = socket.write_all(HTTP_200_JSON).await;
-
-        let mut entries = [storage::DirEntry::EMPTY; DIR_LIST_MAX];
-        let count = match storage::list_root_files(sd, &mut entries) {
-            Ok(n) => n,
-            Err(_) => {
-                let _ = socket.write_all(b"[]").await;
-                let _ = socket.flush().await;
-                close_socket(&mut socket).await;
-                return ServerEvent::Nothing;
-            }
-        };
-
-        let _ = socket.write_all(b"[").await;
-        let mut json_buf = [0u8; 80]; // per-entry scratch: {"name":"XXXXXXXX.XXX","size":4294967295}
-        for (i, e) in entries.iter().enumerate().take(count) {
-            let name = e.name_str();
-            let mut pos = 0usize;
-            let prefix = b"{\"name\":\"";
-            json_buf[..prefix.len()].copy_from_slice(prefix);
-            pos += prefix.len();
-            let nb = name.as_bytes();
-            json_buf[pos..pos + nb.len()].copy_from_slice(nb);
-            pos += nb.len();
-            let mid = b"\",\"size\":";
-            json_buf[pos..pos + mid.len()].copy_from_slice(mid);
-            pos += mid.len();
-
-            pos += fmt_u32(e.size, &mut json_buf[pos..]);
-            json_buf[pos] = b'}';
-            pos += 1;
-            if i + 1 < count {
-                json_buf[pos] = b',';
-                pos += 1;
-            }
-            let _ = socket.write_all(&json_buf[..pos]).await;
-        }
-        let _ = socket.write_all(b"]").await;
-        let _ = socket.flush().await;
-        close_socket(&mut socket).await;
-        return ServerEvent::Nothing;
+        return handle_get_files(&mut socket, sd).await;
     }
 
     if is_post && path == b"/upload" {
-        let boundary = match find_boundary(headers) {
-            Some(b) => b,
-            None => {
-                send_error_response(&mut socket, "Missing multipart boundary").await;
-                close_socket(&mut socket).await;
-                return ServerEvent::UploadFailed;
-            }
-        };
-
-        match handle_upload(&mut socket, sd, boundary, initial_body).await {
-            Ok((name_buf, name_len)) => {
-                let _ = socket.write_all(HTTP_200_TEXT).await;
-                let _ = socket.write_all(b"OK").await;
-                let _ = socket.flush().await;
-                close_socket(&mut socket).await;
-                return ServerEvent::Uploaded {
-                    name: name_buf,
-                    name_len,
-                };
-            }
-            Err(e) => {
-                info!("upload: handle_upload error: {}", e);
-                send_error_response(&mut socket, e).await;
-                close_socket(&mut socket).await;
-                return ServerEvent::UploadFailed;
-            }
-        }
+        return handle_post_upload(&mut socket, sd, headers, initial_body).await;
     }
 
     if is_post && path == b"/delete" {
-        let content_len = extract_content_length(headers).unwrap_or(0);
-        let max_body = content_len.min(13); // 8.3 filename max
-        let mut body = [0u8; 16];
-        let have = initial_body.len().min(body.len());
-        body[..have].copy_from_slice(&initial_body[..have]);
-        let mut body_len = have;
+        return handle_post_delete(&mut socket, sd, headers, initial_body).await;
+    }
 
-        while body_len < max_body && body_len < body.len() {
-            match socket.read(&mut body[body_len..]).await {
-                Ok(0) => break,
-                Ok(n) => body_len += n,
-                Err(_) => break,
+    send_and_close(&mut socket, HTTP_404, b"").await;
+    ServerEvent::Nothing
+}
+
+async fn handle_get_files(socket: &mut TcpSocket<'_>, sd: &SdStorage) -> ServerEvent {
+    let _ = socket.write_all(HTTP_200_JSON).await;
+
+    let mut entries = [storage::DirEntry::EMPTY; DIR_LIST_MAX];
+    let count = match storage::list_root_files(sd, &mut entries) {
+        Ok(n) => n,
+        Err(_) => {
+            send_and_close(socket, HTTP_200_JSON, b"[]").await;
+            return ServerEvent::Nothing;
+        }
+    };
+
+    let _ = socket.write_all(b"[").await;
+    let mut json_buf = [0u8; 80];
+    for (i, e) in entries.iter().enumerate().take(count) {
+        let len = stack_fmt(&mut json_buf, |w| {
+            let _ = write!(w, "{{\"name\":\"{}\",\"size\":{}}}", e.name_str(), e.size);
+            if i + 1 < count {
+                let _ = w.write_str(",");
+            }
+        });
+        let _ = socket.write_all(&json_buf[..len]).await;
+    }
+    let _ = socket.write_all(b"]").await;
+    let _ = socket.flush().await;
+    close_socket(socket).await;
+    ServerEvent::Nothing
+}
+
+async fn handle_post_upload(
+    socket: &mut TcpSocket<'_>,
+    sd: &SdStorage,
+    headers: &[u8],
+    initial_body: &[u8],
+) -> ServerEvent {
+    let boundary = match find_boundary(headers) {
+        Some(b) => b,
+        None => {
+            send_and_close(socket, HTTP_500_TEXT, b"Missing multipart boundary").await;
+            return ServerEvent::UploadFailed;
+        }
+    };
+
+    match handle_upload(socket, sd, boundary, initial_body).await {
+        Ok((name_buf, name_len)) => {
+            send_and_close(socket, HTTP_200_TEXT, b"OK").await;
+            ServerEvent::Uploaded {
+                name: name_buf,
+                name_len,
             }
         }
-
-        let name = match core::str::from_utf8(&body[..body_len]) {
-            Ok(s) => s.trim(),
-            Err(_) => {
-                send_error_response(&mut socket, "Invalid filename").await;
-                close_socket(&mut socket).await;
-                return ServerEvent::DeleteFailed;
-            }
-        };
-
-        if name.is_empty() || name.len() > 12 {
-            send_error_response(&mut socket, "Invalid filename").await;
-            close_socket(&mut socket).await;
-            return ServerEvent::DeleteFailed;
+        Err(e) => {
+            info!("upload: handle_upload error: {}", e);
+            send_and_close(socket, HTTP_500_TEXT, e.as_bytes()).await;
+            ServerEvent::UploadFailed
         }
+    }
+}
 
-        let mut name_buf = [0u8; 13];
-        let name_bytes = name.as_bytes();
-        name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
-        let name_len = name_bytes.len() as u8;
+async fn handle_post_delete(
+    socket: &mut TcpSocket<'_>,
+    sd: &SdStorage,
+    headers: &[u8],
+    initial_body: &[u8],
+) -> ServerEvent {
+    let content_len = extract_content_length(headers).unwrap_or(0);
+    let max_body = content_len.min(13); // 8.3 filename max
+    let mut body = [0u8; 16];
+    let have = initial_body.len().min(body.len());
+    body[..have].copy_from_slice(&initial_body[..have]);
+    let mut body_len = have;
 
-        match storage::delete_file(sd, name) {
-            Ok(()) => {
-                let _ = socket.write_all(HTTP_200_TEXT).await;
-                let _ = socket.write_all(b"OK").await;
-                let _ = socket.flush().await;
-                close_socket(&mut socket).await;
-                return ServerEvent::Deleted {
-                    name: name_buf,
-                    name_len,
-                };
-            }
-            Err(e) => {
-                info!("upload: delete failed for '{}': {}", name, e);
-                send_error_response(&mut socket, "delete failed").await;
-                close_socket(&mut socket).await;
-                return ServerEvent::DeleteFailed;
-            }
+    while body_len < max_body && body_len < body.len() {
+        match socket.read(&mut body[body_len..]).await {
+            Ok(0) => break,
+            Ok(n) => body_len += n,
+            Err(_) => break,
         }
     }
 
-    let _ = socket.write_all(HTTP_404).await;
-    let _ = socket.flush().await;
-    close_socket(&mut socket).await;
-    ServerEvent::Nothing
+    let name = match core::str::from_utf8(&body[..body_len]) {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            send_and_close(socket, HTTP_500_TEXT, b"Invalid filename").await;
+            return ServerEvent::DeleteFailed;
+        }
+    };
+
+    if name.is_empty() || name.len() > 12 {
+        send_and_close(socket, HTTP_500_TEXT, b"Invalid filename").await;
+        return ServerEvent::DeleteFailed;
+    }
+
+    let mut name_buf = [0u8; 13];
+    let name_bytes = name.as_bytes();
+    name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
+    let name_len = name_bytes.len() as u8;
+
+    match storage::delete_file(sd, name) {
+        Ok(()) => {
+            send_and_close(socket, HTTP_200_TEXT, b"OK").await;
+            ServerEvent::Deleted {
+                name: name_buf,
+                name_len,
+            }
+        }
+        Err(e) => {
+            info!("upload: delete failed for '{}': {}", name, e);
+            send_and_close(socket, HTTP_500_TEXT, b"delete failed").await;
+            ServerEvent::DeleteFailed
+        }
+    }
 }
 
 async fn handle_upload(
@@ -565,9 +562,7 @@ async fn handle_upload(
     sd: &SdStorage,
     boundary: &[u8],
     initial_body: &[u8],
-) -> Result<([u8; 13], u8), &'static str>
-where
-{
+) -> Result<([u8; 13], u8), &'static str> {
     if boundary.len() > MAX_BOUNDARY_LEN {
         return Err("boundary too long");
     }
@@ -787,30 +782,6 @@ fn is_valid_83_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~' | b'!' | b'#' | b'$' | b'&')
 }
 
-async fn send_error_response(socket: &mut TcpSocket<'_>, msg: &str) {
-    let _ = socket.write_all(HTTP_500_TEXT).await;
-    let _ = socket.write_all(msg.as_bytes()).await;
-    let _ = socket.flush().await;
-}
-
-fn fmt_u32(mut n: u32, buf: &mut [u8]) -> usize {
-    if n == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 10];
-    let mut pos = 0;
-    while n > 0 {
-        tmp[pos] = b'0' + (n % 10) as u8;
-        n /= 10;
-        pos += 1;
-    }
-    for i in 0..pos {
-        buf[i] = tmp[pos - 1 - i];
-    }
-    pos
-}
-
 fn extract_content_length(headers: &[u8]) -> Option<usize> {
     let marker = b"content-length:";
     let pos = headers
@@ -845,12 +816,7 @@ async fn close_socket(socket: &mut TcpSocket<'_>) {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {

@@ -27,6 +27,17 @@ use crate::ui::{
     SECTION_GAP, StackFmt, TITLE_Y, wrap_next, wrap_prev,
 };
 
+#[inline]
+fn adjust_idx(v: &mut u8, up: bool, max: u8) {
+    if up {
+        if *v < max {
+            *v += 1;
+        }
+    } else if *v > 0 {
+        *v -= 1;
+    }
+}
+
 // layout constants
 const ROW_H: u16 = 40;
 const ROW_GAP: u16 = 6;
@@ -205,77 +216,38 @@ impl SettingsApp {
         }
     }
 
-    // increment/decrement:
-
-    fn increment(&mut self) {
+    fn adjust(&mut self, up: bool) {
         match self.selected {
             0 => {
-                self.settings.sleep_timeout = match self.settings.sleep_timeout {
-                    0 => SLEEP_TIMEOUT_STEP,
-                    t if t >= MAX_SLEEP_TIMEOUT => MAX_SLEEP_TIMEOUT,
-                    t => t + SLEEP_TIMEOUT_STEP,
+                self.settings.sleep_timeout = if up {
+                    match self.settings.sleep_timeout {
+                        0 => SLEEP_TIMEOUT_STEP,
+                        t if t >= MAX_SLEEP_TIMEOUT => MAX_SLEEP_TIMEOUT,
+                        t => t + SLEEP_TIMEOUT_STEP,
+                    }
+                } else {
+                    match self.settings.sleep_timeout {
+                        t if t <= SLEEP_TIMEOUT_STEP => 0,
+                        t => t - SLEEP_TIMEOUT_STEP,
+                    }
                 };
             }
             1 => {
-                self.settings.ghost_clear_every = self
-                    .settings
-                    .ghost_clear_every
-                    .saturating_add(GHOST_CLEAR_STEP)
-                    .min(MAX_GHOST_CLEAR);
-            }
-            2 => {
-                if self.settings.book_font_size_idx < max_size_idx() {
-                    self.settings.book_font_size_idx += 1;
-                }
-            }
-            3 => {
-                if self.settings.ui_font_size_idx < max_size_idx() {
-                    self.settings.ui_font_size_idx += 1;
-                }
-            }
-            4 => {
-                if self.settings.reading_theme < NUM_READING_THEMES - 1 {
-                    self.settings.reading_theme += 1;
-                }
-            }
-            5 => {
-                self.settings.swap_buttons = !self.settings.swap_buttons;
-            }
-            _ => return,
-        }
-        self.save_needed = true;
-    }
-
-    fn decrement(&mut self) {
-        match self.selected {
-            0 => {
-                self.settings.sleep_timeout = match self.settings.sleep_timeout {
-                    t if t <= SLEEP_TIMEOUT_STEP => 0,
-                    t => t - SLEEP_TIMEOUT_STEP,
+                self.settings.ghost_clear_every = if up {
+                    self.settings
+                        .ghost_clear_every
+                        .saturating_add(GHOST_CLEAR_STEP)
+                        .min(MAX_GHOST_CLEAR)
+                } else {
+                    self.settings
+                        .ghost_clear_every
+                        .saturating_sub(GHOST_CLEAR_STEP)
+                        .max(MIN_GHOST_CLEAR)
                 };
             }
-            1 => {
-                self.settings.ghost_clear_every = self
-                    .settings
-                    .ghost_clear_every
-                    .saturating_sub(GHOST_CLEAR_STEP)
-                    .max(MIN_GHOST_CLEAR);
-            }
-            2 => {
-                if self.settings.book_font_size_idx > 0 {
-                    self.settings.book_font_size_idx -= 1;
-                }
-            }
-            3 => {
-                if self.settings.ui_font_size_idx > 0 {
-                    self.settings.ui_font_size_idx -= 1;
-                }
-            }
-            4 => {
-                if self.settings.reading_theme > 0 {
-                    self.settings.reading_theme -= 1;
-                }
-            }
+            2 => adjust_idx(&mut self.settings.book_font_size_idx, up, max_size_idx()),
+            3 => adjust_idx(&mut self.settings.ui_font_size_idx, up, max_size_idx()),
+            4 => adjust_idx(&mut self.settings.reading_theme, up, NUM_READING_THEMES - 1),
             5 => {
                 self.settings.swap_buttons = !self.settings.swap_buttons;
             }
@@ -358,31 +330,19 @@ impl App<AppId> for SettingsApp {
             ActionEvent::Press(Action::Back) => Transition::Pop,
             ActionEvent::LongPress(Action::Back) => Transition::Home,
 
-            ActionEvent::Press(Action::Next) => {
+            ActionEvent::Press(Action::Next) | ActionEvent::Press(Action::Prev) => {
+                let forward = matches!(event, ActionEvent::Press(Action::Next));
                 let old_selected = self.selected;
                 let old_scroll = self.scroll;
-                self.selected = wrap_next(self.selected, NUM_ITEMS);
-                if self.selected < old_selected {
-                    self.scroll = 0;
+                self.selected = if forward {
+                    wrap_next(self.selected, NUM_ITEMS)
                 } else {
-                    self.scroll_into_view();
-                }
-                if self.scroll != old_scroll {
-                    ctx.mark_dirty(self.list_region());
-                } else if self.selected != old_selected {
-                    let old_vis = old_selected - old_scroll;
-                    let new_vis = self.selected - self.scroll;
-                    ctx.mark_dirty(self.row_region(old_vis));
-                    ctx.mark_dirty(self.row_region(new_vis));
-                }
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::Prev) => {
-                let old_selected = self.selected;
-                let old_scroll = self.scroll;
-                self.selected = wrap_prev(self.selected, NUM_ITEMS);
-                if self.selected > old_selected {
+                    wrap_prev(self.selected, NUM_ITEMS)
+                };
+                // on wrap-around, snap scroll to the target end
+                if forward && self.selected < old_selected {
+                    self.scroll = 0;
+                } else if !forward && self.selected > old_selected {
                     self.scroll = NUM_ITEMS.saturating_sub(vis);
                 } else {
                     self.scroll_into_view();
@@ -390,25 +350,21 @@ impl App<AppId> for SettingsApp {
                 if self.scroll != old_scroll {
                     ctx.mark_dirty(self.list_region());
                 } else if self.selected != old_selected {
-                    let old_vis = old_selected - old_scroll;
-                    let new_vis = self.selected - self.scroll;
-                    ctx.mark_dirty(self.row_region(old_vis));
-                    ctx.mark_dirty(self.row_region(new_vis));
+                    ctx.mark_dirty(self.row_region(old_selected - old_scroll));
+                    ctx.mark_dirty(self.row_region(self.selected - self.scroll));
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
-                self.increment();
-                let v = self.selected - self.scroll;
-                ctx.mark_dirty(self.value_region(v));
+                self.adjust(true);
+                ctx.mark_dirty(self.value_region(self.selected - self.scroll));
                 Transition::None
             }
 
             ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
-                self.decrement();
-                let v = self.selected - self.scroll;
-                ctx.mark_dirty(self.value_region(v));
+                self.adjust(false);
+                ctx.mark_dirty(self.value_region(self.selected - self.scroll));
                 Transition::None
             }
 

@@ -32,7 +32,6 @@ pub enum Rotation {
     Deg270,
 }
 
-#[allow(dead_code)]
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
     pub const BOOSTER_SOFT_START: u8 = 0x0C;
@@ -40,7 +39,6 @@ mod cmd {
     pub const DATA_ENTRY_MODE: u8 = 0x11;
     pub const SW_RESET: u8 = 0x12;
     pub const TEMPERATURE_SENSOR: u8 = 0x18;
-    pub const WRITE_TEMP_REGISTER: u8 = 0x1A;
     pub const MASTER_ACTIVATION: u8 = 0x20;
     pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
     pub const DISPLAY_UPDATE_CONTROL_2: u8 = 0x22;
@@ -533,12 +531,16 @@ where
         self.initial_refresh = false;
     }
 
+    fn send_power_off_cmd(&mut self) {
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0x83]);
+        self.send_command(cmd::MASTER_ACTIVATION);
+    }
+
     // mode 1: image retained, ~3 uA; requires hw reset to wake
     pub fn enter_deep_sleep(&mut self) {
         if self.power_is_on {
-            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-            self.send_data(&[0x83]);
-            self.send_command(cmd::MASTER_ACTIVATION);
+            self.send_power_off_cmd();
             self.wait_busy(POWER_OFF_TIME_MS);
             self.power_is_on = false;
         }
@@ -562,17 +564,6 @@ where
 
     async fn wait_busy_async(&mut self) {
         let _ = self.busy.wait_for_low().await;
-    }
-
-    pub async fn write_full_frame_async<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        delay: &mut Delay,
-        draw: &F,
-    ) where
-        F: Fn(&mut StripBuffer),
-    {
-        self.write_full_frame(strip, delay, draw);
     }
 
     pub async fn partial_refresh_async<F>(
@@ -637,31 +628,22 @@ where
     ) where
         F: Fn(&mut StripBuffer),
     {
-        self.write_full_frame_async(strip, delay, draw).await;
+        self.write_full_frame(strip, delay, draw);
         self.update_full_async().await;
         self.initial_refresh = false;
     }
 
     pub async fn power_off_async(&mut self) {
         if self.power_is_on {
-            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-            self.send_data(&[0x83]);
-            self.send_command(cmd::MASTER_ACTIVATION);
+            self.send_power_off_cmd();
             self.wait_busy_async().await;
             self.power_is_on = false;
         }
     }
 
     async fn update_full_async(&mut self) {
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x40, 0x00]);
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xF7]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
+        self.start_full_update();
         self.wait_busy_async().await;
-
         self.power_is_on = false;
     }
 }

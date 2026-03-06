@@ -16,6 +16,38 @@ use bitmap::BitmapFont;
 
 pub const FONT_SIZE_COUNT: usize = 5;
 
+const BODY_FONTS: [&BitmapFont; FONT_SIZE_COUNT] = [
+    &font_data::REGULAR_BODY_XSMALL,
+    &font_data::REGULAR_BODY_SMALL,
+    &font_data::REGULAR_BODY_MEDIUM,
+    &font_data::REGULAR_BODY_LARGE,
+    &font_data::REGULAR_BODY_XLARGE,
+];
+
+const HEADING_FONTS: [&BitmapFont; FONT_SIZE_COUNT] = [
+    &font_data::REGULAR_HEADING_XSMALL,
+    &font_data::REGULAR_HEADING_SMALL,
+    &font_data::REGULAR_HEADING_MEDIUM,
+    &font_data::REGULAR_HEADING_LARGE,
+    &font_data::REGULAR_HEADING_XLARGE,
+];
+
+const BOLD_FONTS: [&BitmapFont; FONT_SIZE_COUNT] = [
+    &font_data::BOLD_BODY_XSMALL,
+    &font_data::BOLD_BODY_SMALL,
+    &font_data::BOLD_BODY_MEDIUM,
+    &font_data::BOLD_BODY_LARGE,
+    &font_data::BOLD_BODY_XLARGE,
+];
+
+const ITALIC_FONTS: [&BitmapFont; FONT_SIZE_COUNT] = [
+    &font_data::ITALIC_BODY_XSMALL,
+    &font_data::ITALIC_BODY_SMALL,
+    &font_data::ITALIC_BODY_MEDIUM,
+    &font_data::ITALIC_BODY_LARGE,
+    &font_data::ITALIC_BODY_XLARGE,
+];
+
 pub const FONT_SIZE_NAMES: &[&str] = &["XSmall", "Small", "Medium", "Large", "XLarge"];
 
 // pre-resolved body + heading font pair for a given size index
@@ -48,32 +80,22 @@ pub const fn max_size_idx() -> u8 {
     (FONT_SIZE_COUNT - 1) as u8
 }
 
+fn font_by_idx(table: &[&'static BitmapFont; FONT_SIZE_COUNT], idx: u8) -> &'static BitmapFont {
+    table[(idx as usize).min(FONT_SIZE_COUNT - 1)]
+}
+
 pub fn body_font(idx: u8) -> &'static BitmapFont {
-    match idx {
-        0 => &font_data::REGULAR_BODY_XSMALL,
-        1 => &font_data::REGULAR_BODY_SMALL,
-        2 => &font_data::REGULAR_BODY_MEDIUM,
-        3 => &font_data::REGULAR_BODY_LARGE,
-        4 => &font_data::REGULAR_BODY_XLARGE,
-        _ => &font_data::REGULAR_BODY_SMALL,
-    }
+    font_by_idx(&BODY_FONTS, idx)
 }
 
 // chrome font (button labels, quick-menu items, loading text)
 // always the XSmall body font, compact for UI chrome
 pub fn chrome_font() -> &'static BitmapFont {
-    body_font(0)
+    &font_data::REGULAR_BODY_XSMALL
 }
 
 pub fn heading_font(idx: u8) -> &'static BitmapFont {
-    match idx {
-        0 => &font_data::REGULAR_HEADING_XSMALL,
-        1 => &font_data::REGULAR_HEADING_SMALL,
-        2 => &font_data::REGULAR_HEADING_MEDIUM,
-        3 => &font_data::REGULAR_HEADING_LARGE,
-        4 => &font_data::REGULAR_HEADING_XLARGE,
-        _ => &font_data::REGULAR_HEADING_SMALL,
-    }
+    font_by_idx(&HEADING_FONTS, idx)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,44 +142,13 @@ impl FontSet {
     }
 
     pub fn for_size(idx: u8) -> Self {
-        match idx {
-            0 => Self::from_fonts(
-                &font_data::REGULAR_BODY_XSMALL,
-                &font_data::BOLD_BODY_XSMALL,
-                &font_data::ITALIC_BODY_XSMALL,
-                &font_data::REGULAR_HEADING_XSMALL,
-            ),
-            1 => Self::from_fonts(
-                &font_data::REGULAR_BODY_SMALL,
-                &font_data::BOLD_BODY_SMALL,
-                &font_data::ITALIC_BODY_SMALL,
-                &font_data::REGULAR_HEADING_SMALL,
-            ),
-            2 => Self::from_fonts(
-                &font_data::REGULAR_BODY_MEDIUM,
-                &font_data::BOLD_BODY_MEDIUM,
-                &font_data::ITALIC_BODY_MEDIUM,
-                &font_data::REGULAR_HEADING_MEDIUM,
-            ),
-            3 => Self::from_fonts(
-                &font_data::REGULAR_BODY_LARGE,
-                &font_data::BOLD_BODY_LARGE,
-                &font_data::ITALIC_BODY_LARGE,
-                &font_data::REGULAR_HEADING_LARGE,
-            ),
-            4 => Self::from_fonts(
-                &font_data::REGULAR_BODY_XLARGE,
-                &font_data::BOLD_BODY_XLARGE,
-                &font_data::ITALIC_BODY_XLARGE,
-                &font_data::REGULAR_HEADING_XLARGE,
-            ),
-            _ => Self::from_fonts(
-                &font_data::REGULAR_BODY_SMALL,
-                &font_data::BOLD_BODY_SMALL,
-                &font_data::ITALIC_BODY_SMALL,
-                &font_data::REGULAR_HEADING_SMALL,
-            ),
-        }
+        let i = (idx as usize).min(FONT_SIZE_COUNT - 1);
+        Self::from_fonts(
+            BODY_FONTS[i],
+            BOLD_FONTS[i],
+            ITALIC_FONTS[i],
+            HEADING_FONTS[i],
+        )
     }
 
     #[inline]
@@ -186,11 +177,6 @@ impl FontSet {
     }
 
     #[inline]
-    pub fn advance_byte(&self, b: u8, style: Style) -> u8 {
-        self.font(style).advance(bitmap::byte_to_char(b))
-    }
-
-    #[inline]
     pub fn draw_char(
         &self,
         strip: &mut StripBuffer,
@@ -200,17 +186,6 @@ impl FontSet {
         baseline: i32,
     ) -> u8 {
         self.font(style).draw_char(strip, ch, cx, baseline)
-    }
-
-    pub fn draw_bytes(
-        &self,
-        strip: &mut StripBuffer,
-        text: &[u8],
-        style: Style,
-        cx: i32,
-        baseline: i32,
-    ) -> i32 {
-        self.font(style).draw_bytes(strip, text, cx, baseline)
     }
 
     pub fn draw_str(
