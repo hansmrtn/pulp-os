@@ -3,14 +3,14 @@
 // widgets draw to logical coords, clipped here
 
 use embedded_graphics_core::{
+    Pixel,
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
     pixelcolor::BinaryColor,
     primitives::Rectangle,
-    Pixel,
 };
 
-use super::ssd1677::{Rotation, HEIGHT, WIDTH};
+use super::ssd1677::{HEIGHT, Rotation, WIDTH};
 use crate::ui::Region;
 
 pub const STRIP_ROWS: u16 = 40;

@@ -10,8 +10,8 @@ use crate::fonts::bitmap::FIRST_CHAR;
 use crate::kernel::KernelHandle;
 
 use super::{
-    decode_utf8_char, LineSpan, ReaderApp, State, DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE,
-    MAX_PAGES, NO_PREFETCH, PAGE_BUF,
+    DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
+    ReaderApp, State, decode_utf8_char,
 };
 
 impl ReaderApp {

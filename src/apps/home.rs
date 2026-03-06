@@ -510,9 +510,8 @@ impl HomeApp {
             .unwrap();
 
         if self.bm_count > 0 {
-            let mut status =
-                BitmapDynLabel::<20>::new(self.bm_status_region(), self.ui_fonts.body)
-                    .alignment(Alignment::CenterRight);
+            let mut status = BitmapDynLabel::<20>::new(self.bm_status_region(), self.ui_fonts.body)
+                .alignment(Alignment::CenterRight);
             let _ = write!(status, "{}/{}", self.bm_selected + 1, self.bm_count);
             status.draw(strip).unwrap();
         }

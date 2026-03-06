@@ -16,11 +16,11 @@ use smol_epub::html_strip::{IMG_REF, MARKER};
 use smol_epub::zip::{self, ZipIndex};
 
 use crate::error::{Error, ErrorKind};
-use crate::kernel::work_queue;
 use crate::kernel::KernelHandle;
+use crate::kernel::work_queue;
 
 use super::{
-    ReaderApp, DEFAULT_IMG_H, MAX_IMAGES_PER_PAGE, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX,
+    DEFAULT_IMG_H, MAX_IMAGES_PER_PAGE, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp,
 };
 
 fn from_smol_image(img: smol_epub::DecodedImage) -> DecodedImage {

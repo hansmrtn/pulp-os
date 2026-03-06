@@ -481,11 +481,7 @@ impl ReaderApp {
         } else {
             // image phase: 80% to 100%
             if img_found > 0 {
-                let _ = write!(
-                    lbuf,
-                    "Caching images {}/{}",
-                    img_cached, img_found
-                );
+                let _ = write!(lbuf, "Caching images {}/{}", img_cached, img_found);
                 (80 + (img_cached * 20) / img_found).min(100) as u8
             } else {
                 let _ = write!(lbuf, "Caching images");
@@ -582,7 +578,8 @@ impl ReaderApp {
             // apply line spacing: scale native line height by theme percentage
             self.font_line_h = ((native_h as u32 * spacing_pct as u32) / 100).max(1) as u16;
             self.font_ascent = fs.ascent(fonts::Style::Regular);
-            self.max_lines = ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE) as u8;
+            self.max_lines =
+                ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE) as u8;
             log::info!(
                 "font: size_idx={} line_h={} (native {} x {}%) ascent={} max_lines={} margin={}",
                 self.book_font_size_idx,
@@ -1345,7 +1342,7 @@ impl App<AppId> for ReaderApp {
                 }
             }
             QA_TOC => {
-        if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
+                if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
                     let toc = self.epub.toc.as_ref().unwrap();
                     log::info!("toc: opening ({} entries)", toc.len());
                     self.epub.toc_selected = 0;
@@ -1447,8 +1444,7 @@ impl App<AppId> for ReaderApp {
                     let _ = write!(
                         sbuf,
                         " [img {}/{}]",
-                        self.epub.img_cached_count,
-                        self.epub.img_found_count,
+                        self.epub.img_cached_count, self.epub.img_found_count,
                     );
                 } else {
                     let _ = write!(sbuf, " [img]");

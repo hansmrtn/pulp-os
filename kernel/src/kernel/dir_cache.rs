@@ -3,7 +3,7 @@
 
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{
-    list_root_files, read_file_start_in_dir, DirEntry, DirPage, PULP_DIR, TITLES_FILE,
+    DirEntry, DirPage, PULP_DIR, TITLES_FILE, list_root_files, read_file_start_in_dir,
 };
 use crate::error::Result;
 

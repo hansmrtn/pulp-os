@@ -111,23 +111,26 @@ impl EpubState {
                     self.archive_size,
                     self.name_hash,
                     self.spine.len(),
-                ).is_ok() && hdr.chapters_complete() {
+                )
+                .is_ok()
+                    && hdr.chapters_complete()
+                {
                     // read chapter table
                     let count = hdr.chapter_count as usize;
                     let tbl_bytes = count * cache::CHAPTER_ENTRY_SIZE;
                     let tbl_offset = hdr.table_offset();
                     if tbl_bytes <= scratch.len() {
-                        if let Ok(tn) = k.read_cache_chunk(
-                            cf_str,
-                            tbl_offset,
-                            &mut scratch[..tbl_bytes],
-                        ) && tn >= tbl_bytes
+                        if let Ok(tn) =
+                            k.read_cache_chunk(cf_str, tbl_offset, &mut scratch[..tbl_bytes])
+                            && tn >= tbl_bytes
                         {
                             if cache::parse_chapter_table(
                                 &scratch[..tbl_bytes],
                                 count,
                                 &mut self.chapter_table,
-                            ).is_ok() {
+                            )
+                            .is_ok()
+                            {
                                 self.chapters_cached = true;
                                 for i in 0..count {
                                     self.ch_cached[i] = true;
