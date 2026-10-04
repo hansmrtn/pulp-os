@@ -1,0 +1,13 @@
+# Host harness workspace for the English TXT/EPUB regression (T13).
+# Generated into target/reader-regression/<variant>/ by scripts/check-reader-regression.sh;
+# @ROOT@ is replaced by the repository root. `pulp/` (symlink created by the script) is the
+# source tree under test: the work tree, or a `git archive` of the pre-port commit.
+[workspace]
+resolver = "2"
+members = ["esp-hal-shim", "kernel", "os"]
+
+[profile.dev]
+opt-level = 1
+debug = 0
+[profile.dev.build-override]
+opt-level = 3

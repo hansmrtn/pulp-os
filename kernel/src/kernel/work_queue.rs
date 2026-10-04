@@ -22,7 +22,7 @@ use embassy_sync::channel::Channel;
 pub struct DecodedImage {
     pub width: u16,
     pub height: u16,
-    pub data: Vec<u8>,
+    pub data: super::BigBuf,
     pub stride: usize,
 }
 

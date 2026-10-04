@@ -16,6 +16,40 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
 use crate::ui::{Alignment, Region};
 
+// the physical keys the overlay labels, by position: X4 Back / Confirm / Left /
+// Right on the bottom edge and Vol Up / Vol Down on the right edge; on the
+// OnePage C61 the front ladder Back / Enter / Left / Right and the side keys
+// Prev / Next
+mod keys {
+    use crate::board::button::Button;
+
+    #[cfg(feature = "board-x4")]
+    pub const BACK: Button = Button::Back;
+    #[cfg(feature = "board-x4")]
+    pub const CONFIRM: Button = Button::Confirm;
+    #[cfg(feature = "board-x4")]
+    pub const LEFT: Button = Button::Left;
+    #[cfg(feature = "board-x4")]
+    pub const RIGHT: Button = Button::Right;
+    #[cfg(feature = "board-x4")]
+    pub const SIDE_UP: Button = Button::VolUp;
+    #[cfg(feature = "board-x4")]
+    pub const SIDE_DOWN: Button = Button::VolDown;
+
+    #[cfg(feature = "board-onepage-c61")]
+    pub const BACK: Button = Button::Back;
+    #[cfg(feature = "board-onepage-c61")]
+    pub const CONFIRM: Button = Button::Enter;
+    #[cfg(feature = "board-onepage-c61")]
+    pub const LEFT: Button = Button::Left;
+    #[cfg(feature = "board-onepage-c61")]
+    pub const RIGHT: Button = Button::Right;
+    #[cfg(feature = "board-onepage-c61")]
+    pub const SIDE_UP: Button = Button::Prev;
+    #[cfg(feature = "board-onepage-c61")]
+    pub const SIDE_DOWN: Button = Button::Next;
+}
+
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;
 
@@ -41,32 +75,32 @@ struct BumpDef {
 
 const BUMPS: [BumpDef; NUM_BUMPS] = [
     BumpDef {
-        button: Button::Back,
+        button: keys::BACK,
         edge: Edge::Bottom,
         center: CX_BACK,
     },
     BumpDef {
-        button: Button::Confirm,
+        button: keys::CONFIRM,
         edge: Edge::Bottom,
         center: CX_CONFIRM,
     },
     BumpDef {
-        button: Button::Left,
+        button: keys::LEFT,
         edge: Edge::Bottom,
         center: CX_LEFT,
     },
     BumpDef {
-        button: Button::Right,
+        button: keys::RIGHT,
         edge: Edge::Bottom,
         center: CX_RIGHT,
     },
     BumpDef {
-        button: Button::VolUp,
+        button: keys::SIDE_UP,
         edge: Edge::Right,
         center: CY_VOL_UP,
     },
     BumpDef {
-        button: Button::VolDown,
+        button: keys::SIDE_DOWN,
         edge: Edge::Right,
         center: CY_VOL_DOWN,
     },

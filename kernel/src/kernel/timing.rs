@@ -15,20 +15,21 @@ pub const INPUT_TICK_SLOW_MS: u64 = 50;
 // number of ticks at fast rate after the last event before switching to slow
 pub const INPUT_IDLE_TICKS: u32 = 100; // 100 * 10ms = 1 second
 
-// button debounce window (ms)
+// button debounce window (ms); debounce/long-press/repeat/oversample values
+// live in pulp-board-logic (shared with the OnePage C61 input path)
 // raw input must be stable for this duration before registering
-pub const DEBOUNCE_MS: u64 = 15;
+pub const DEBOUNCE_MS: u64 = pulp_board_logic::input::DEBOUNCE_MS; // 15
 
 // long-press detection threshold (ms)
 // holding a button for this duration generates a LongPress event
-pub const LONG_PRESS_MS: u64 = 1000;
+pub const LONG_PRESS_MS: u64 = pulp_board_logic::input::LONG_PRESS_MS; // 1000
 
 // key repeat interval (ms)
 // after long-press, generates Repeat events at this rate
-pub const REPEAT_MS: u64 = 150;
+pub const REPEAT_MS: u64 = pulp_board_logic::input::REPEAT_MS; // 150
 
 // ADC oversampling count
-pub const ADC_OVERSAMPLE: u32 = 4;
+pub const ADC_OVERSAMPLE: u32 = pulp_board_logic::input::ADC_OVERSAMPLE; // 4
 
 // status log interval (s)
 pub const STATUS_INTERVAL_SECS: u64 = 5;

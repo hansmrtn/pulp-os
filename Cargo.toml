@@ -1,9 +1,11 @@
 [workspace]
-members = [".", "kernel"]
+members = [".", "kernel", "board-logic"]
 
 [workspace.dependencies]
-esp-hal  = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
-embassy-executor = "0.9"
+# chip selection (esp32c3 / esp32c61) is NOT set here; it comes from the
+# target-specific dependency tables of each crate (see "Board selection").
+esp-hal  = { version = "=1.2.0", features = ["log-04", "unstable"] }
+embassy-executor = "0.10"
 embassy-time     = "0.5"
 embassy-futures  = "0.1"
 embassy-sync     = "0.7"
@@ -18,12 +20,12 @@ critical-section = "1.2.0"
 static_cell      = "2.1.1"
 nb  = "1.1.0"
 log = "0.4.27"
-esp-alloc = { version = "0.9.0", features = ["internal-heap-stats"] }
+esp-alloc = { version = "=0.11.0", features = ["internal-heap-stats"] }
 
 [package]
 edition      = "2024"
 name         = "pulp-os"
-rust-version = "1.88"
+rust-version = "1.95"
 version      = "0.1.0"
 authors      = ["Hans Martin <https://github.com/hansmrtn>"]
 repository   = "https://github.com/hansmrtn/pulp-os"
@@ -32,6 +34,52 @@ license      = "MIT"
 [[bin]]
 name = "pulp-os"
 path = "./src/bin/main.rs"
+required-features = ["board-x4"]
+
+# OnePage C61 full offline firmware (T12)
+[[bin]]
+name = "pulp-os-c61"
+path = "./src/bin/main_c61.rs"
+required-features = ["board-onepage-c61"]
+
+# OnePage C61 minimal bring-up image (T2-T11 proofs: pins, SD, EPD, keys, PSRAM,
+# battery/USB, session, sleep demo); kept for hardware bring-up (T14)
+[[bin]]
+name = "pulp-os-c61-boot"
+path = "./src/bin/c61_boot.rs"
+required-features = ["board-onepage-c61"]
+
+# Board selection
+# ---------------
+# Exactly one board feature must be enabled (compile_error! in
+# kernel/src/lib.rs). There is deliberately no default feature.
+#   X4  : cargo build-x4   (riscv32imc,  esp32c3)
+#   C61 : cargo build-c61  (riscv32imac, esp32c61)
+# The *chip* is selected by the build target through the target-specific
+# dependency tables below, not by the board feature. Reason: Cargo features
+# are additive, so chip features driven by board features would build
+# conflicting esp-* chip crates when none/both boards are given and fail in
+# upstream build scripts with unreadable messages before our check runs.
+# With chip = f(target) every esp-* crate always builds, and the board /
+# target consistency is checked by our own compile_error!.
+[features]
+default = []
+
+# Wi-Fi upload stack (optional boundary, T3). Off by default for every board:
+# without it esp-radio / embassy-net / embedded-io-async are not linked, the
+# Upload app, its home-menu entry and the WIFI peripheral steal are compiled
+# out (R4, R5). Build an X4 with upload via `cargo build-x4-wifi`.
+# Not ported to OnePage C61 yet (src/lib.rs rejects wifi + board-onepage-c61).
+wifi = [
+  "dep:esp-radio",
+  "dep:embassy-net",
+  "dep:embedded-io-async",
+  "esp-rtos/esp-radio",
+  "esp-rtos/esp-alloc",
+]
+
+board-x4          = ["pulp-kernel/board-x4"]
+board-onepage-c61 = ["pulp-kernel/board-onepage-c61"]
 
 [dependencies]
 pulp-kernel = { path = "kernel" }
@@ -47,26 +95,44 @@ log.workspace                  = true
 esp-alloc.workspace            = true
 smol-epub.workspace            = true
 
-esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3", "esp-radio", "log-04"] }
+esp-rtos = { version = "=0.4.0", features = ["embassy", "log-04"] }
 
-# wifi / networking (used by apps/upload.rs)
-esp-radio = { version = "0.17", default-features = false, features = [
-  "esp32c3",
+# wifi / networking (used by apps/upload.rs); optional, enabled via `wifi`
+esp-radio = { version = "=1.0.0-beta.1", optional = true, default-features = false, features = [
   "wifi",
   "log-04",
   "esp-alloc",
 ] }
-embassy-net       = { version = "0.8", features = ["dhcpv4", "medium-ethernet", "tcp", "udp"] }
-embedded-io-async = "0.7"
+embassy-net       = { version = "0.8", optional = true, features = ["dhcpv4", "medium-ethernet", "tcp", "udp"] }
+embedded-io-async = { version = "0.7", optional = true }
 
-esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3", "log-04"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["log-04"] }
 
-esp-backtrace = { version = "0.18.1", features = [
-  "esp32c3",
+esp-backtrace = { version = "0.20", features = [
   "panic-handler",
   "println",
 ] }
-esp-println = { version = "0.16.1", features = ["esp32c3", "log-04"] }
+esp-println = { version = "0.18", features = ["log-04"] }
+
+# chip features: X4 = esp32c3 (riscv32imc)
+[target.riscv32imc-unknown-none-elf.dependencies]
+esp-hal                = { workspace = true, features = ["esp32c3"] }
+esp-alloc              = { workspace = true, features = ["esp32c3"] }
+esp-rtos               = { version = "=0.4.0", features = ["esp32c3"] }
+esp-radio              = { version = "=1.0.0-beta.1", optional = true, default-features = false, features = ["esp32c3"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32c3"] }
+esp-backtrace          = { version = "0.20", features = ["esp32c3"] }
+esp-println            = { version = "0.18", features = ["esp32c3"] }
+
+# chip features: OnePage C61 = esp32c61 (riscv32imac)
+[target.riscv32imac-unknown-none-elf.dependencies]
+esp-hal                = { workspace = true, features = ["esp32c61"] }
+esp-alloc              = { workspace = true, features = ["esp32c61"] }
+esp-rtos               = { version = "=0.4.0", features = ["esp32c61"] }
+esp-radio              = { version = "=1.0.0-beta.1", optional = true, default-features = false, features = ["esp32c61"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32c61"] }
+esp-backtrace          = { version = "0.20", features = ["esp32c61"] }
+esp-println            = { version = "0.18", features = ["esp32c61"] }
 
 [build-dependencies]
 fontdue = "0.9"

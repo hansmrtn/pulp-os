@@ -1,6 +1,5 @@
 // wifi upload server: HTTP file upload + mDNS (pulp.local)
 
-use alloc::string::String;
 use core::fmt::Write as FmtWrite;
 
 use embassy_futures::select::{Either, select};
@@ -10,7 +9,10 @@ use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write as AsyncWrite;
 use esp_hal::delay::Delay;
-use esp_radio::wifi::{ClientConfig, Config, ModeConfig};
+use esp_radio::wifi::sta::StationConfig;
+use esp_radio::wifi::{
+    AuthenticationMethodConfig, Config, ControllerConfig, Interface, Password, Ssid, WifiController,
+};
 use log::info;
 
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
@@ -131,17 +133,22 @@ pub async fn run_upload_mode(
         render_screen(epd, strip, delay, heading, body, &[msg], None, bumps, true).await;
     }
 
-    let radio = match esp_radio::init() {
-        Ok(r) => r,
-        Err(e) => {
-            info!("upload: radio init failed: {:?}", e);
+    // esp-radio 1.0 initialises the radio stack inside the controller; the
+    // station config (with its bounded SSID/password types) is passed at
+    // construction instead of through a separate set_config/start step.
+    let station_cfg = match (Ssid::try_from(ssid), Password::try_from(password)) {
+        (Ok(s), Ok(p)) => StationConfig::default()
+            .with_ssid(s)
+            .with_authentication(AuthenticationMethodConfig::Wpa2Personal(p)),
+        _ => {
+            info!("upload: ssid/password rejected (too long)");
             render_screen(
                 epd,
                 strip,
                 delay,
                 heading,
                 body,
-                &["Radio init failed!"],
+                &["WiFi config error!"],
                 Some("Press BACK to exit"),
                 bumps,
                 false,
@@ -152,10 +159,11 @@ pub async fn run_upload_mode(
         }
     };
 
-    let (mut wifi_ctrl, interfaces) = match esp_radio::wifi::new(&radio, wifi, Config::default()) {
-        Ok(pair) => pair,
+    let ctrl_cfg = ControllerConfig::default().with_initial_config(Config::Station(station_cfg));
+    let mut wifi_ctrl = match WifiController::new(wifi, ctrl_cfg) {
+        Ok(c) => c,
         Err(e) => {
-            info!("upload: wifi::new failed: {:?}", e);
+            info!("upload: wifi init failed: {:?}", e);
             render_screen(
                 epd,
                 strip,
@@ -172,48 +180,9 @@ pub async fn run_upload_mode(
             return;
         }
     };
+    let sta_interface = Interface::station();
 
-    let client_cfg = ClientConfig::default()
-        .with_ssid(String::from(ssid))
-        .with_password(String::from(password));
-
-    if let Err(e) = wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
-        info!("upload: set_config failed: {:?}", e);
-        render_screen(
-            epd,
-            strip,
-            delay,
-            heading,
-            body,
-            &["WiFi config error!"],
-            Some("Press BACK to exit"),
-            bumps,
-            false,
-        )
-        .await;
-        drain_until_back().await;
-        return;
-    }
-
-    if let Err(e) = wifi_ctrl.start_async().await {
-        info!("upload: start failed: {:?}", e);
-        render_screen(
-            epd,
-            strip,
-            delay,
-            heading,
-            body,
-            &["WiFi start failed!"],
-            Some("Press BACK to exit"),
-            bumps,
-            false,
-        )
-        .await;
-        drain_until_back().await;
-        return;
-    }
-
-    info!("upload: wifi started, connecting to '{}'", ssid);
+    info!("upload: wifi initialised, connecting to '{}'", ssid);
 
     if let Err(e) = wifi_ctrl.connect_async().await {
         info!("upload: connect failed: {:?}", e);
@@ -242,7 +211,7 @@ pub async fn run_upload_mode(
     };
 
     let mut resources = embassy_net::StackResources::<4>::new();
-    let (stack, mut runner) = embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
+    let (stack, mut runner) = embassy_net::new(sta_interface, net_config, &mut resources, seed);
 
     let got_ip = match select(
         runner.run(),

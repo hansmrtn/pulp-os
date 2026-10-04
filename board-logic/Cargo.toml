@@ -1,0 +1,14 @@
+[package]
+name         = "pulp-board-logic"
+edition      = "2024"
+rust-version = "1.95"
+version      = "0.1.0"
+description  = "HAL-free board logic (pin map, GPIO27 power-order state machine) shared by firmware and host tests"
+license      = "MIT"
+
+# No dependencies on purpose: esp-hal cannot be built for the host, so every
+# piece of logic that needs a host `cargo test` lives in a crate like this one
+# and reaches hardware only through small traits. The firmware links this very
+# crate (pulp-kernel, feature board-onepage-c61); there is no test-only copy.
+# Host test command: `cargo test-board-logic` (see .cargo/config.toml).
+[dependencies]

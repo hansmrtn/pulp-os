@@ -5,7 +5,6 @@
 // methods that also touch PageState or ReaderApp fields stay on
 // impl ReaderApp (epub_init_opf, epub_index_chapter, bg_cache_step).
 
-use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use smol_epub::cache;
@@ -14,6 +13,7 @@ use smol_epub::epub;
 use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
+use crate::kernel::{BigBuf, BufClass};
 
 use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
 
@@ -73,11 +73,8 @@ impl EpubState {
             epub_size
         );
 
-        let mut cd_buf = Vec::new();
-        cd_buf
-            .try_reserve_exact(cd_size as usize)
+        let mut cd_buf = BigBuf::zeroed(BufClass::ZipToc, cd_size as usize)
             .map_err(|_| Error::new(ErrorKind::OutOfMemory, "epub_init_zip: CD alloc"))?;
-        cd_buf.resize(cd_size as usize, 0);
         super::read_full(k, name, cd_offset, &mut cd_buf)?;
         self.zip.clear();
         self.zip
@@ -289,7 +286,7 @@ impl EpubState {
         let ch_size = ch_size_u32 as usize;
 
         if ch_size == 0 || ch_size > CHAPTER_CACHE_MAX {
-            self.ch_cache = Vec::new();
+            self.ch_cache = BigBuf::empty();
             return false;
         }
 
@@ -298,12 +295,14 @@ impl EpubState {
             return true;
         }
 
-        self.ch_cache = Vec::new();
-        if self.ch_cache.try_reserve_exact(ch_size).is_err() {
-            log::info!("chapter cache: OOM for {} bytes", ch_size);
-            return false;
+        self.ch_cache = BigBuf::empty();
+        match BigBuf::zeroed(BufClass::ChapterText, ch_size) {
+            Ok(b) => self.ch_cache = b,
+            Err(_) => {
+                log::info!("chapter cache: OOM for {} bytes", ch_size);
+                return false;
+            }
         }
-        self.ch_cache.resize(ch_size, 0);
 
         let cf = self.cache_file;
         let cf_str = cache::cache_filename_str(&cf);
@@ -320,7 +319,7 @@ impl EpubState {
                 Ok(_) => break,
                 Err(e) => {
                     log::info!("chapter cache: SD read failed at {}: {}", pos, e);
-                    self.ch_cache = Vec::new();
+                    self.ch_cache = BigBuf::empty();
                     return false;
                 }
             }
@@ -418,7 +417,7 @@ impl ReaderApp {
         self.reset_paging();
         // force reload; ch_cache may hold a different chapter's data
         // with the same byte count (try_cache_chapter only checks len)
-        self.epub.ch_cache = Vec::new();
+        self.epub.ch_cache = BigBuf::empty();
         self.file_size = self.epub.current_chapter_size();
         log::info!(
             "epub: index chapter {}/{} ({} bytes cached text)",

@@ -8,7 +8,6 @@ use crate::apps::PendingSetting;
 use crate::fonts::bitmap::{self, BitmapFont};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::fmt::Write;
 
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -24,6 +23,7 @@ use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::error::{Error, ErrorKind};
 use crate::fonts;
+use crate::kernel::BigBuf;
 use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
@@ -208,7 +208,7 @@ pub(super) struct PageState {
     pub(super) lines: [LineSpan; LINES_PER_PAGE],
     pub(super) line_count: usize,
 
-    pub(super) prefetch: Vec<u8>,
+    pub(super) prefetch: BigBuf,
     pub(super) prefetch_len: usize,
     pub(super) prefetch_page: usize,
 }
@@ -224,7 +224,7 @@ impl PageState {
             buf_len: 0,
             lines: [LineSpan::EMPTY; LINES_PER_PAGE],
             line_count: 0,
-            prefetch: Vec::new(),
+            prefetch: BigBuf::empty(),
             prefetch_len: 0,
             prefetch_page: NO_PREFETCH,
         }
@@ -246,7 +246,7 @@ pub(super) struct EpubState {
     pub(super) chapters_cached: bool,
     pub(super) cache_chapter: u16,
     pub(super) ch_cached: [bool; cache::MAX_CACHE_CHAPTERS],
-    pub(super) ch_cache: Vec<u8>,
+    pub(super) ch_cache: BigBuf,
 
     pub(super) bg_cache: BgCacheState,
     pub(super) work_gen: u16,
@@ -283,7 +283,7 @@ impl EpubState {
             chapters_cached: false,
             cache_chapter: 0,
             ch_cached: [false; cache::MAX_CACHE_CHAPTERS],
-            ch_cache: Vec::new(),
+            ch_cache: BigBuf::empty(),
             bg_cache: BgCacheState::Idle,
             work_gen: 0,
             img_cache_ch: 0,
@@ -645,6 +645,11 @@ impl ReaderApp {
         self.book_font_size_idx
     }
 
+    // true while the epub table of contents is on screen (ENTER selects there)
+    pub fn showing_toc(&self) -> bool {
+        self.state == State::ShowToc
+    }
+
     pub fn restore_state(
         &mut self,
         filename: &[u8],
@@ -837,7 +842,7 @@ impl App<AppId> for ReaderApp {
         self.rebuild_quick_actions();
         self.apply_theme_layout();
         self.reset_paging();
-        self.epub.ch_cache = Vec::new();
+        self.epub.ch_cache = BigBuf::empty();
         self.file_size = 0;
         self.epub.chapter = 0;
         self.error = None;
@@ -870,7 +875,7 @@ impl App<AppId> for ReaderApp {
         self.pg.prefetch_len = 0;
         self.restore_offset = None;
         self.show_position = false;
-        self.epub.ch_cache = Vec::new();
+        self.epub.ch_cache = BigBuf::empty();
         self.page_img = None;
 
         if self.is_epub {

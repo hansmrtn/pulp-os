@@ -13,55 +13,18 @@ use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
+use pulp_board_logic::power::DelayMs;
+// geometry, rotation, command sequences and region math are shared with the
+// OnePage C61 (host-tested in pulp-board-logic); X4 keeps its own SPI/pin/delay
+// plumbing here and ignores bus errors exactly as before
+use pulp_board_logic::ssd1677::{self as shared, DisplayError, EpdBus, StripSource, cmd};
+pub use pulp_board_logic::ssd1677::{HEIGHT, RenderState, Rotation, WIDTH};
 
-use super::strip::{STRIP_COUNT, StripBuffer};
-
-pub const WIDTH: u16 = 800;
-pub const HEIGHT: u16 = 480;
+use super::strip::StripBuffer;
 
 pub const SPI_FREQ_MHZ: u32 = 20;
 
 const POWER_OFF_TIME_MS: u32 = 200; // analog shutdown timeout
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum Rotation {
-    #[default]
-    Deg0,
-    Deg90,
-    Deg180,
-    Deg270,
-}
-
-#[allow(dead_code)]
-mod cmd {
-    pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
-    pub const BOOSTER_SOFT_START: u8 = 0x0C;
-    pub const DEEP_SLEEP: u8 = 0x10;
-    pub const DATA_ENTRY_MODE: u8 = 0x11;
-    pub const SW_RESET: u8 = 0x12;
-    pub const TEMPERATURE_SENSOR: u8 = 0x18;
-    pub const WRITE_TEMP_REGISTER: u8 = 0x1A;
-    pub const MASTER_ACTIVATION: u8 = 0x20;
-    pub const DISPLAY_UPDATE_CONTROL_1: u8 = 0x21;
-    pub const DISPLAY_UPDATE_CONTROL_2: u8 = 0x22;
-    pub const WRITE_RAM_BW: u8 = 0x24;
-    pub const WRITE_RAM_RED: u8 = 0x26;
-    pub const BORDER_WAVEFORM: u8 = 0x3C;
-    pub const SET_RAM_X_RANGE: u8 = 0x44;
-    pub const SET_RAM_Y_RANGE: u8 = 0x45;
-    pub const SET_RAM_X_COUNTER: u8 = 0x4E;
-    pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RenderState {
-    pub px: u16,
-    pub py: u16,
-    pub pw: u16,
-    pub ph: u16,
-    pub left_mask: u8,
-    pub right_mask: u8,
-}
 
 pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     spi: SPI,
@@ -235,93 +198,17 @@ where
     }
 
     fn init_display(&mut self, delay: &mut Delay) {
-        self.send_command(cmd::SW_RESET);
-        delay.delay_millis(10);
-
-        self.send_command(cmd::TEMPERATURE_SENSOR);
-        self.send_data(&[0x80]);
-
-        self.send_command(cmd::BOOSTER_SOFT_START);
-        self.send_data(&[0xAE, 0xC7, 0xC3, 0xC0, 0x80]);
-
-        self.send_command(cmd::DRIVER_OUTPUT_CONTROL);
-        self.send_data(&[((HEIGHT - 1) & 0xFF) as u8, ((HEIGHT - 1) >> 8) as u8, 0x02]);
-
-        self.send_command(cmd::BORDER_WAVEFORM);
-        self.send_data(&[0x01]);
-
-        self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-
+        let _ = shared::init_display(&mut WithDelay { bus: self, delay });
         self.init_done = true;
     }
 
-    fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
-        match self.rotation {
-            Rotation::Deg0 => (x, y, w, h),
-            Rotation::Deg90 => (WIDTH - y - h, x, h, w),
-            Rotation::Deg180 => (WIDTH - x - w, HEIGHT - y - h, w, h),
-            Rotation::Deg270 => (y, HEIGHT - x - w, h, w),
-        }
-    }
-
     fn align_partial_region(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
-        let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
-
-        let px = (tx & !7).min(WIDTH);
-        let py = ty.min(HEIGHT);
-        let pw = ((tw + (tx & 7) + 7) & !7).min(WIDTH - px);
-        let ph = th.min(HEIGHT - py);
-
-        if pw == 0 || ph == 0 {
-            return None;
-        }
-
-        let lp = (tx - px) as u32;
-        let rp = ((px + pw) - (tx + tw)) as u32;
-        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
-        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
-
-        Some(RenderState {
-            px,
-            py,
-            pw,
-            ph,
-            left_mask,
-            right_mask,
-        })
+        shared::align_partial_region(self.rotation, x, y, w, h)
     }
 
     // gates wired in reverse; Y flipped, X inc / Y dec
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
-        let y_flipped = HEIGHT - y - h;
-
-        self.send_command(cmd::DATA_ENTRY_MODE);
-        self.send_data(&[0x01]);
-
-        self.send_command(cmd::SET_RAM_X_RANGE);
-        self.send_data(&[
-            (x & 0xFF) as u8,
-            (x >> 8) as u8,
-            ((x + w - 1) & 0xFF) as u8,
-            ((x + w - 1) >> 8) as u8,
-        ]);
-
-        self.send_command(cmd::SET_RAM_Y_RANGE);
-        self.send_data(&[
-            ((y_flipped + h - 1) & 0xFF) as u8,
-            ((y_flipped + h - 1) >> 8) as u8,
-            (y_flipped & 0xFF) as u8,
-            (y_flipped >> 8) as u8,
-        ]);
-
-        self.send_command(cmd::SET_RAM_X_COUNTER);
-        self.send_data(&[(x & 0xFF) as u8, (x >> 8) as u8]);
-
-        self.send_command(cmd::SET_RAM_Y_COUNTER);
-        self.send_data(&[
-            ((y_flipped + h - 1) & 0xFF) as u8,
-            ((y_flipped + h - 1) >> 8) as u8,
-        ]);
+        let _ = shared::set_ram_area(self, x, y, w, h);
     }
 
     fn wait_busy(&mut self, timeout_ms: u32) {
@@ -503,29 +390,13 @@ where
             self.init_display(delay);
         }
 
-        delay.delay_millis(1);
-
-        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
-            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-            self.send_command(ram_cmd);
-            delay.delay_millis(1);
-
-            for i in 0..STRIP_COUNT {
-                strip.begin_strip(self.rotation, i);
-                draw(strip);
-                self.send_data(strip.data());
-            }
-        }
+        let rotation = self.rotation;
+        let mut src = DrawSource { strip, draw };
+        let _ = shared::write_full_frame(&mut WithDelay { bus: self, delay }, rotation, &mut src);
     }
 
     pub fn start_full_update(&mut self) {
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x40, 0x00]);
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xF7]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
+        let _ = shared::start_full_update(self);
     }
 
     pub fn finish_full_update(&mut self) {
@@ -543,8 +414,7 @@ where
             self.power_is_on = false;
         }
 
-        self.send_command(cmd::DEEP_SLEEP);
-        self.send_data(&[0x01]);
+        let _ = shared::deep_sleep(self);
         self.init_done = false;
     }
 }
@@ -653,13 +523,7 @@ where
     }
 
     async fn update_full_async(&mut self) {
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x40, 0x00]);
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xF7]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
+        let _ = shared::start_full_update(self);
         self.wait_busy_async().await;
 
         self.power_is_on = false;
@@ -674,9 +538,63 @@ where
     BUSY: InputPin,
 {
     fn size(&self) -> Size {
-        match self.rotation {
-            Rotation::Deg0 | Rotation::Deg180 => Size::new(WIDTH as u32, HEIGHT as u32),
-            Rotation::Deg90 | Rotation::Deg270 => Size::new(HEIGHT as u32, WIDTH as u32),
-        }
+        let (w, h) = self.rotation.logical_size();
+        Size::new(w as u32, h as u32)
+    }
+}
+
+// the shared sequences drive the panel through this; errors are dropped like
+// the old `let _ = spi.write(..)` calls
+impl<SPI, DC, RST, BUSY, E> EpdBus for DisplayDriver<SPI, DC, RST, BUSY>
+where
+    SPI: SpiDevice<Error = E>,
+    DC: OutputPin,
+    RST: OutputPin,
+    BUSY: InputPin,
+{
+    fn command(&mut self, c: u8) -> Result<(), DisplayError> {
+        self.send_command(c);
+        Ok(())
+    }
+
+    fn data(&mut self, data: &[u8]) -> Result<(), DisplayError> {
+        self.send_data(data);
+        Ok(())
+    }
+}
+
+// bus + the caller's esp-hal delay, for the sequences that sleep
+struct WithDelay<'a, B: EpdBus> {
+    bus: &'a mut B,
+    delay: &'a mut Delay,
+}
+
+impl<B: EpdBus> EpdBus for WithDelay<'_, B> {
+    fn command(&mut self, c: u8) -> Result<(), DisplayError> {
+        self.bus.command(c)
+    }
+
+    fn data(&mut self, data: &[u8]) -> Result<(), DisplayError> {
+        self.bus.data(data)
+    }
+}
+
+impl<B: EpdBus> DelayMs for WithDelay<'_, B> {
+    fn delay_ms(&mut self, ms: u32) {
+        self.delay.delay_millis(ms);
+    }
+}
+
+// one strip per call: clear, run the caller's draw closure, hand out the bytes
+struct DrawSource<'a, F> {
+    strip: &'a mut StripBuffer,
+    draw: &'a F,
+}
+
+impl<F: Fn(&mut StripBuffer)> StripSource for DrawSource<'_, F> {
+    fn render_strip(&mut self, rotation: Rotation, idx: u16) -> &[u8] {
+        self.strip.begin_strip(rotation, idx);
+        (self.draw)(self.strip);
+        self.strip.data()
     }
 }

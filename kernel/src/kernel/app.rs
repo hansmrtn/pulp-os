@@ -30,6 +30,13 @@ use super::config::{SystemSettings, WifiConfig};
 
 pub const MAX_APP_ACTIONS: usize = 6;
 
+// the board's session payload: X4 keeps it in RTC FAST memory, the OnePage C61
+// has no such section and stores the same fields on the SD card (T10)
+#[cfg(feature = "board-x4")]
+pub type SessionData = super::rtc_session::RtcSession;
+#[cfg(feature = "board-onepage-c61")]
+pub type SessionData = pulp_board_logic::session::SessionState;
+
 #[derive(Debug, Clone, Copy)]
 pub enum QuickActionKind {
     Cycle {
@@ -474,16 +481,13 @@ pub trait AppLayer {
     fn enter_initial(&mut self, k: &mut KernelHandle<'_>);
 
     // session persistence: save/restore active app across sleep/wake
-    // using RTC FAST memory (survives deep sleep, zeroed on power-on)
+    // X4: RTC FAST memory (survives deep sleep, zeroed on power-on)
+    // C61: two slot files on the SD card (pulp_board_logic::session)
     //
-    // collect_session writes app state to the provided RtcSession struct
-    // apply_session restores app state from RtcSession, returns true if successful
-    fn collect_session(&self, session: &mut super::rtc_session::RtcSession);
-    fn apply_session(
-        &mut self,
-        session: &super::rtc_session::RtcSession,
-        k: &mut KernelHandle<'_>,
-    ) -> bool;
+    // collect_session writes app state to the provided SessionData struct
+    // apply_session restores app state from SessionData, returns true if successful
+    fn collect_session(&self, session: &mut SessionData);
+    fn apply_session(&mut self, session: &SessionData, k: &mut KernelHandle<'_>) -> bool;
 
     // true when the active app wants to take over the main loop
     // (e.g. wifi upload mode bypasses the normal event dispatch)

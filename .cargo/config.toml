@@ -1,5 +1,36 @@
+# Wi-Fi upload is optional and OFF by default (offline firmware, no radio
+# linked). `*-x4-wifi` aliases add `--features wifi` (X4 only for now).
+# Boards (exactly one board feature per build; see README.txt):
+#   X4  : cargo build-x4   -> riscv32imc,  esp32c3
+#   C61 : cargo build-c61  -> riscv32imac, esp32c61: builds both images, the full
+#         offline firmware (pulp-os-c61) and the bring-up image (pulp-os-c61-boot)
+# The default [build] target below is the X4 one for backwards compatibility;
+# the aliases always pass --target explicitly, and build.rs rejects a board /
+# target mismatch.
+[alias]
+build-x4  = "build --release --target riscv32imc-unknown-none-elf --features board-x4"
+run-x4    = "run --release --target riscv32imc-unknown-none-elf --features board-x4"
+check-x4  = "check --release --target riscv32imc-unknown-none-elf --features board-x4"
+build-x4-wifi = "build --release --target riscv32imc-unknown-none-elf --features board-x4,wifi"
+run-x4-wifi   = "run --release --target riscv32imc-unknown-none-elf --features board-x4,wifi"
+build-c61 = "build --release --target riscv32imac-unknown-none-elf --features board-onepage-c61"
+run-c61   = "run --release --target riscv32imac-unknown-none-elf --features board-onepage-c61 --bin pulp-os-c61"
+run-c61-boot = "run --release --target riscv32imac-unknown-none-elf --features board-onepage-c61 --bin pulp-os-c61-boot"
+# Host tests for HAL-free logic (pulp-board-logic). esp-hal cannot build on the
+# host, so only HAL-free crates are tested this way. The root `build-std =
+# [alloc, core]` is merged (not replaced) by --config, and a core-only build-std
+# collides with the test harness's sysroot core (E0152), so std+test are added.
+test-board-logic = "test -p pulp-board-logic --target x86_64-unknown-linux-gnu --config unstable.build-std=[\"std\",\"test\"]"
+check-c61 = "check --release --target riscv32imac-unknown-none-elf --features board-onepage-c61"
+
 [target.riscv32imc-unknown-none-elf]
 runner = "espflash flash --monitor --chip esp32c3"
+
+# OnePage C61: BSP bring-up uses flash 40 MHz DIO / 16 MB (80 MHz flash causes
+# image-hash boot loops on this board, see bsp_onepage_c61/README.md). Needs an
+# espflash that knows esp32c61 (>= 4.6.0 source has it; 4.3.0 rejects the chip).
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c61 --flash-mode dio --flash-freq 40mhz --flash-size 16mb"
 
 [env]
 ESP_LOG="info"

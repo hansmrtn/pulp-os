@@ -1,4 +1,8 @@
 [toolchain]
-channel    = "stable"
-components = ["rust-src"]
-targets = ["riscv32imc-unknown-none-elf"]
+# Pinned for reproducible builds. build-std (see .cargo/config.toml) requires a
+# nightly compiler, and the date must be bumped together with the Espressif
+# dependency set (see specs/changes/onepage-c61-port/baseline.md).
+channel    = "nightly-2026-09-22"
+profile    = "minimal"
+components = ["rust-src", "rustfmt", "clippy"]
+targets    = ["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf"]

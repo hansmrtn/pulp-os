@@ -7,6 +7,7 @@ use smol_epub::html_strip::{
 
 use crate::fonts;
 use crate::fonts::bitmap::FIRST_CHAR;
+use crate::kernel::BufClass;
 use crate::kernel::KernelHandle;
 
 use super::{
@@ -176,10 +177,13 @@ impl ReaderApp {
             }
         }
 
-        if self.pg.page + 1 < self.pg.total_pages {
-            if self.pg.prefetch.len() < PAGE_BUF {
-                self.pg.prefetch.resize(PAGE_BUF, 0);
-            }
+        if self.pg.page + 1 < self.pg.total_pages
+            && self
+                .pg
+                .prefetch
+                .ensure_len(BufClass::ChapterText, PAGE_BUF)
+                .is_ok()
+        {
             let pf_offset = self.pg.offsets[self.pg.page + 1];
             let pf_result = if self.is_epub && self.epub.chapters_cached {
                 let cf_str = self.epub.cache_file_str();

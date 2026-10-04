@@ -1,0 +1,28 @@
+[package]
+name = "pulp-kernel"
+version = "0.0.0"
+edition = "2024"
+
+# Host build of the *real* kernel sources the reader/settings/bookmarks use
+# (error, ui, util, kernel/{app,bigbuf,bookmarks,config,handle,timing,work_queue},
+# board/{action,button,layout}, drivers/strip). Only the hardware edge is shimmed:
+# sdcard/storage (in-memory FS), Kernel struct, Epd, Event alias.
+[features]
+default = ["board-x4"]
+board-x4 = []
+# declared only so the real files' cfg(feature = "board-onepage-c61") arms are known (never enabled)
+board-onepage-c61 = []
+# post-port source tree (has kernel/bigbuf.rs, SessionData, ...); off for the pre-port commit
+tree = []
+
+[dependencies]
+esp-hal = { path = "../esp-hal-shim" }
+pulp-board-logic = { path = "@ROOT@/board-logic" }
+embassy-time = { version = "0.5", features = ["std"] }
+embassy-sync = "0.7"
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+embassy-futures = "0.1"
+embedded-graphics = "0.8.2"
+embedded-graphics-core = "0.4.1"
+critical-section = { version = "1.2", features = ["std"] }
+log = "0.4"

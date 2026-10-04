@@ -1,0 +1,24 @@
+[package]
+name = "pulp-os-host"
+version = "0.0.0"
+edition = "2024"
+build = "build.rs"
+
+[features]
+default = ["board-x4"]
+board-x4 = ["pulp-kernel/board-x4"]
+tree = ["pulp-kernel/tree"]
+board-onepage-c61 = []
+
+[dependencies]
+pulp-kernel = { path = "../kernel", default-features = false }
+pulp-board-logic = { path = "@ROOT@/board-logic" }
+smol-epub = { path = "@SMOL@", features = ["async"] }
+embedded-graphics = "0.8.2"
+embedded-graphics-core = "0.4.1"
+embassy-futures = "0.1"
+log = "0.4"
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+
+[build-dependencies]
+fontdue = "0.9"

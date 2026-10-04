@@ -1,0 +1,15 @@
+// The real build.rs of the tree under test (font rasterisation), included verbatim:
+// its font generator is the only thing used. `assets/` is symlinked next to this
+// crate by scripts/check-reader-regression.sh because the generator reads the
+// relative path assets/fonts.
+#[allow(dead_code, unused)]
+mod real {
+    include!("@SRC@/build.rs");
+    pub fn run() {
+        generate_bitmap_fonts();
+    }
+}
+
+fn main() {
+    real::run();
+}

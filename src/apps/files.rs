@@ -1,7 +1,6 @@
 // paginated file browser for SD card root directory
 // background title scanner resolves EPUB titles from OPF metadata
 
-use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -17,6 +16,7 @@ use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
+use crate::kernel::{BigBuf, BufClass};
 use crate::ui::{
     Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W, LARGE_MARGIN,
     Region, SECTION_GAP, TITLE_Y_OFFSET,
@@ -558,11 +558,8 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
         // the From<&'static str> impl on Error converts automatically via ?
         let (cd_offset, cd_size) = ZipIndex::parse_eocd(&buf[..n], file_size)?;
 
-        let mut cd_buf = Vec::new();
-        cd_buf
-            .try_reserve_exact(cd_size as usize)
+        let mut cd_buf = BigBuf::zeroed(BufClass::ZipToc, cd_size as usize)
             .map_err(|_| Error::new(ErrorKind::OutOfMemory, "title_scan: CD alloc"))?;
-        cd_buf.resize(cd_size as usize, 0);
 
         let mut total = 0usize;
         while total < cd_buf.len() {

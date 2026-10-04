@@ -6,7 +6,6 @@
 // (small images); both epub_find_and_dispatch_image (background scan)
 // and dispatch_one_image_in_chapter (nearby prefetch) call through it
 
-use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::kernel::work_queue::DecodedImage;
@@ -18,18 +17,22 @@ use smol_epub::zip::{self, ZipIndex};
 use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
+use crate::kernel::{BigBuf, BufClass};
 
 use super::{
     DEFAULT_IMG_H, MAX_IMAGES_PER_PAGE, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp,
 };
 
-fn from_smol_image(img: smol_epub::DecodedImage) -> DecodedImage {
-    DecodedImage {
+// takes the decoded pixels over into a budgeted image buffer (PSRAM on the C61;
+// on the X4 the heap block as it is); refused = the image is skipped
+fn from_smol_image(img: smol_epub::DecodedImage) -> Result<DecodedImage, &'static str> {
+    Ok(DecodedImage {
         width: img.width,
         height: img.height,
-        data: img.data,
+        data: BigBuf::from_vec(img.data, BufClass::ImageData)
+            .map_err(|_| "image buffer over budget")?,
         stride: img.stride,
-    }
+    })
 }
 
 // result of scanning a chapter for the next uncached image
@@ -279,7 +282,7 @@ impl ReaderApp {
                     img_max_h,
                 )
             };
-            raw.map(from_smol_image)
+            raw.and_then(from_smol_image)
         };
 
         let result = do_decode(k);
@@ -293,7 +296,7 @@ impl ReaderApp {
                     e,
                     self.epub.ch_cache.len() / 1024,
                 );
-                self.epub.ch_cache = Vec::new();
+                self.epub.ch_cache = BigBuf::empty();
                 do_decode(k)
             }
             Err(e) => Err(e),
@@ -433,9 +436,10 @@ impl ReaderApp {
         }
 
         self.pg.prefetch_page = NO_PREFETCH;
-        if self.pg.prefetch.len() < PAGE_BUF {
-            self.pg.prefetch.resize(PAGE_BUF, 0);
-        }
+        self.pg
+            .prefetch
+            .ensure_len(BufClass::ChapterText, PAGE_BUF)
+            .map_err(|_| Error::new(ErrorKind::OutOfMemory, "scan_chapter: prefetch"))?;
 
         let dir_buf = self.epub.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
@@ -572,7 +576,7 @@ impl ReaderApp {
                                 e,
                                 self.epub.ch_cache.len() / 1024,
                             );
-                            self.epub.ch_cache = Vec::new();
+                            self.epub.ch_cache = BigBuf::empty();
                             decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h)
                         }
                         Err(e) => Err(e),
@@ -859,7 +863,7 @@ pub(super) fn decode_image_streaming(
         )
     };
     result
-        .map(from_smol_image)
+        .and_then(from_smol_image)
         .map_err(|msg| Error::from(msg).with_source("decode_image_streaming"))
 }
 
@@ -893,10 +897,8 @@ pub(super) fn load_cached_image(
             "load_cached_image: size mismatch",
         ));
     }
-    let mut data = Vec::new();
-    data.try_reserve_exact(data_len)
+    let mut data = BigBuf::zeroed(BufClass::ImageData, data_len)
         .map_err(|_| Error::new(ErrorKind::OutOfMemory, "load_cached_image"))?;
-    data.resize(data_len, 0);
     k.read_app_subdir_chunk(dir, name, 4, &mut data)?;
     Ok(DecodedImage {
         width,

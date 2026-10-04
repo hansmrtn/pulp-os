@@ -24,15 +24,55 @@ hardware
     EPD and SD share SPI2, arbitrated by CriticalSectionDevice.
 
 building
-    requires stable Rust >= 1.88 and the riscv32imc-unknown-none-elf
-    target. rust-toolchain.toml handles both automatically.
+    requires the nightly pinned in rust-toolchain.toml (build-std needs
+    nightly; rust-src and the riscv32imc/imac targets are installed
+    automatically by rustup). see specs/changes/onepage-c61-port/baseline.md.
 
-        cargo build --release
-        espflash flash --monitor --chip esp32c3 target/...
+    exactly one board must be selected (a bare `cargo build` fails with
+    a "no board selected" error on purpose):
 
-    or:
+        cargo build-x4 --locked      xteink x4, esp32c3, riscv32imc
+        cargo run-x4                 build + flash + monitor (espflash)
+        cargo build-x4-wifi --locked x4 with wifi upload (--features wifi)
 
-        cargo run --release
+        cargo build-c61 --locked     onepage c61, esp32c61, riscv32imac;
+                                     builds both images: pulp-os-c61 (full
+                                     offline firmware, src/bin/main_c61.rs)
+                                     and pulp-os-c61-boot (bring-up image)
+        cargo run-c61                flash + monitor the full firmware;
+                                     needs espflash >= 4.6.0 (4.3.0 does
+                                     not know esp32c61); flash 40 MHz dio
+        cargo run-c61-boot           same for the bring-up image
+        cargo test-board-logic       host tests of the HAL-free board logic
+                                     (board-logic/, x86_64 target)
+        scripts/check-x4-driver-trace.sh
+                                     x4 epd driver wire trace must match
+                                     the pinned pre-c61-port trace
+
+    the aliases live in .cargo/config.toml and pass --target and
+    --features board-x4 / board-onepage-c61 explicitly. the chip crates
+    follow the target; the board feature must agree with it. check:
+
+        scripts/check-board-selection.sh
+
+    wifi upload is optional and off by default for every board: the
+    default (offline) firmware does not link esp-radio / embassy-net, has
+    no Upload menu entry, and cannot enter upload mode. `--features wifi`
+    (or the *-x4-wifi aliases) adds it; x4 only, c61 rejects it at compile
+    time until the radio is ported. settings.txt still round-trips the
+    wifi_ssid / wifi_pass keys so credentials are not lost. check:
+
+        scripts/check-offline-boundary.sh
+
+    status: the c61 build is the full offline firmware
+    (src/bin/main_c61.rs: reader, files, settings, bookmarks, home,
+    session restore, idle-timeout deep sleep, PSRAM-budgeted buffers)
+    plus the minimal bring-up image (src/bin/c61_boot.rs). both link;
+    neither has been run on hardware. every c61 refresh is a full
+    refresh (no partial refresh yet); see
+    specs/changes/onepage-c61-port/baseline.md (T12) for the key
+    mapping (no Menu key: long-press ENTER in the reader opens the quick
+    menu) and the decisions awaiting confirmation.
 
     local path dependencies (sibling dirs):
       embedded-sdmmc    async FAT filesystem over SD/SPI (local fork)
@@ -49,7 +89,8 @@ features
                     scanner (resolves titles from OPF metadata)
     bookmarks       16-slot LRU in RAM, flushed to SD every 30 s;
                     home screen bookmarks browser sorted by recency
-    wifi upload     HTTP file upload + mDNS (pulp.local);
+    wifi upload     optional (--features wifi, off by default);
+                    HTTP file upload + mDNS (pulp.local);
                     drag-and-drop web UI with delete support
     fonts           regular/bold/italic TTFs rasterised at build time
                     via fontdue; five sizes, book and UI independently

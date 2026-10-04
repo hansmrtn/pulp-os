@@ -21,6 +21,9 @@ const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
 const ITEM_X: u16 = (SCREEN_W - ITEM_W) / 2;
 const TITLE_ITEM_GAP: u16 = 24;
 const MAX_ITEMS: usize = 5;
+// the Upload entry exists only when the Wi-Fi boundary is compiled in; the
+// offline firmware has no menu path into upload mode (R5)
+const UPLOAD_ITEMS: usize = cfg!(feature = "wifi") as usize;
 
 // bookmark list layout (matches Files app)
 const BM_ROW_H: u16 = 52;
@@ -88,7 +91,7 @@ impl HomeApp {
             selected: 0,
             ui_fonts: uf,
             item_regions: compute_item_regions(uf.heading.line_height),
-            item_count: 4, // updated after load; may include Continue
+            item_count: 3 + UPLOAD_ITEMS, // updated after load; may include Continue
             recent_book: [0u8; 32],
             recent_book_len: 0,
             needs_load_recent: false,
@@ -171,7 +174,7 @@ impl HomeApp {
     }
 
     fn rebuild_item_count(&mut self) {
-        self.item_count = if self.recent_book_len > 0 { 5 } else { 4 };
+        self.item_count = if self.recent_book_len > 0 { 4 } else { 3 } + UPLOAD_ITEMS;
         if self.selected >= self.item_count {
             self.selected = 0;
         }
@@ -182,40 +185,42 @@ impl HomeApp {
     }
 
     fn item_label(&self, idx: usize) -> &str {
-        if self.has_recent() {
+        let idx = if self.has_recent() {
             match idx {
-                0 => "Continue",
-                1 => "Files",
-                2 => "Bookmarks",
-                3 => "Settings",
-                _ => "Upload",
+                0 => return "Continue",
+                _ => idx - 1,
             }
         } else {
-            match idx {
-                0 => "Files",
-                1 => "Bookmarks",
-                2 => "Settings",
-                _ => "Upload",
-            }
+            idx
+        };
+        match idx {
+            0 => "Files",
+            1 => "Bookmarks",
+            2 => "Settings",
+            #[cfg(feature = "wifi")]
+            _ => "Upload",
+            #[cfg(not(feature = "wifi"))]
+            _ => "Settings",
         }
     }
 
     fn item_action(&self, idx: usize) -> MenuAction {
-        if self.has_recent() {
+        let idx = if self.has_recent() {
             match idx {
-                0 => MenuAction::Continue,
-                1 => MenuAction::Push(AppId::Files),
-                2 => MenuAction::OpenBookmarks,
-                3 => MenuAction::Push(AppId::Settings),
-                _ => MenuAction::Push(AppId::Upload),
+                0 => return MenuAction::Continue,
+                _ => idx - 1,
             }
         } else {
-            match idx {
-                0 => MenuAction::Push(AppId::Files),
-                1 => MenuAction::OpenBookmarks,
-                2 => MenuAction::Push(AppId::Settings),
-                _ => MenuAction::Push(AppId::Upload),
-            }
+            idx
+        };
+        match idx {
+            0 => MenuAction::Push(AppId::Files),
+            1 => MenuAction::OpenBookmarks,
+            2 => MenuAction::Push(AppId::Settings),
+            #[cfg(feature = "wifi")]
+            _ => MenuAction::Push(AppId::Upload),
+            #[cfg(not(feature = "wifi"))]
+            _ => MenuAction::Push(AppId::Settings),
         }
     }
 

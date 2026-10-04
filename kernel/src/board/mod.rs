@@ -24,8 +24,7 @@ use esp_hal::{
     Blocking,
     analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation},
     delay::Delay,
-    dma::{DmaRxBuf, DmaTxBuf},
-    gpio::{Event, Input, InputConfig, Io, Level, Output, OutputConfig, Pull},
+    gpio::{Event, Input, InputConfig, Io, Level, Output, OutputConfig, Pull, WakeupConfig},
     peripherals::{ADC1, GPIO0, GPIO1, GPIO2, Peripherals},
     spi,
     time::Rate,
@@ -33,7 +32,7 @@ use esp_hal::{
 use log::info;
 use static_cell::StaticCell;
 
-pub type SpiBus = spi::master::SpiDmaBus<'static, Blocking>;
+pub type SpiBus = spi::master::SpiDma<'static, Blocking>;
 pub type SharedSpiDevice = CriticalSectionDevice<'static, SpiBus, Output<'static>, Delay>;
 pub type SdSpiDevice = CriticalSectionDevice<'static, SpiBus, raw_gpio::RawOutputPin, Delay>;
 pub type Epd = DisplayDriver<SharedSpiDevice, Output<'static>, Output<'static>, Input<'static>>;
@@ -164,6 +163,11 @@ impl Board {
             InputConfig::default().with_pull(Pull::Up),
         );
         power.listen(Event::FallingEdge);
+        // deep sleep powers down the digital GPIO path, so the wake pad
+        // must use its low-power path (GPIO3 is an RTC-capable pad)
+        power
+            .apply_wakeup_config(&WakeupConfig::default().with_low_power_path(true))
+            .expect("GPIO3 has a low-power wake path");
 
         critical_section::with(|cs| {
             POWER_BTN.borrow_ref_mut(cs).replace(power);
@@ -206,9 +210,8 @@ impl Board {
         let _ = spi_raw.write(&[0xFF; 10]);
 
         // 4096B each direction: strip max ~4000B, SD sectors 512B
-        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(4096);
-        let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-        let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+        let dma_rx_buf = esp_hal::dma_rx_buffer!(4096).unwrap();
+        let dma_tx_buf = esp_hal::dma_tx_buffer!(4096).unwrap();
 
         let spi_dma_bus = spi_raw
             .with_dma(p.DMA_CH0)

@@ -9,6 +9,7 @@ pub mod reader;
 pub mod widgets;
 
 pub mod settings;
+#[cfg(feature = "wifi")]
 pub mod upload;
 
 use crate::kernel::app::AppIdType;
@@ -20,7 +21,9 @@ pub enum AppId {
     Reader,
     Settings,
     // upload bypasses the App trait; AppManager::needs_special_mode
-    // returns true for this variant and run_special_mode handles it
+    // returns true for this variant and run_special_mode handles it.
+    // Exists only with the `wifi` feature (offline firmware has no upload).
+    #[cfg(feature = "wifi")]
     Upload,
 }
 

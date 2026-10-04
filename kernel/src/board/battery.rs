@@ -5,18 +5,6 @@
 // voltage divider multiplier (100K/100K resistive divider)
 pub const DIVIDER_MULT: u32 = 2;
 
-// piecewise-linear li-ion discharge curve, sorted descending by mV
-pub const DISCHARGE_CURVE: &[(u32, u8)] = &[
-    (4200, 100),
-    (4060, 90),
-    (3980, 80),
-    (3920, 70),
-    (3870, 60),
-    (3830, 50),
-    (3790, 40),
-    (3750, 30),
-    (3700, 20),
-    (3600, 10),
-    (3400, 5),
-    (3000, 0),
-];
+// piecewise-linear li-ion discharge curve, sorted descending by mV; the table
+// lives in pulp-board-logic (shared with the OnePage C61, T9) and is unchanged
+pub use pulp_board_logic::battery::LIPO_DISCHARGE_CURVE as DISCHARGE_CURVE;

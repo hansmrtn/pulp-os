@@ -13,6 +13,7 @@ use core::cell::RefCell;
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
+#[cfg(feature = "board-x4")]
 use embedded_hal::delay::DelayNs;
 
 use embedded_sdmmc::{
@@ -21,7 +22,12 @@ use embedded_sdmmc::{
 };
 use log::info;
 
+// the SPI device type is board-specific (X4: CriticalSectionDevice over a raw
+// GPIO12 CS; C61: arbiter-managed device, see board_c61::spi)
+#[cfg(feature = "board-x4")]
 use crate::board::SdSpiDevice;
+#[cfg(feature = "board-onepage-c61")]
+use crate::board_c61::spi::SdSpiDevice;
 
 // sync BlockDevice -> AsyncBlockDevice adapter
 //
@@ -108,6 +114,10 @@ impl SdStorage {
     //
     // pub so Board::init can run this before other SPI peripherals
     // touch the bus - SD spec requires a clean 400 kHz bus for CMD0
+    //
+    // X4 only: the C61 init goes through board_c61::sd::init (requires the
+    // GPIO27 SdInitPermit and classifies failures instead of returning None)
+    #[cfg(feature = "board-x4")]
     pub fn init_card(spi_device: SdSpiDevice) -> Option<SyncSdCard> {
         let sd = SdCard::new(spi_device, esp_hal::delay::Delay::new());
 
